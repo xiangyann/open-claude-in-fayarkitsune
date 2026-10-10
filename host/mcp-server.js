@@ -53,7 +53,7 @@ let requestIdCounter = 0;
 // Primary mode: track client MCP server connections
 const clientSockets = new Map(); // clientId -> socket
 let clientIdCounter = 0;
-// Map from prefixed request ID -> { clientId, originalId }
+// Map from prefixed request ID -> { clientId, originalId, tool, args, resent }
 const clientRequestMap = new Map();
 
 // Client mode: TCP connection to the primary
@@ -183,11 +183,13 @@ function attachExtension(conn) {
 function detachExtension(conn) {
   if (extensionConn !== conn) return;
   extensionConn = null;
-  // Only the requests that were in flight on this connection: anything sent
-  // after a reconnect already reached the new connection and mustn't repeat.
+  // Only the requests that were in flight on this connection, this session's
+  // and those forwarded from client sessions: anything sent after a
+  // reconnect already reached the new connection and mustn't repeat.
   const inFlight = [...pendingRequests.keys()];
-  if (inFlight.length === 0) return;
-  // Give the extension a few seconds to reconnect, then resend once.
+  const forwarded = [...clientRequestMap.keys()];
+  if (inFlight.length === 0 && forwarded.length === 0) return;
+  // Give the extension a few seconds to reconnect, then resend each once.
   setTimeout(() => {
     for (const id of inFlight) {
       const entry = pendingRequests.get(id);
@@ -199,6 +201,20 @@ function detachExtension(conn) {
         clearTimeout(entry.timer);
         pendingRequests.delete(id);
         entry.reject(new Error("Browser extension disconnected"));
+      }
+    }
+    for (const id of forwarded) {
+      const entry = clientRequestMap.get(id);
+      if (!entry) continue; // answered, or the client left
+      if (extensionConnected() && !entry.resent) {
+        entry.resent = true;
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
+      } else {
+        clientRequestMap.delete(id);
+        const clientSocket = clientSockets.get(entry.clientId);
+        if (clientSocket && !clientSocket.destroyed) {
+          clientSocket.write(JSON.stringify({ id: entry.originalId, type: "tool_error", error: "Browser extension disconnected" }) + "\n");
+        }
       }
     }
   }, 5000);
@@ -350,7 +366,8 @@ function setupClientConnection(socket, initialBuffer) {
         if (msg.type === "tool_request" && msg.id) {
           // Forward to the extension with a prefixed ID
           const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
+          // tool/args are kept so the request can be resent after a reconnect
+          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, resent: false });
 
           if (!extensionConnected()) {
             // Send error back to client
