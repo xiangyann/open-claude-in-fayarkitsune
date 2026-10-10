@@ -642,21 +642,25 @@ const toolHandlers = {
         if (!args.region || args.region.length !== 4) {
           return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
         }
-        const [x0, y0, x1, y1] = args.region;
-        const width = x1 - x0;
-        const height = y1 - y0;
-        if (width <= 0 || height <= 0) {
-          return { content: [{ type: "text", text: "region must have x1 > x0 and y1 > y0" }] };
+        const [x0, y0, x1, y1] = args.region.map(Number);
+        if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) {
+          return { content: [{ type: "text", text: "region must be numbers with x1 > x0 and y1 > y0" }] };
         }
         // captureVisibleTab's rect is in page coordinates, so add the scroll offset.
         const [{ result: view }] = await chrome.scripting.executeScript({
           target: { tabId },
           func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY, innerWidth: window.innerWidth }),
         });
+        // The rect must be whole pixels (scroll offsets can be fractional on
+        // scaled displays); round outwards so the whole region is covered.
+        const left = Math.floor(view.scrollX + x0);
+        const top = Math.floor(view.scrollY + y0);
+        const width = Math.ceil(view.scrollX + x1) - left;
+        const height = Math.ceil(view.scrollY + y1) - top;
         // Render the region at up to 4x so it fills roughly a viewport's width.
         const scale = Math.min(4, Math.max(1, view.innerWidth / width));
         const { base64 } = await takeScreenshot(tabId, {
-          rect: { x: view.scrollX + x0, y: view.scrollY + y0, width, height },
+          rect: { x: left, y: top, width, height },
           scale,
         });
         return {

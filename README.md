@@ -62,6 +62,12 @@ Two components:
 
 No native messaging host, registry keys or install script: the extension finds the server by its fixed port.
 
+### Security
+
+- **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header.
+- **Other Firefox add-ons can.** Every add-on has a `moz-extension://` origin, and the server doesn't check which add-on is connecting. If another add-on in the same Firefox profile connects first, it takes the server's single browser slot. It would then see the tool requests Claude sends (URLs, text to type, JavaScript to run) and could send fake results back to Claude. It can't use that connection to control the browser. Use a Firefox profile with only add-ons you trust.
+- **Programs on your computer can.** Anything running as your user can connect to `127.0.0.1:18765` and send tool requests, the same way a second Claude session does. Such a program already has your user's access to the machine, so this adds little, but it's worth knowing.
+
 ## Installation
 
 ### Prerequisites
@@ -135,7 +141,9 @@ That's it. The extension connects to the server on its own whenever Claude is ru
 
 ### Upgrading from extension 1.0.0
 
-Extension 1.0.0 reached the server through a native messaging host (`host/native-host.js`, registered by `install.sh` or the registry). 1.1.0 connects directly, so the host is no longer used. The server still accepts 1.0.0 connections during the switch. Once you're on 1.1.0, remove the old registration:
+1.1.0 has a different add-on ID (`open-claude-in-fayarkitsune@anthropic`) from the original 1.0.0 (`open-claude-in-firefox@anthropic`), so Firefox installs it alongside 1.0.0 instead of updating it. **Remove 1.0.0 in `about:addons` before starting 1.1.0.** The server takes one browser at a time, so if both are enabled, whichever connects first wins and the other is refused.
+
+Extension 1.0.0 reached the server through a native messaging host (`host/native-host.js`, registered by `install.sh` or the registry). 1.1.0 connects directly, so the host is no longer used. Once you've removed 1.0.0, also remove the old host registration:
 
 - **Windows**: `reg delete HKCU\Software\Mozilla\NativeMessagingHosts\com.anthropic.open_claude_in_firefox /f`
 - **macOS**: `rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/com.anthropic.open_claude_in_firefox.json`
