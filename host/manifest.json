@@ -1,0 +1,113 @@
+{
+  "manifest_version": "0.2",
+  "name": "open-claude-in-fayarkitsune",
+  "display_name": "Claude MCP in Fayar kitsune",
+  "version": "1.1.0",
+  "description": "Browser automation in Firefox through the Claude MCP in Fayar kitsune extension.",
+  "long_description": "MCP server for the Claude MCP in Fayar kitsune Firefox extension. Install the extension in Firefox; it connects to this server over a WebSocket on 127.0.0.1:18765. Nothing else to set up: no native messaging host, no Node.js install, no registry keys.",
+  "author": {
+    "name": "xiangyann",
+    "url": "https://github.com/xiangyann"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiangyann/open-claude-in-fayarkitsune"
+  },
+  "homepage": "https://github.com/xiangyann/open-claude-in-fayarkitsune",
+  "icon": "icon.png",
+  "server": {
+    "type": "node",
+    "entry_point": "mcp-server.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/mcp-server.js"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "tabs_context_mcp",
+      "description": "List tabs in the MCP tab group"
+    },
+    {
+      "name": "tabs_create_mcp",
+      "description": "Open a new tab in the MCP tab group"
+    },
+    {
+      "name": "navigate",
+      "description": "Go to a URL, or back/forward"
+    },
+    {
+      "name": "computer",
+      "description": "Mouse, keyboard, scroll and screenshots"
+    },
+    {
+      "name": "find",
+      "description": "Find page elements by description"
+    },
+    {
+      "name": "form_input",
+      "description": "Set form field values"
+    },
+    {
+      "name": "get_page_text",
+      "description": "Extract the page's text"
+    },
+    {
+      "name": "gif_creator",
+      "description": "Record and export a GIF of browser actions"
+    },
+    {
+      "name": "javascript_tool",
+      "description": "Run JavaScript in the page"
+    },
+    {
+      "name": "read_console_messages",
+      "description": "Read console output"
+    },
+    {
+      "name": "read_network_requests",
+      "description": "Read network requests"
+    },
+    {
+      "name": "read_page",
+      "description": "Accessibility tree of the page"
+    },
+    {
+      "name": "resize_window",
+      "description": "Resize the browser window"
+    },
+    {
+      "name": "shortcuts_list",
+      "description": "List shortcuts and workflows"
+    },
+    {
+      "name": "shortcuts_execute",
+      "description": "Run a shortcut or workflow"
+    },
+    {
+      "name": "switch_browser",
+      "description": "Switch which Firefox is automated"
+    },
+    {
+      "name": "update_plan",
+      "description": "Present a plan with domains for approval"
+    },
+    {
+      "name": "upload_image",
+      "description": "Upload a screenshot to a file input or drop target"
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "license": "MIT"
+}

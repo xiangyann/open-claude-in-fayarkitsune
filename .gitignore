@@ -7,3 +7,4 @@ host/com.anthropic.open_claude_in_firefox.json
 .env
 *.log
 .DS_Store
+*.mcpb
