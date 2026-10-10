@@ -183,24 +183,25 @@ function attachExtension(conn) {
 function detachExtension(conn) {
   if (extensionConn !== conn) return;
   extensionConn = null;
-  if (pendingRequests.size > 0) {
-    // Give the extension a few seconds to reconnect, then resend once.
-    setTimeout(() => {
-      if (extensionConnected()) {
-        for (const [id, entry] of pendingRequests) {
-          if (entry.resent) continue;
-          entry.resent = true;
-          extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
-        }
+  // Only the requests that were in flight on this connection: anything sent
+  // after a reconnect already reached the new connection and mustn't repeat.
+  const inFlight = [...pendingRequests.keys()];
+  if (inFlight.length === 0) return;
+  // Give the extension a few seconds to reconnect, then resend once.
+  setTimeout(() => {
+    for (const id of inFlight) {
+      const entry = pendingRequests.get(id);
+      if (!entry) continue; // answered or timed out meanwhile
+      if (extensionConnected() && !entry.resent) {
+        entry.resent = true;
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
       } else {
-        for (const [, { reject, timer }] of pendingRequests) {
-          clearTimeout(timer);
-          reject(new Error("Browser extension disconnected"));
-        }
-        pendingRequests.clear();
+        clearTimeout(entry.timer);
+        pendingRequests.delete(id);
+        entry.reject(new Error("Browser extension disconnected"));
       }
-    }, 5000);
-  }
+    }
+  }, 5000);
 }
 
 // WebSocket upgrades are handed to this (non-listening) HTTP server. Only
@@ -520,7 +521,7 @@ async function callTool(toolName, args) {
 
 const server = new McpServer({
   name: "open-claude-in-fayarkitsune",
-  version: "1.1.0",
+  version: "1.1.1",
 });
 
 // Pre-validation arg coercion
