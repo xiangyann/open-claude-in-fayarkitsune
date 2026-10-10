@@ -8,3 +8,4 @@ host/com.anthropic.open_claude_in_firefox.json
 *.log
 .DS_Store
 *.mcpb
+web-ext-artifacts/

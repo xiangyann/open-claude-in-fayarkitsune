@@ -67,13 +67,40 @@ No native messaging host, registry keys or install script: the extension finds t
 ### Prerequisites
 
 - **Firefox** 142+
-- **Claude Desktop**, and/or **Claude Code** v2.0.73+ with **Node.js** v18+
+- **Claude Desktop** and/or **Claude Code** v2.0.73+
+- **Node.js** v18+ to build the MCP server (Claude Desktop then runs it with its own built-in Node.js)
+
+No signed build is published, so you build both parts from this repo.
 
 ### Step 1: Install the extension
 
-Install the signed `.xpi`: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
+Pick one of these.
 
-For development, load it unsigned instead: `about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `extension/manifest.json`. Temporary add-ons are removed when Firefox restarts.
+#### Temporary (quickest, any Firefox)
+
+`about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `extension/manifest.json`. Firefox removes temporary add-ons when it restarts, so you'll repeat this after each restart.
+
+#### Permanent: sign your own copy
+
+Release Firefox only installs add-ons signed by Mozilla. Signing as **unlisted** is free, automated, and doesn't publish anything on addons.mozilla.org:
+
+1. Change `browser_specific_settings.gecko.id` in `extension/manifest.json` to an ID of your own, e.g. `claude-mcp@yourname`. Add-on IDs are unique on AMO, and the current one belongs to the maintainer's account.
+2. Create API credentials at [addons.mozilla.org/developers/addon/api/key](https://addons.mozilla.org/developers/addon/api/key/).
+3. Sign:
+   ```bash
+   npx web-ext sign -s extension --channel=unlisted --api-key=YOUR_JWT_ISSUER --api-secret=YOUR_JWT_SECRET
+   ```
+4. Install the `.xpi` it saves in `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
+
+#### Permanent: unsigned, on Firefox Developer Edition, Nightly or ESR
+
+Those builds can turn off the signature check (release and beta Firefox ignore it):
+
+1. In `about:config`, set `xpinstall.signatures.required` to `false`.
+2. Build: `npx web-ext build -s extension`
+3. Install the `.zip` from `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
+
+#### Permissions
 
 After installing, a setup page opens with the extension's permissions. You can reopen it any time from the toolbar button, which shows a red **!** while website access is missing:
 
@@ -84,15 +111,15 @@ After installing, a setup page opens with the extension's permissions. You can r
 
 #### Claude Desktop
 
-Double-click `open-claude-in-fayarkitsune.mcpb` to install it. Claude Desktop runs it with its built-in Node.js, so nothing else needs installing.
-
-To build the `.mcpb` yourself:
+Build the `.mcpb` bundle:
 
 ```bash
 cd host
 npm install
 npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
 ```
+
+Then double-click `open-claude-in-fayarkitsune.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so you can also hand the file to someone without Node.js installed.
 
 #### Claude Code
 
