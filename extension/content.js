@@ -1,4 +1,4 @@
-// Content script for Open Claude in Firefox extension.
+// Content script for Claude MCP in Fayar kitsune extension.
 // Injected into every page. Provides:
 // - Accessibility tree generation (read_page)
 // - Element ref mapping with WeakRef (persistent across calls)
@@ -420,6 +420,54 @@
     return new Promise((r) => setTimeout(r, ms));
   }
 
+  // Whether a user-scrollable element can still move by (dx, dy).
+  function canScroll(node, dx, dy) {
+    const style = getComputedStyle(node);
+    const canY = dy !== 0 && /auto|scroll|overlay/.test(style.overflowY) &&
+      (dy > 0 ? node.scrollTop + node.clientHeight < node.scrollHeight - 1 : node.scrollTop > 0);
+    const canX = dx !== 0 && /auto|scroll|overlay/.test(style.overflowX) &&
+      (dx > 0 ? node.scrollLeft + node.clientWidth < node.scrollWidth - 1 : node.scrollLeft > 0);
+    return canY || canX;
+  }
+
+  // Nearest element (from el upwards, body included) that can still scroll by
+  // (dx, dy); null means the page itself should scroll.
+  function findScrollableAncestor(el, dx, dy) {
+    for (let node = el; node && node !== document.documentElement; node = node.parentElement) {
+      if (canScroll(node, dx, dy)) return node;
+    }
+    return null;
+  }
+
+  // Scroll target (an element or window) instantly; true if it actually moved.
+  function scrollMoves(target, dx, dy) {
+    const pos = () => (target === window ? [window.scrollX, window.scrollY] : [target.scrollLeft, target.scrollTop]);
+    const [x0, y0] = pos();
+    target.scrollBy({ left: dx, top: dy, behavior: "instant" });
+    const [x1, y1] = pos();
+    return x0 !== x1 || y0 !== y1;
+  }
+
+  // html or body hides overflow in this direction *and* has content cut off.
+  // Apps that hide overflow by design (an inner pane scrolls) don't count.
+  function isScrollLocked(dx, dy) {
+    return [document.documentElement, document.body].some((node) => {
+      if (!node) return false;
+      const style = getComputedStyle(node);
+      const lockedY = dy !== 0 && /hidden|clip/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1;
+      const lockedX = dx !== 0 && /hidden|clip/.test(style.overflowX) && node.scrollWidth > node.clientWidth + 1;
+      return lockedY || lockedX;
+    });
+  }
+
+  // Inline !important beats the page's stylesheet !important, and setting it
+  // through the CSSOM isn't blocked by the page's CSP (a <style> tag can be).
+  function unlockScroll() {
+    for (const node of [document.documentElement, document.body]) {
+      if (node) node.style.setProperty("overflow", "auto", "important");
+    }
+  }
+
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "generateAccessibilityTree") {
@@ -532,22 +580,41 @@
     }
 
     if (msg.type === "dispatchScroll") {
+      const dx = msg.deltaX || 0;
+      const dy = msg.deltaY || 0;
       const el = document.elementFromPoint(msg.x, msg.y) || document.documentElement;
-      el.dispatchEvent(new WheelEvent("wheel", {
+      const notCanceled = el.dispatchEvent(new WheelEvent("wheel", {
         bubbles: true, cancelable: true, view: window,
         clientX: msg.x, clientY: msg.y,
-        deltaX: msg.deltaX || 0, deltaY: msg.deltaY || 0,
+        deltaX: dx, deltaY: dy,
         deltaMode: WheelEvent.DOM_DELTA_PIXEL,
         ctrlKey: !!(msg.modifiers & 2), altKey: !!(msg.modifiers & 1),
         shiftKey: !!(msg.modifiers & 8), metaKey: !!(msg.modifiers & 4),
       }));
-      // Also scroll the container for compatibility
-      if (el !== document.documentElement && el !== document.body) {
-        el.scrollBy({ left: msg.deltaX || 0, top: msg.deltaY || 0, behavior: "auto" });
-      } else {
-        window.scrollBy({ left: msg.deltaX || 0, top: msg.deltaY || 0, behavior: "auto" });
+      // A synthetic wheel event never scrolls by itself, so scroll what a real
+      // wheel would: the nearest ancestor that can still move that way, else
+      // the page.
+      const scrollNearest = () => {
+        const target = findScrollableAncestor(el, dx, dy);
+        if (target && scrollMoves(target, dx, dy)) return true;
+        if (scrollMoves(window, dx, dy)) return true;
+        // When html isn't overflow:visible, body is its own scroller, even
+        // if the point isn't over it.
+        const body = document.body;
+        return !!body && canScroll(body, dx, dy) && scrollMoves(body, dx, dy);
+      };
+      let moved = false;
+      let unlocked = false;
+      // preventDefault means the page used the wheel itself (a map, a carousel)...
+      if (notCanceled) moved = scrollNearest();
+      // ...unless it's a scroll lock (cookie walls, modals): force html/body
+      // back to overflow:auto, like the usual "unlock scroll" bookmarklet.
+      if (!moved && isScrollLocked(dx, dy)) {
+        unlockScroll();
+        unlocked = true;
+        moved = scrollNearest();
       }
-      sendResponse({});
+      sendResponse({ moved, unlocked, handledByPage: !notCanceled && !unlocked });
       return true;
     }
 

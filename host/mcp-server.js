@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// MCP Server for Open Claude in Firefox extension.
+// MCP Server for Claude MCP in Fayar kitsune extension.
 // Started by Claude Code via stdio MCP transport.
 //
 // Operates in one of two modes:
@@ -8,13 +8,20 @@
 // - CLIENT: Port already taken by another session, connects as a client
 //
 // This allows multiple Claude Code sessions to share one browser extension.
+//
+// The primary's port accepts three kinds of connection:
+// - the browser extension over WebSocket (extension >= 1.1.0)
+// - client MCP servers (newline-delimited JSON, start with client_hello)
+// - the legacy native messaging host (extension 1.0.0)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import net from "node:net";
+import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { WebSocketServer } from "ws";
 import { z } from "zod";
 
 
@@ -37,14 +44,16 @@ const TCP_PORT = getPort();
 let mode = "primary"; // or "client"
 
 // --- Shared state ---
-let nativeHostSocket = null;
+// The browser extension's connection, whichever transport it came in on:
+// { send(msg), close(), isOpen() }
+let extensionConn = null;
 const pendingRequests = new Map(); // id -> { resolve, reject, timer, tool, args, resent }
 let requestIdCounter = 0;
 
 // Primary mode: track client MCP server connections
 const clientSockets = new Map(); // clientId -> socket
 let clientIdCounter = 0;
-// Map from prefixed request ID -> { clientId, originalId }
+// Map from prefixed request ID -> { clientId, originalId, tool, args, resent }
 const clientRequestMap = new Map();
 
 // Client mode: TCP connection to the primary
@@ -63,14 +72,13 @@ function sendToExtension(tool, args) {
     pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
 
     if (mode === "primary") {
-      if (!nativeHostSocket || nativeHostSocket.destroyed) {
+      if (!extensionConnected()) {
         clearTimeout(timer);
         pendingRequests.delete(id);
-        reject(new Error("Browser extension is not connected. Make sure Firefox is running with the Open Claude in Firefox extension installed and enabled."));
+        reject(new Error("Browser extension is not connected. Make sure Firefox is running with the Claude MCP in Fayar kitsune extension installed and enabled."));
         return;
       }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-      nativeHostSocket.write(msg);
+      extensionConn.send({ id, type: "tool_request", tool, args });
     } else {
       // Client mode: send to primary server
       if (!primarySocket || primarySocket.destroyed) {
@@ -102,7 +110,7 @@ function cleanupPidfile() {
 
 function shutdown() {
   if (mode === "primary") cleanupPidfile();
-  if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
+  if (extensionConn) extensionConn.close();
   if (primarySocket && !primarySocket.destroyed) primarySocket.destroy();
   for (const [, sock] of clientSockets) {
     if (!sock.destroyed) sock.destroy();
@@ -159,10 +167,101 @@ function processLine(line) {
   } catch {}
 }
 
+// --- Browser extension connection (WebSocket, or legacy native host socket) ---
+
+function extensionConnected() {
+  return extensionConn !== null && extensionConn.isOpen();
+}
+
+// Returns false if another browser is already connected.
+function attachExtension(conn) {
+  if (extensionConnected()) return false;
+  extensionConn = conn;
+  return true;
+}
+
+function detachExtension(conn) {
+  if (extensionConn !== conn) return;
+  extensionConn = null;
+  // Only the requests that were in flight on this connection, this session's
+  // and those forwarded from client sessions: anything sent after a
+  // reconnect already reached the new connection and mustn't repeat.
+  const inFlight = [...pendingRequests.keys()];
+  const forwarded = [...clientRequestMap.keys()];
+  if (inFlight.length === 0 && forwarded.length === 0) return;
+  // Give the extension a few seconds to reconnect, then resend each once.
+  setTimeout(() => {
+    for (const id of inFlight) {
+      const entry = pendingRequests.get(id);
+      if (!entry) continue; // answered or timed out meanwhile
+      if (extensionConnected() && !entry.resent) {
+        entry.resent = true;
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
+      } else {
+        clearTimeout(entry.timer);
+        pendingRequests.delete(id);
+        entry.reject(new Error("Browser extension disconnected"));
+      }
+    }
+    for (const id of forwarded) {
+      const entry = clientRequestMap.get(id);
+      if (!entry) continue; // answered, or the client left
+      if (extensionConnected() && !entry.resent) {
+        entry.resent = true;
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
+      } else {
+        clientRequestMap.delete(id);
+        const clientSocket = clientSockets.get(entry.clientId);
+        if (clientSocket && !clientSocket.destroyed) {
+          clientSocket.write(JSON.stringify({ id: entry.originalId, type: "tool_error", error: "Browser extension disconnected" }) + "\n");
+        }
+      }
+    }
+  }, 5000);
+}
+
+// WebSocket upgrades are handed to this (non-listening) HTTP server. Only
+// moz-extension:// origins are accepted, so web pages can't connect.
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(426, { "Content-Type": "text/plain" });
+  res.end("WebSocket upgrade required\n");
+});
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on("upgrade", (req, socket, head) => {
+  const origin = req.headers.origin || "";
+  if (!origin.startsWith("moz-extension://")) {
+    process.stderr.write(`Rejected WebSocket connection from origin "${origin}"\n`);
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, setupExtensionWebSocket);
+});
+
+function setupExtensionWebSocket(ws) {
+  const conn = {
+    send: (msg) => ws.send(JSON.stringify(msg)),
+    close: () => ws.terminate(),
+    isOpen: () => ws.readyState === ws.OPEN,
+  };
+  if (!attachExtension(conn)) {
+    ws.close(1008, "Another browser profile is already connected.");
+    return;
+  }
+  process.stderr.write("Browser extension connected\n");
+  ws.on("message", (data) => processLine(data.toString("utf-8")));
+  ws.on("error", () => {});
+  ws.on("close", () => {
+    if (extensionConn === conn) process.stderr.write("Browser extension disconnected\n");
+    detachExtension(conn);
+  });
+}
+
 const tcpServer = net.createServer((socket) => {
-  // Classification: wait briefly for a client_hello. If none arrives, treat as native host.
-  // Native hosts (launched by the browser) don't send data immediately on connect.
-  // Client MCP servers send client_hello immediately.
+  // Classification:
+  // - "GET " means an HTTP request: the extension's WebSocket handshake.
+  // - Client MCP servers send client_hello immediately.
+  // - Anything else, or silence for 500ms, is a legacy native host.
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
@@ -176,6 +275,18 @@ const tcpServer = net.createServer((socket) => {
   socket.on("data", function onEarlyData(chunk) {
     if (classified) return; // Already classified, data handler was replaced
     earlyBuffer = Buffer.concat([earlyBuffer, chunk]);
+
+    if (earlyBuffer.length >= 4 && earlyBuffer.toString("latin1", 0, 4) === "GET ") {
+      classified = true;
+      clearTimeout(classifyTimeout);
+      socket.removeListener("data", onEarlyData);
+      socket.pause();
+      socket.unshift(earlyBuffer);
+      httpServer.emit("connection", socket);
+      socket.resume();
+      return;
+    }
+
     const newlineIdx = earlyBuffer.indexOf(10);
     if (newlineIdx === -1) return; // No full line yet, keep buffering
 
@@ -199,15 +310,19 @@ const tcpServer = net.createServer((socket) => {
   });
 });
 
+// Legacy: extension 1.0.0 talks to us through native-host.js over raw TCP.
 function setupNativeHostConnection(socket, initialBuffer) {
-  if (nativeHostSocket && !nativeHostSocket.destroyed) {
-    // Already have a native host. Reject.
+  const conn = {
+    send: (msg) => socket.write(JSON.stringify(msg) + "\n"),
+    close: () => socket.destroy(),
+    isOpen: () => !socket.destroyed,
+  };
+  if (!attachExtension(conn)) {
     socket.end(JSON.stringify({ type: "error", error: "Another browser profile is already connected." }) + "\n");
     socket.destroy();
     return;
   }
 
-  nativeHostSocket = socket;
   let buffer = initialBuffer;
 
   // Process any data already in the buffer
@@ -226,28 +341,8 @@ function setupNativeHostConnection(socket, initialBuffer) {
     }
   });
 
-  socket.on("error", () => { nativeHostSocket = null; });
-
-  socket.on("close", () => {
-    if (nativeHostSocket === socket) nativeHostSocket = null;
-    if (pendingRequests.size > 0) {
-      setTimeout(() => {
-        if (nativeHostSocket && !nativeHostSocket.destroyed) {
-          for (const [id, entry] of pendingRequests) {
-            if (entry.resent) continue;
-            entry.resent = true;
-            nativeHostSocket.write(JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n");
-          }
-        } else {
-          for (const [, { reject, timer }] of pendingRequests) {
-            clearTimeout(timer);
-            reject(new Error("Native host disconnected"));
-          }
-          pendingRequests.clear();
-        }
-      }, 5000);
-    }
-  });
+  socket.on("error", () => {});
+  socket.on("close", () => detachExtension(conn));
 }
 
 function setupClientConnection(socket, initialBuffer) {
@@ -269,16 +364,17 @@ function setupClientConnection(socket, initialBuffer) {
       try {
         const msg = JSON.parse(line);
         if (msg.type === "tool_request" && msg.id) {
-          // Forward to native host with a prefixed ID
+          // Forward to the extension with a prefixed ID
           const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
+          // tool/args are kept so the request can be resent after a reconnect
+          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, resent: false });
 
-          if (!nativeHostSocket || nativeHostSocket.destroyed) {
+          if (!extensionConnected()) {
             // Send error back to client
             socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
             clientRequestMap.delete(prefixedId);
           } else {
-            nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
+            extensionConn.send({ ...msg, id: prefixedId });
           }
         }
       } catch {}
@@ -441,8 +537,8 @@ async function callTool(toolName, args) {
 // --- MCP Server with all 18 tools ---
 
 const server = new McpServer({
-  name: "open-claude-in-firefox",
-  version: "1.0.0",
+  name: "open-claude-in-fayarkitsune",
+  version: "1.1.1",
 });
 
 // Pre-validation arg coercion

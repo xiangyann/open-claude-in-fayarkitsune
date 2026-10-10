@@ -1,15 +1,18 @@
-// Background service worker for Open Claude in Firefox extension.
-// Handles: native messaging, Firefox WebExtension APIs, tool dispatch, window management.
+// Background service worker for Claude MCP in Fayar kitsune extension.
+// Handles: WebSocket link to the MCP server, Firefox WebExtension APIs, tool dispatch, window management.
 
 self.addEventListener("unhandledrejection", (event) => {
   event.preventDefault();
 });
 
-const NATIVE_HOST_NAME = "com.anthropic.open_claude_in_firefox";
+// Must match the MCP server's port (host/mcp-server.js, default 18765).
+const SERVER_URL = "ws://127.0.0.1:18765";
 const MCP_WINDOW_STORAGE_KEY = "mcpWindowId";
 
 // --- State ---
-let nativePort = null;
+let serverSocket = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
 let mcpWindowId = null;
 const mcpTabs = new Set();
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
@@ -21,49 +24,70 @@ const consoleInterceptors = new Set(); // tabIds with interceptor installed
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
-    if (!nativePort) connectNativeHost();
+    if (!serverSocket) connectToServer();
   }
 });
 
-// --- Native messaging ---
-function connectNativeHost() {
-  if (nativePort) return;
+// --- Connection to the MCP server ---
+function connectToServer() {
+  if (serverSocket) return;
+  let ws;
   try {
-    nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    ws = new WebSocket(SERVER_URL);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+  serverSocket = ws;
 
-    nativePort.onMessage.addListener((msg) => {
-      if (msg.type === "tool_request" && msg.id) {
-        handleToolRequest(msg.id, msg.tool, msg.args || {});
-      }
-    });
+  ws.onopen = () => {
+    reconnectDelay = 1000;
+  };
 
-    nativePort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      nativePort = null;
-      setTimeout(connectNativeHost, 2000);
-    });
-  } catch (e) {
-    nativePort = null;
-    setTimeout(connectNativeHost, 2000);
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (msg.type === "tool_request" && msg.id) {
+      handleToolRequest(msg.id, msg.tool, msg.args || {});
+    }
+  };
+
+  // onerror is always followed by onclose
+  ws.onclose = () => {
+    if (serverSocket === ws) serverSocket = null;
+    scheduleReconnect();
+  };
+}
+
+// The server only runs while Claude is open, so back off up to 10s between tries.
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToServer();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+}
+
+function postToServer(msg) {
+  if (!serverSocket || serverSocket.readyState !== WebSocket.OPEN) return;
+  try {
+    serverSocket.send(JSON.stringify(msg));
+  } catch {
+    // Socket closed
   }
 }
 
 function sendResponse(id, result) {
-  if (!nativePort) return;
-  try {
-    nativePort.postMessage({ id, type: "tool_response", result });
-  } catch {
-    // Port disconnected
-  }
+  postToServer({ id, type: "tool_response", result });
 }
 
 function sendError(id, error) {
-  if (!nativePort) return;
-  try {
-    nativePort.postMessage({ id, type: "tool_error", error: String(error) });
-  } catch {
-    // Port disconnected
-  }
+  postToServer({ id, type: "tool_error", error: String(error) });
 }
 
 // --- MCP window management (replaces Chrome tab groups) ---
@@ -258,7 +282,10 @@ async function resolveRefToCoordinates(tabId, ref) {
 
 // --- Screenshot helper ---
 // Firefox uses tabs.captureVisibleTab() — the tab must be active in its window.
-async function takeScreenshot(tabId) {
+// scale 1 keeps image pixels equal to CSS pixels, so coordinates read off a
+// screenshot match the ones clicks use, even on HiDPI screens.
+// rect (optional) is a region in page coordinates, i.e. including scroll offset.
+async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
   const tab = await chrome.tabs.get(tabId);
 
   // Activate the tab so captureVisibleTab captures the right content
@@ -267,19 +294,15 @@ async function takeScreenshot(tabId) {
     await sleep(100);
   }
 
-  let dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-    format: "jpeg",
-    quality: 55,
-  });
-  let base64 = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+  const capture = async (quality) => {
+    const options = { format: "jpeg", quality, scale };
+    if (rect) options.rect = rect;
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, options);
+    return dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+  };
 
-  if (base64.length > 500000) {
-    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 30,
-    });
-    base64 = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
-  }
+  let base64 = await capture(55);
+  if (base64.length > 500000) base64 = await capture(30);
 
   const imageId = `screenshot_${Date.now()}`;
   screenshotStore.set(imageId, base64);
@@ -559,16 +582,20 @@ const toolHandlers = {
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
         const deltaY = dir === "up" ? -amount * 100 : dir === "down" ? amount * 100 : 0;
-        await sendContentMessage(tabId, {
+        const outcome = await sendContentMessage(tabId, {
           type: "dispatchScroll",
           x: coordinate[0], y: coordinate[1],
           deltaX, deltaY, modifiers,
         });
+        let note = "";
+        if (outcome?.unlocked) note = " (the page had scrolling locked; forced overflow:auto on html/body)";
+        if (outcome?.handledByPage) note = " (the page handled the wheel event itself, e.g. a map or carousel)";
+        else if (outcome && !outcome.moved) note += " (nothing scrolled: already at the edge, or nothing scrollable here)";
         await sleep(300);
         const { base64 } = await takeScreenshot(tabId);
         return {
           content: [
-            { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})` },
+            { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})${note}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -615,11 +642,31 @@ const toolHandlers = {
         if (!args.region || args.region.length !== 4) {
           return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
         }
-        const { base64: fullBase64 } = await takeScreenshot(tabId);
+        const [x0, y0, x1, y1] = args.region.map(Number);
+        if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) {
+          return { content: [{ type: "text", text: "region must be numbers with x1 > x0 and y1 > y0" }] };
+        }
+        // captureVisibleTab's rect is in page coordinates, so add the scroll offset.
+        const [{ result: view }] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY, innerWidth: window.innerWidth }),
+        });
+        // The rect must be whole pixels (scroll offsets can be fractional on
+        // scaled displays); round outwards so the whole region is covered.
+        const left = Math.floor(view.scrollX + x0);
+        const top = Math.floor(view.scrollY + y0);
+        const width = Math.ceil(view.scrollX + x1) - left;
+        const height = Math.ceil(view.scrollY + y1) - top;
+        // Render the region at up to 4x so it fills roughly a viewport's width.
+        const scale = Math.min(4, Math.max(1, view.innerWidth / width));
+        const { base64 } = await takeScreenshot(tabId, {
+          rect: { x: left, y: top, width, height },
+          scale,
+        });
         return {
           content: [
-            { type: "text", text: `Zoom region: [${args.region.join(", ")}]` },
-            { type: "image", data: fullBase64, mimeType: "image/jpeg" },
+            { type: "text", text: `Zoomed into region [${args.region.join(", ")}] at ${scale.toFixed(1)}x` },
+            { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
       }
@@ -718,26 +765,20 @@ const toolHandlers = {
       return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: (code) => {
-          try {
-            const val = eval(code); // eslint-disable-line no-eval
-            if (val && typeof val.then === "function") {
-              return val
-                .then((v) => ({ value: v === undefined ? "__undefined__" : v }))
-                .catch((e) => ({ error: e.message }));
-            }
-            return { value: val === undefined ? "__undefined__" : val };
-          } catch (e) {
-            return { error: e.message };
-          }
-        },
-        args: [text],
-      });
+      let result = await evalInPage(tabId, text);
+      if (result?.error && isCspError(result.error)) {
+        if (chrome.userScripts?.execute) {
+          result = await runAsUserScript(tabId, text);
+        } else {
+          // The namespace only exists once the permission is granted;
+          // userScripts.execute itself needs Firefox 153+.
+          const fix = chrome.userScripts
+            ? "Running scripts on sites like this needs Firefox 153 or later."
+            : `To run scripts on sites like this, click the ${EXTENSION_NAME} toolbar button and allow "User scripts".`;
+          result = { error: `${result.error}. This site's security policy blocks eval(). ${fix}` };
+        }
+      }
 
-      const result = results[0]?.result;
       if (!result) return { content: [{ type: "text", text: "undefined" }] };
       if (result.error)
         return { content: [{ type: "text", text: `Error: ${result.error}` }] };
@@ -752,7 +793,7 @@ const toolHandlers = {
         ],
       };
     } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      return { content: [{ type: "text", text: `Error: ${withPermissionHelp(e.message)}` }] };
     }
   },
 
@@ -905,9 +946,121 @@ async function handleToolRequest(id, tool, args) {
     const result = await handler(args);
     sendResponse(id, result);
   } catch (err) {
-    sendError(id, `${tool} failed: ${err.message}`);
+    sendError(id, `${tool} failed: ${withPermissionHelp(err.message)}`);
   }
 }
+
+// --- javascript_tool helpers ---
+
+// eval() in the page's own world, so page variables are visible. Pages whose
+// CSP forbids eval (reddit, HN, ...) make this fail with a CSP error.
+async function evalInPage(tabId, code) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (code) => {
+      try {
+        const val = eval(code); // eslint-disable-line no-eval
+        if (val && typeof val.then === "function") {
+          return val
+            .then((v) => ({ value: v === undefined ? "__undefined__" : v }))
+            .catch((e) => ({ error: e.message }));
+        }
+        return { value: val === undefined ? "__undefined__" : val };
+      } catch (e) {
+        return { error: e.message };
+      }
+    },
+    args: [code],
+  });
+  return results[0]?.result;
+}
+
+function isCspError(error) {
+  return /CSP|Content Security Policy/i.test(String(error));
+}
+
+function errorText(error) {
+  return typeof error === "string" ? error : error?.message || String(error);
+}
+
+// Runs code as a user script: Firefox injects it itself instead of through
+// eval(), so the page's CSP doesn't stop it. Needs the optional "userScripts"
+// permission. Tries the page's world first (page variables visible), then the
+// isolated user-script world. The block keeps top-level const/let from
+// leaking into the page between calls, and keeps the completion value.
+async function runAsUserScript(tabId, code) {
+  let lastError;
+  for (const world of ["MAIN", "USER_SCRIPT"]) {
+    try {
+      const [res] = await chrome.userScripts.execute({
+        target: { tabId },
+        js: [{ code: `{\n${code}\n}` }],
+        world,
+      });
+      if (!res?.error) return { value: res?.result === undefined ? "__undefined__" : res.result };
+      lastError = res.error;
+    } catch (e) {
+      lastError = e;
+    }
+    if (!isCspError(lastError)) break;
+  }
+  return { error: errorText(lastError) };
+}
+
+// --- Permissions and the setup page ---
+// Website access is in the install prompt (Firefox 127+), but users can revoke
+// it at any time. userScripts is optional-only in Firefox, so it can only be
+// granted from a click: on the setup page, which opens on install and from
+// the toolbar button.
+
+const EXTENSION_NAME = "Claude MCP in Fayar kitsune";
+const SITE_ACCESS = { origins: ["<all_urls>"] };
+
+function withPermissionHelp(message) {
+  return /Missing (host|activeTab) permission/i.test(message)
+    ? `${message}. Firefox hasn't given ${EXTENSION_NAME} access to websites: click its toolbar button and allow "Access to all websites".`
+    : message;
+}
+
+async function openSetupPage() {
+  const url = chrome.runtime.getURL("setup.html");
+  const [existing] = await chrome.tabs.query({ url });
+  if (existing) {
+    await chrome.tabs.update(existing.id, { active: true });
+    await chrome.windows.update(existing.windowId, { focused: true });
+  } else {
+    await chrome.tabs.create({ url });
+  }
+}
+
+async function updateBadge() {
+  const hasSiteAccess = await chrome.permissions.contains(SITE_ACCESS);
+  await chrome.action.setBadgeBackgroundColor({ color: "#d70022" });
+  await chrome.action.setBadgeText({ text: hasSiteAccess ? "" : "!" });
+  await chrome.action.setTitle({
+    title: hasSiteAccess ? EXTENSION_NAME : `${EXTENSION_NAME}: needs website access, click to set up`,
+  });
+}
+
+chrome.action.onClicked.addListener(() => openSetupPage());
+chrome.permissions.onAdded.addListener(updateBadge);
+chrome.permissions.onRemoved.addListener(updateBadge);
+
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+  // Always on first install, since userScripts can't be in the install
+  // prompt; on updates only if website access is missing.
+  if (reason === "install" || !(await chrome.permissions.contains(SITE_ACCESS))) {
+    openSetupPage();
+  }
+});
+
+// The setup page shows whether Claude's MCP server is connected.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "getConnectionStatus") {
+    sendResponse({ connected: serverSocket?.readyState === WebSocket.OPEN });
+  }
+});
 
 // --- Init ---
 
@@ -930,4 +1083,5 @@ async function recoverMcpWindowState() {
 }
 
 recoverMcpWindowState();
-connectNativeHost();
+connectToServer();
+updateBadge();

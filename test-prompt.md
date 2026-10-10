@@ -1,6 +1,6 @@
-# Open Claude in Firefox — Integration Test Prompt
+# Claude MCP in Fayar kitsune — Integration Test Prompt
 
-Copy and paste everything below the line into a new Claude Code session that has the `open-claude-in-firefox` MCP configured.
+Copy and paste everything below the line into a new Claude Code session that has the `open-claude-in-fayarkitsune` MCP configured.
 
 ---
 

@@ -1,0 +1,55 @@
+// Setup page: shows and requests the extension's permissions, and whether
+// Claude's MCP server is connected.
+
+const PERMISSIONS = [
+  { id: "site-access", request: { origins: ["<all_urls>"] } },
+  { id: "user-scripts", request: { permissions: ["userScripts"] } },
+];
+
+// userScripts.execute, which javascript_tool relies on, arrived in Firefox 153.
+const userScriptsSupported = browser.runtime
+  .getBrowserInfo()
+  .then(({ version }) => parseInt(version, 10) >= 153)
+  .catch(() => true);
+
+async function renderPermissions() {
+  for (const { id, request } of PERMISSIONS) {
+    const row = document.getElementById(id);
+    const status = row.querySelector(".status");
+    const button = row.querySelector("button");
+    if (id === "user-scripts" && !(await userScriptsSupported)) {
+      status.textContent = "Needs Firefox 153+";
+      status.className = "status warn";
+      button.hidden = true;
+      continue;
+    }
+    const granted = await chrome.permissions.contains(request);
+    status.textContent = granted ? "Allowed" : "Not allowed";
+    status.className = `status ${granted ? "ok" : "warn"}`;
+    button.hidden = granted;
+  }
+}
+
+for (const { id, request } of PERMISSIONS) {
+  // permissions.request only works directly inside the click handler.
+  document.getElementById(id).querySelector("button").addEventListener("click", () => {
+    chrome.permissions.request(request).then(renderPermissions, renderPermissions);
+  });
+}
+
+async function renderConnection() {
+  let connected = false;
+  try {
+    ({ connected } = await chrome.runtime.sendMessage({ type: "getConnectionStatus" }));
+  } catch {}
+  const el = document.getElementById("connection");
+  el.textContent = connected
+    ? "Connected. Claude can use this browser."
+    : "Not connected yet. Start Claude Desktop with the Claude MCP in Fayar kitsune extension installed, or a Claude Code session with the MCP server added. This page updates by itself.";
+}
+
+chrome.permissions.onAdded.addListener(renderPermissions);
+chrome.permissions.onRemoved.addListener(renderPermissions);
+renderPermissions();
+renderConnection();
+setInterval(renderConnection, 3000);

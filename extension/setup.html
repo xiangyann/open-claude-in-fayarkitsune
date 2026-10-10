@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude MCP in Fayar kitsune setup</title>
+  <link rel="icon" href="icons/icon16.png">
+  <style>
+    :root {
+      --bg: #f9f9fb;
+      --card: #ffffff;
+      --text: #15141a;
+      --muted: #5b5b66;
+      --border: #e0e0e6;
+      --accent: #0061e0;
+      --accent-hover: #0250bb;
+      --ok: #017a40;
+      --ok-bg: #e3fff3;
+      --warn: #8a4d00;
+      --warn-bg: #fff4de;
+      color-scheme: light dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1c1b22;
+        --card: #2b2a33;
+        --text: #fbfbfe;
+        --muted: #bfbfc9;
+        --border: #3a3944;
+        --accent: #00ddff;
+        --accent-hover: #80ebff;
+        --ok: #54ffbd;
+        --ok-bg: #0f3a2b;
+        --warn: #ffd567;
+        --warn-bg: #4a3b0e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 680px; margin: 0 auto; padding: 40px 16px 56px; }
+    header { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+    header img { width: 40px; height: 40px; }
+    h1 { font-size: 22px; margin: 0; }
+    h2 { font-size: 16px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    p { margin: 0; }
+    .lede { color: var(--muted); margin-bottom: 28px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-bottom: 12px;
+    }
+    .perm { display: flex; gap: 20px; align-items: center; justify-content: space-between; }
+    .perm p { color: var(--muted); font-size: 14px; }
+    .side { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; flex-shrink: 0; }
+    .tag {
+      font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 2px 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted);
+    }
+    .status { font-size: 13px; font-weight: 600; padding: 3px 10px; border-radius: 99px; white-space: nowrap; }
+    .status.ok { color: var(--ok); background: var(--ok-bg); }
+    .status.warn { color: var(--warn); background: var(--warn-bg); }
+    button {
+      font: inherit; font-weight: 600; font-size: 14px;
+      color: #fff; background: var(--accent);
+      border: 0; border-radius: 6px; padding: 7px 16px; cursor: pointer;
+    }
+    @media (prefers-color-scheme: dark) { button { color: #15141a; } }
+    button:hover { background: var(--accent-hover); }
+    button[hidden] { display: none; }
+    code { font-size: 13px; }
+    .footnote { color: var(--muted); font-size: 13px; margin-top: 20px; }
+    a { color: var(--accent); }
+    @media (max-width: 520px) {
+      .perm { flex-direction: column; align-items: stretch; }
+      .side { flex-direction: row; align-items: center; justify-content: space-between; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="icons/icon48.png" alt="">
+      <h1>Claude MCP in Fayar kitsune</h1>
+    </header>
+    <p class="lede">
+      Lets Claude (Claude Desktop or Claude Code) use this Firefox: open tabs, read pages, click and type.
+      The extension only talks to the MCP server on this computer (127.0.0.1). What Claude reads from a page
+      goes to Claude, like anything else in your conversation.
+    </p>
+
+    <section class="card perm" id="site-access">
+      <div>
+        <h2>Access to all websites <span class="tag">Required</span></h2>
+        <p>Needed to read pages, take screenshots, click and type on the sites Claude visits.</p>
+      </div>
+      <div class="side">
+        <span class="status"></span>
+        <button type="button">Allow</button>
+      </div>
+    </section>
+
+    <section class="card perm" id="user-scripts">
+      <div>
+        <h2>User scripts <span class="tag">Optional</span></h2>
+        <p>
+          Lets <code>javascript_tool</code> run on sites whose security policy blocks it, such as reddit.com.
+          Firefox warns that this allows unverified scripts: those scripts are the code Claude asks to run.
+        </p>
+      </div>
+      <div class="side">
+        <span class="status"></span>
+        <button type="button">Allow</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Connection to Claude</h2>
+      <p id="connection"></p>
+    </section>
+
+    <p class="footnote">
+      Change these any time in <code>about:addons</code> → Claude MCP in Fayar kitsune → Permissions,
+      or reopen this page from the toolbar button.
+      <a href="https://github.com/xiangyann/open-claude-in-fayarkitsune">Source and setup guide</a>
+    </p>
+  </main>
+  <script src="setup.js"></script>
+</body>
+</html>

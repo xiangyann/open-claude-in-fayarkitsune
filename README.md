@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="extension/icons/icon128.png" width="96" alt="Open Claude in Firefox">
+  <img src="extension/icons/icon128.png" width="96" alt="Claude MCP in Fayar kitsune">
 </p>
 
-<h1 align="center">Open Claude in Firefox</h1>
+<h1 align="center">Claude MCP in Fayar kitsune</h1>
 
 <p align="center">
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
-  <strong>Open Claude in Firefox gives you the whole web — in Firefox.</strong></em>
+  <strong>Claude MCP in Fayar kitsune gives you the whole web — in Firefox.</strong></em>
   <br/>
   <sub>Firefox port of the open-source Claude browser automation extension. No blocklist. Full MCP tool parity.</sub>
 </p>
@@ -20,11 +20,11 @@
 
 ---
 
-This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension. It gives Claude Code (and Claude Desktop) full browser automation via 18 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
+This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension, forked from [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox). It gives Claude Code (and Claude Desktop) full browser automation via 18 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
 
 ## What's Different
 
-| | Claude in Chrome (official) | Open Claude in Firefox |
+| | Claude in Chrome (official) | Claude MCP in Fayar kitsune |
 |---|---|---|
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser** | Chrome and Edge only | Firefox |
@@ -48,125 +48,106 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 | News/Media | NYT, WSJ, Barron's, MarketWatch, Bloomberg, Reuters, Economist, Wired, Vogue |
 | Social Media | Reddit |
 
-Open Claude in Firefox has **none of these restrictions**.
+Claude MCP in Fayar kitsune has **none of these restrictions**.
 
 ## Architecture
 
 ```
-Claude Code / Claude Desktop <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native messaging--> Extension <--> Firefox
+Claude Code / Claude Desktop <--stdio MCP--> mcp-server.js <--WebSocket 127.0.0.1:18765--> Extension <--> Firefox
 ```
 
-Three components:
-1. **Extension** — Manifest V3 using Firefox WebExtension APIs (screenshots via `captureVisibleTab`, input via content script synthetic events, JS eval via `scripting.executeScript`)
-2. **MCP Server** — Node.js process started by Claude Code or Claude Desktop, exposes tools via MCP
-3. **Native Messaging Host** — Bridge between the MCP server and the extension
+Two components:
+1. **Extension** — Manifest V3 using Firefox WebExtension APIs (screenshots via `captureVisibleTab`, input via content script synthetic events, JS eval via `scripting.executeScript`). Connects to the MCP server over a localhost WebSocket.
+2. **MCP Server** — Node.js process started by Claude Code or Claude Desktop, exposes tools via MCP. Only accepts WebSocket connections from `moz-extension://` origins, so web pages can't drive it.
+
+No native messaging host, registry keys or install script: the extension finds the server by its fixed port.
+
+### Security
+
+- **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header.
+- **Other Firefox add-ons can.** Every add-on has a `moz-extension://` origin, and the server doesn't check which add-on is connecting. If another add-on in the same Firefox profile connects first, it takes the server's single browser slot. It would then see the tool requests Claude sends (URLs, text to type, JavaScript to run) and could send fake results back to Claude. It can't use that connection to control the browser. Use a Firefox profile with only add-ons you trust.
+- **Programs on your computer can.** Anything running as your user can connect to `127.0.0.1:18765` and send tool requests, the same way a second Claude session does. Such a program already has your user's access to the machine, so this adds little, but it's worth knowing.
 
 ## Installation
 
 ### Prerequisites
 
-- **Node.js** v18+
-- **Firefox** 109+
-- **Claude Code** v2.0.73+ and/or **Claude Desktop**
+- **Firefox** 142+
+- **Claude Desktop** and/or **Claude Code** v2.0.73+
+- **Node.js** v18+ to build the MCP server (Claude Desktop then runs it with its own built-in Node.js)
 
-### Step 1: Install dependencies
+No signed build is published, so you build both parts from this repo.
+
+### Step 1: Install the extension
+
+Pick one of these.
+
+#### Temporary (quickest, any Firefox)
+
+`about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `extension/manifest.json`. Firefox removes temporary add-ons when it restarts, so you'll repeat this after each restart.
+
+#### Permanent: sign your own copy
+
+Release Firefox only installs add-ons signed by Mozilla. Signing as **unlisted** is free, automated, and doesn't publish anything on addons.mozilla.org:
+
+1. Change `browser_specific_settings.gecko.id` in `extension/manifest.json` to an ID of your own, e.g. `claude-mcp@yourname`. Add-on IDs are unique on AMO, and the current one belongs to the maintainer's account.
+2. Create API credentials at [addons.mozilla.org/developers/addon/api/key](https://addons.mozilla.org/developers/addon/api/key/).
+3. Sign:
+   ```bash
+   npx web-ext sign -s extension --channel=unlisted --api-key=YOUR_JWT_ISSUER --api-secret=YOUR_JWT_SECRET
+   ```
+4. Install the `.xpi` it saves in `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
+
+#### Permanent: unsigned, on Firefox Developer Edition, Nightly or ESR
+
+Those builds can turn off the signature check (release and beta Firefox ignore it):
+
+1. In `about:config`, set `xpinstall.signatures.required` to `false`.
+2. Build: `npx web-ext build -s extension`
+3. Install the `.zip` from `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
+
+#### Permissions
+
+After installing, a setup page opens with the extension's permissions. You can reopen it any time from the toolbar button, which shows a red **!** while website access is missing:
+
+- **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
+- **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
+
+### Step 2: Add the MCP server
+
+#### Claude Desktop
+
+Build the `.mcpb` bundle:
 
 ```bash
 cd host
 npm install
-cd ..
+npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
 ```
 
-### Step 2: Load the extension in Firefox
+Then double-click `open-claude-in-fayarkitsune.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so you can also hand the file to someone without Node.js installed.
 
-1. Open `about:debugging` in Firefox
-2. Click **This Firefox**
-3. Click **Load Temporary Add-on...**
-4. Select `extension/manifest.json`
-
-> **Permanent install**: Go to `about:addons` → gear icon → **Install Add-on From File** and select `extension/manifest.json`. Or load the `.xpi` if one is provided.
-
-Unlike Chrome, Firefox assigns the extension ID from `manifest.json` (`open-claude-in-firefox@anthropic`), so you don't need to pass an ID to the install script.
-
-### Step 3: Register the native messaging host
-
-#### macOS / Linux
+#### Claude Code
 
 ```bash
-./install.sh
+cd host
+npm install
+claude mcp add open-claude-in-fayarkitsune -- node "$(pwd)/mcp-server.js"
 ```
 
-#### Windows (manual)
+On Windows PowerShell, use `"$PWD\mcp-server.js"` for the path.
 
-Firefox on Windows finds native messaging hosts via the registry. Three steps:
+That's it. The extension connects to the server on its own whenever Claude is running.
 
-**3a.** Create a wrapper script at `host\native-host-wrapper.bat`:
+### Upgrading from extension 1.0.0
 
-```bat
-@echo off
-node "%~dp0native-host.js"
-```
+1.1.0 has a different add-on ID (`open-claude-in-fayarkitsune@anthropic`) from the original 1.0.0 (`open-claude-in-firefox@anthropic`), so Firefox installs it alongside 1.0.0 instead of updating it. **Remove 1.0.0 in `about:addons` before starting 1.1.0.** The server takes one browser at a time, so if both are enabled, whichever connects first wins and the other is refused.
 
-**3b.** Create the manifest at `host\com.anthropic.open_claude_in_firefox.json` (use the actual absolute path):
+Extension 1.0.0 reached the server through a native messaging host (`host/native-host.js`, registered by `install.sh` or the registry). 1.1.0 connects directly, so the host is no longer used. Once you've removed 1.0.0, also remove the old host registration:
 
-```json
-{
-  "name": "com.anthropic.open_claude_in_firefox",
-  "description": "Open Claude in Firefox Native Messaging Host",
-  "path": "C:\\path\\to\\open-claude-in-firefox\\host\\native-host-wrapper.bat",
-  "type": "stdio",
-  "allowed_extensions": ["open-claude-in-firefox@anthropic"]
-}
-```
-
-**3c.** Register it in the registry. Run in PowerShell (adjust the path):
-
-```powershell
-$manifestPath = "C:\path\to\open-claude-in-firefox\host\com.anthropic.open_claude_in_firefox.json"
-New-Item -Path "HKCU:\SOFTWARE\Mozilla\NativeMessagingHosts\com.anthropic.open_claude_in_firefox" -Force |
-  Set-ItemProperty -Name "(Default)" -Value $manifestPath
-```
-
-### Step 4: Restart Firefox
-
-Close **all** Firefox windows and reopen. Firefox reads native messaging host configs on startup.
-
-### Step 5: Add to Claude Code
-
-```bash
-claude mcp add open-claude-in-firefox -- node /absolute/path/to/host/mcp-server.js
-```
-
-Find the absolute path with:
-
-```bash
-# macOS / Linux
-echo "node $(pwd)/host/mcp-server.js"
-
-# Windows (PowerShell)
-"node $(Resolve-Path host\mcp-server.js)"
-```
-
-### Step 5 (alternative): Add to Claude Desktop
-
-Edit your Claude Desktop config file and add an `mcpServers` entry:
-
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Linux**: `~/.config/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "open-claude-in-firefox": {
-      "command": "node",
-      "args": ["/absolute/path/to/host/mcp-server.js"]
-    }
-  }
-}
-```
-
-Fully quit and restart Claude Desktop after saving.
+- **Windows**: `reg delete HKCU\Software\Mozilla\NativeMessagingHosts\com.anthropic.open_claude_in_firefox /f`
+- **macOS**: `rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/com.anthropic.open_claude_in_firefox.json`
+- **Linux**: `rm ~/.mozilla/native-messaging-hosts/com.anthropic.open_claude_in_firefox.json`
 
 ## Verification
 
@@ -220,6 +201,10 @@ Firefox WebExtensions cannot use the Chrome DevTools Protocol. Mouse clicks, key
 
 `tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. If the MCP window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused.
 
+### Content security policy
+
+The manifest sets the `extension_pages` CSP to `script-src 'self'`. This drops Firefox's Manifest V3 default `upgrade-insecure-requests`, so the `ws://127.0.0.1` connection isn't upgraded to `wss://`.
+
 ### Console monitoring
 
 Console messages are captured via a MAIN-world interceptor injected into the page. Messages logged **before** `read_console_messages` is first called on a tab are not captured. Call `read_console_messages` early in a session to start capturing.
@@ -231,9 +216,8 @@ No build step. All files are plain JavaScript. After pulling or editing:
 | What changed | What to do |
 |---|---|
 | `extension/background.js`, `content.js`, or `manifest.json` | Reload: `about:debugging` → click the reload icon next to the extension |
-| `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
-| `host/native-host.js` | Restart Firefox (close all windows, reopen) |
-| `install.sh` or native host name changed | Re-run `./install.sh`, restart Firefox, re-add MCP |
+| `host/mcp-server.js` (Claude Code) | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
+| `host/mcp-server.js` (Claude Desktop) | Rebuild the `.mcpb` (bump `version` in `host/manifest.json`) and install it again |
 
 ### Quick reset
 
@@ -243,14 +227,9 @@ If things are broken and you're not sure why:
 # 1. Kill all MCP servers
 pkill -f "node.*mcp-server"
 
-# 2. Re-run install
-./install.sh
+# 2. Reload extension in about:debugging
 
-# 3. Restart Firefox (close all windows, reopen)
-
-# 4. Reload extension in about:debugging
-
-# 5. Reconnect in Claude Code
+# 3. Reconnect in Claude Code
 # /mcp
 ```
 
@@ -267,29 +246,19 @@ pkill -f "node.*mcp-server"
 
 ## Troubleshooting
 
-### Extension not connecting
-
-1. Verify the extension is loaded and enabled in `about:debugging`
-2. Make sure `./install.sh` completed without errors (macOS/Linux) or the registry key is set (Windows)
-3. Restart Firefox completely (all windows closed)
-4. Verify the native messaging manifest exists:
-   - **macOS**: `~/Library/Application Support/Mozilla/NativeMessagingHosts/com.anthropic.open_claude_in_firefox.json`
-   - **Linux**: `~/.mozilla/native-messaging-hosts/com.anthropic.open_claude_in_firefox.json`
-   - **Windows**: check `HKCU\SOFTWARE\Mozilla\NativeMessagingHosts\com.anthropic.open_claude_in_firefox` in the registry
-
 ### MCP server not found
 
 Use an absolute path:
 ```bash
-claude mcp add open-claude-in-firefox -- node /absolute/path/to/host/mcp-server.js
+claude mcp add open-claude-in-fayarkitsune -- node /absolute/path/to/host/mcp-server.js
 ```
 
 ### "Browser extension is not connected"
 
-The MCP server started but the native host hasn't connected. Try:
-1. Open any webpage in the MCP window (wakes the service worker)
-2. Check service worker logs: `about:debugging` → Inspect the extension's service worker
-3. Verify `host/native-host-wrapper.sh` (macOS/Linux) or `host/native-host-wrapper.bat` (Windows) exists and is executable
+The MCP server is running but the extension hasn't connected. The extension retries with a backoff of up to 10 seconds, so wait a moment first. Then:
+1. Verify the extension is installed and enabled in `about:addons`
+2. Check the extension's logs: `about:debugging` → **This Firefox** → **Inspect** next to the extension. Connection errors for `ws://127.0.0.1:18765` show up in its console.
+3. Make sure no older server (from 1.0.0) is holding the port: `pkill -f "node.*mcp-server"`, then reconnect
 
 ### Tools fail immediately after reconnect
 
@@ -308,7 +277,8 @@ Default port is 18765. To change:
    ```json
    { "port": 19000 }
    ```
-2. Restart Firefox and Claude Code
+2. Change `SERVER_URL` in `extension/background.js` to match, and reload (or re-sign) the extension
+3. Restart Claude
 
 ## License
 
