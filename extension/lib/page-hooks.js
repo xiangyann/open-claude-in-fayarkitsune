@@ -67,12 +67,13 @@ function installPageHooks(settings) {
         note.answer = "left open for the user";
         return { native: true };
       }
-      const chosen = hooks.nextAnswer;
-      hooks.nextAnswer = null;
       if (type === "alert") {
+        // Leaves an answer chosen with handle_dialog for the next confirm/prompt.
         note.answer = "OK";
         return { value: undefined };
       }
+      const chosen = hooks.nextAnswer;
+      hooks.nextAnswer = null;
       const accept = chosen ? chosen.accept : false;
       if (type === "confirm") {
         note.answer = accept ? "OK" : "Cancel";

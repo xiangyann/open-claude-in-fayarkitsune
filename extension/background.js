@@ -243,7 +243,11 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   const { kind } = await tabControl(tab.openerTabId);
   if (kind === "own" && tab.groupId !== claudeGroupId) {
     try {
-      await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] });
+      // A popup window's tab is elsewhere; a tab joins a group only in the
+      // group's own window.
+      const group = await findClaudeGroup();
+      if (tab.windowId !== group.windowId) await chrome.tabs.move(tab.id, { windowId: group.windowId, index: -1 });
+      await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
     } catch {}
   } else if (kind === "shared" && Date.now() - (lastWorkAt.get(tab.openerTabId) || 0) < 5000) {
     sharedTabs.add(tab.id);
@@ -350,9 +354,13 @@ function dialogDeadline(tabId, kind) {
 
 // Installs or updates the hooks in the tab's page and returns what they
 // recorded ({ dialogs, dropped } or { logs }); null where pages can't be
-// scripted.
+// scripted, or when the page doesn't answer in time: a script stuck in a
+// loop (one javascript_tool gave up on) blocks the page's world, and the
+// tool result mustn't wait for it.
+const PAGE_HOOKS_TIMEOUT_MS = 3000;
+
 async function callPageHooks(tabId, settings, frameId = 0) {
-  try {
+  const call = (async () => {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: "MAIN",
@@ -362,9 +370,8 @@ async function callPageHooks(tabId, settings, frameId = 0) {
     });
     if (settings?.answerUntil > 0) hookedTabs.add(tabId);
     return res?.result ?? null;
-  } catch {
-    return null;
-  }
+  })().catch(() => null);
+  return Promise.race([call, sleep(PAGE_HOOKS_TIMEOUT_MS).then(() => null)]);
 }
 
 // A tab Claude no longer controls (released, or dragged out of Claude's

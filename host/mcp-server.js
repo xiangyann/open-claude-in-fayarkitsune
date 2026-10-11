@@ -566,6 +566,9 @@ async function callTool(toolName, args) {
 // comes from this server and the answer from the user, not from the model.
 // Apps without that ask Claude to get the answer in the conversation.
 const HANDOVER_ANSWER_TIMEOUT_MS = 5 * 60 * 1000;
+// Tabs whose handover was sent to the conversation because the app's own
+// prompt failed: a retry with confirmed: true is honored for these.
+const handoverAskedInConversation = new Set();
 
 async function requestHandover({ tabIds, reason, confirmed }) {
   const ids = [...new Set(tabIds)];
@@ -589,11 +592,20 @@ async function requestHandover({ tabIds, reason, confirmed }) {
     });
   } catch {}
 
-  if (!server.server.getClientCapabilities()?.elicitation) {
-    if (confirmed) return callTool("tabs_handover", { tabIds: ids });
+  const askedInConversation = ids.every((id) => handoverAskedInConversation.has(id));
+  if (confirmed && askedInConversation) {
+    for (const id of ids) handoverAskedInConversation.delete(id);
+    return callTool("tabs_handover", { tabIds: ids });
+  }
+  const askInConversation = (why) => {
+    for (const id of ids) handoverAskedInConversation.add(id);
     return textResult(
-      "This app can't show a confirmation prompt. Ask the user in the conversation whether to move these tabs out of their window into Claude's own window. If they agree, call tabs_request_handover again with confirmed: true."
+      `${why} Ask the user in the conversation whether to move these tabs out of their window into Claude's own window. If they agree, call tabs_request_handover again with confirmed: true.`
     );
+  };
+
+  if (!server.server.getClientCapabilities()?.elicitation) {
+    return askInConversation("This app can't show a confirmation prompt.");
   }
 
   let answer;
@@ -616,7 +628,7 @@ async function requestHandover({ tabIds, reason, confirmed }) {
       { timeout: HANDOVER_ANSWER_TIMEOUT_MS }
     );
   } catch (err) {
-    return textResult(`Error: couldn't ask the user (${err.message}). Ask them in the conversation instead.`);
+    return askInConversation(`The app's confirmation prompt didn't work (${err.message}).`);
   }
   if (answer.action !== "accept" || !answer.content?.move) {
     return textResult("The user chose to keep the tabs where they are. They're still shared with you.");
