@@ -7,38 +7,53 @@
 // earliest first, and the first body that parses is the one that runs. A body
 // that doesn't parse never runs, so trying several has no side effects.
 
+// Each candidate is a full copy of the code, so the search is bounded: only
+// code up to AUTO_RETURN_MAX_LENGTH gets one, and only the last
+// MAX_CANDIDATES places within LAST_STATEMENT_WINDOW characters of the end
+// are tried (the last statement sits at the end). Candidates are built one
+// at a time, never all at once. Code whose last statement doesn't fit runs as
+// a plain function body.
 const AUTO_RETURN_MAX_LENGTH = 100000;
+const LAST_STATEMENT_WINDOW = 4000;
+const MAX_CANDIDATES = 60;
 
 // Error messages Firefox gives for `await` and `return` outside a function.
 function needsFunctionBody(message) {
   return /await is only valid in async functions|return not in function/i.test(String(message));
 }
 
-// Offsets where the last statement could begin: the start of the code, each
-// line, and after each semicolon (most of these won't parse, which is fine).
+// Offsets where the last statement could begin, earliest first: the start of
+// a line, or after a semicolon (most of these won't parse, which is fine).
 function statementStarts(code) {
-  const starts = new Set([0]);
-  for (let i = 0; i < code.length; i++) {
-    if (code[i] === "\n" || code[i] === ";") starts.add(i + 1);
+  if (code.length > AUTO_RETURN_MAX_LENGTH) return [];
+  const from = Math.max(0, code.length - LAST_STATEMENT_WINDOW);
+  const starts = from === 0 ? [0] : [];
+  for (let i = from; i < code.length; i++) {
+    if (code[i] === "\n" || code[i] === ";") starts.push(i + 1);
   }
-  return [...starts].sort((a, b) => a - b);
+  return starts.slice(-MAX_CANDIDATES);
 }
 
-// Async function bodies to try for `code`, in order. The last one is the code
-// unchanged, for code whose last statement isn't an expression.
-function functionBodies(code) {
-  const bodies = [];
-  if (code.length <= AUTO_RETURN_MAX_LENGTH) {
-    for (const at of statementStarts(code)) {
-      const last = code.slice(at).replace(/[\s;]+$/, "");
-      if (!last.trim()) continue;
-      // Newlines around the expression keep a trailing // comment from
-      // swallowing the closing parenthesis.
-      bodies.push(`${code.slice(0, at)}\nreturn (\n${last}\n);`);
-    }
+// The async function body that returns the expression starting at `at`, or
+// null when nothing follows. Self-contained: its source is also sent to
+// pages, which build the candidates themselves.
+function returnBodyAt(code, at) {
+  const last = code.slice(at).replace(/[\s;]+$/, "");
+  if (!last.trim()) return null;
+  // Newlines around the expression keep a trailing // comment from
+  // swallowing the closing parenthesis.
+  return `${code.slice(0, at)}\nreturn (\n${last}\n);`;
+}
+
+// Async function bodies to try for `code`, in order, one at a time. The last
+// one is the code unchanged, for code whose last statement isn't an
+// expression.
+function* functionBodies(code) {
+  for (const at of statementStarts(code)) {
+    const body = returnBodyAt(code, at);
+    if (body !== null) yield body;
   }
-  bodies.push(code);
-  return bodies;
+  yield code;
 }
 
 // Turns a script result into something that survives structured cloning and

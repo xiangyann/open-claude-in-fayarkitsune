@@ -53,7 +53,15 @@ function redactString(s) {
   return redactTokens(s);
 }
 
-// Tokens embedded in longer text, e.g. an error message or a page's HTML.
+// A thrown error's text: "TypeError: message", or the thrown value itself
+// (a script can `throw document.cookie`). The message gets the same checks
+// as a returned string.
+function redactErrorText(text) {
+  const named = /^((?:[A-Za-z$_][\w$]*)?(?:Error|Exception)): ([\s\S]*)$/.exec(String(text));
+  return named ? `${named[1]}: ${redactString(named[2])}` : redactString(String(text));
+}
+
+// Tokens embedded in longer text, e.g. a page's HTML.
 function redactTokens(s) {
   return String(s)
     .replace(JWT_ANYWHERE, "[hidden: token]")

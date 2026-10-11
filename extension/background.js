@@ -187,9 +187,21 @@ chrome.tabGroups.onUpdated.addListener(async (group) => {
   if (group.id === claudeGroupId && !isClaudeGroup(group)) await findClaudeGroup();
 });
 
-async function ensureClaudeGroup() {
-  const existing = await findClaudeGroup();
-  if (existing) return existing;
+// Tool calls from several Claude sessions run at the same time. Anything
+// that may create the group runs one at a time and looks for the group
+// again first, so two calls can't each make a "Claude" group.
+let groupLock = Promise.resolve();
+function withGroupLock(task) {
+  const run = groupLock.then(task);
+  groupLock = run.catch(() => {});
+  return run;
+}
+
+function ensureClaudeGroup() {
+  return withGroupLock(async () => (await findClaudeGroup()) || createClaudeGroup());
+}
+
+async function createClaudeGroup() {
   const win = await chrome.windows.create({ focused: true, url: "about:blank" });
   const groupId = await chrome.tabs.group({
     tabIds: [win.tabs[0].id],
@@ -1187,7 +1199,7 @@ function jsTimeoutSeconds(value) {
 // Resolves to { ok: packed result }, { thrown: error text } or { timedOut }.
 async function runJavascript(tabId, code, deadline) {
   let outcome = await evalInPage(tabId, code);
-  if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, functionBodies(code));
+  if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, code);
   if (!outcome.csp) return outcome;
 
   // The page's Content Security Policy blocks eval().
@@ -1237,16 +1249,26 @@ async function evalInPage(tabId, code) {
   return res?.result ?? { thrown: "The script produced no result." };
 }
 
-// Runs the first of `bodies` that parses as an async function body.
-async function evalBodiesInPage(tabId, bodies) {
+// Runs the first candidate body for `code` (see lib/js-source.js) that
+// parses as an async function body. The page builds them one at a time from
+// the offsets, rather than receiving them all.
+async function evalBodiesInPage(tabId, code) {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (bodies, packSource) => {
+    func: async (code, starts, bodyAtSource, packSource) => {
       const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
       const pack = (0, eval)(`(${packSource})`); // eslint-disable-line no-eval
+      const bodyAt = (0, eval)(`(${bodyAtSource})`); // eslint-disable-line no-eval
+      const bodies = function* () {
+        for (const at of starts) {
+          const body = bodyAt(code, at);
+          if (body !== null) yield body;
+        }
+        yield code;
+      };
       let parseError = null;
-      for (const body of bodies) {
+      for (const body of bodies()) {
         let pending;
         try {
           // Parsing happens before anything runs: a body that doesn't parse
@@ -1267,7 +1289,7 @@ async function evalBodiesInPage(tabId, bodies) {
       }
       return { thrown: describe(parseError) };
     },
-    args: [bodies, packValue.toString()],
+    args: [code, statementStarts(code), returnBodyAt.toString(), packValue.toString()],
   });
   if (res?.error) return { thrown: errorText(res.error) };
   return res?.result ?? { thrown: "The script produced no result." };
@@ -1284,19 +1306,13 @@ function errorText(error) {
 // Runs code as a user script: Firefox injects it itself instead of through
 // eval(), so the page's CSP doesn't stop it. Needs the optional "userScripts"
 // permission. Tries the page's world first (page variables visible), then the
-// isolated user-script world. Each candidate body is a separate script; one
-// that doesn't parse is reported as an error without running, and the next
-// is tried.
-const USER_SCRIPT_MAX_TRIES = 150;
-
+// isolated user-script world. Each candidate body (built one at a time, at
+// most MAX_CANDIDATES + 1 of them) is a separate script; one that doesn't
+// parse is reported as an error without running, and the next is tried.
 async function runAsUserScript(tabId, code, deadline) {
-  const bodies = functionBodies(code);
-  const tries = bodies.length > USER_SCRIPT_MAX_TRIES
-    ? [...bodies.slice(0, USER_SCRIPT_MAX_TRIES - 1), bodies[bodies.length - 1]]
-    : bodies;
   let world = "MAIN";
   let lastError = "The script produced no result.";
-  for (const body of tries) {
+  for (const body of functionBodies(code)) {
     if (Date.now() > deadline) return { timedOut: true };
     let res;
     try {
@@ -1327,7 +1343,7 @@ async function runAsUserScript(tabId, code, deadline) {
 
 // Credentials are hidden (lib/redact.js) and long output is cut.
 function formatJavascriptOutcome(outcome) {
-  if (outcome.thrown !== undefined) return textResult(`Error: ${redactTokens(outcome.thrown)}`);
+  if (outcome.thrown !== undefined) return textResult(`Error: ${redactErrorText(outcome.thrown)}`);
   const packed = outcome.ok;
   if (!packed || packed.undefined) return textResult("undefined");
   const value = redactValue(packed.value);
@@ -1358,7 +1374,12 @@ const shareRequests = new Map(); // requestId -> { reason, query, windowId, sett
 
 // Moves tabs into Claude's group, in its window; with no group yet, the
 // first tab starts a new Claude window. They're Claude's own tabs afterwards.
-async function moveTabsToClaude(tabIds) {
+// It may create the group, so it holds the group lock (see withGroupLock).
+function moveTabsToClaude(tabIds) {
+  return withGroupLock(() => moveTabsToClaudeNow(tabIds));
+}
+
+async function moveTabsToClaudeNow(tabIds) {
   for (const id of tabIds) {
     const tab = await chrome.tabs.get(id);
     if (tab.pinned) await chrome.tabs.update(id, { pinned: false }); // pinned tabs can't be grouped
