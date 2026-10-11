@@ -724,7 +724,7 @@ server.tool(
   "handle_dialog",
   "Choose how the next JavaScript confirm() or prompt() on a page is answered. Dialogs never block your tools: alerts are acknowledged, and confirm/prompt are cancelled unless you choose otherwise here. Each one is reported in the result of the tool call during which it opened. Applies to the page currently loaded in the tab.",
   {
-    tabId: z.number().describe("Tab ID of the page. Must be a tab in the current group, or one the user shared."),
+    tabId: z.number().describe("Tab ID of the page. Must be a tab in the current group, or one the user shared with you."),
     accept: z.boolean().describe("true to answer OK, false to answer Cancel."),
     promptText: z.string().optional().describe("For prompt(): the text to answer with when accept is true. Defaults to the prompt's default value."),
   },
@@ -737,7 +737,7 @@ server.tool(
   'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
-    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("navigate", args)
 );
@@ -752,7 +752,7 @@ server.tool(
       "type", "screenshot", "wait", "scroll", "key",
       "left_click_drag", "zoom", "scroll_to", "hover"
     ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
-    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
@@ -773,7 +773,7 @@ server.tool(
   'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
     query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
-    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("find", args)
 );
@@ -785,7 +785,7 @@ server.tool(
   {
     ref: z.string().describe('Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")'),
     value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
-    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("form_input", args)
 );
@@ -795,7 +795,7 @@ server.tool(
   "get_page_text",
   "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("get_page_text", args)
 );
@@ -828,7 +828,7 @@ server.tool(
   {
     action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
     text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically (e.g., 'window.myData.value'); 'return' and top-level 'await' also work. You can access and modify the DOM, call page functions, and interact with page variables."),
-    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     timeout: z.number().optional().describe("Seconds to wait for the result (default 30, max 50). A script still running after that is reported as timed out."),
   },
   async (args) => callTool("javascript_tool", args)
@@ -839,7 +839,7 @@ server.tool(
   "read_console_messages",
   "Read browser console messages (console.log, console.error, console.warn, etc.), uncaught errors and unhandled promise rejections from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current page only, recorded since you started using the tab. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
   {
-    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
     limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
     onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
@@ -851,9 +851,9 @@ server.tool(
 // 11. read_network_requests
 server.tool(
   "read_network_requests",
-  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. In a tab the user shared, only requests made after they shared it are recorded. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
     limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
     clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
@@ -866,7 +866,7 @@ server.tool(
   "read_page",
   "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)'),
     depth: z.number().optional().describe("Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."),
     ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
@@ -882,7 +882,7 @@ server.tool(
   {
     width: z.number().describe("Target window width in pixels"),
     height: z.number().describe("Target window height in pixels"),
-    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group (a tab the user shared is in their window, which keeps its size: see tabs_request_handover). Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("resize_window", args)
 );

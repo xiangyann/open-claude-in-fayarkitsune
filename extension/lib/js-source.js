@@ -45,10 +45,19 @@ function functionBodies(code) {
 // JSON: DOM nodes and functions become short descriptions, cycles and very
 // deep or long structures are cut. Self-contained, because its source is also
 // injected into pages as text (see userScriptSource).
+//
+// The work is bounded for the whole result, not per object: an object
+// reached along many paths is packed once per path (only true cycles are
+// caught), so without a shared budget a modest graph could expand to
+// millions of values and freeze the page. { cut: true } says it ran out.
 function packValue(result) {
   const MAX_DEPTH = 8;
   const MAX_ITEMS = 200;
+  const MAX_VALUES = 20000; // values packed in total
+  const MAX_STRING = 100000; // characters per string; the tool shows 50,000 at most
   const seen = new WeakSet();
+  let valuesLeft = MAX_VALUES;
+  let cut = false;
 
   const describeNode = (node) => {
     if (node.nodeType === 9) return `[document ${node.URL || ""}]`.trim();
@@ -74,8 +83,15 @@ function packValue(result) {
   };
 
   const walk = (v, depth) => {
+    if (--valuesLeft < 0) {
+      cut = true;
+      return "…";
+    }
     switch (typeof v) {
       case "string":
+        if (v.length <= MAX_STRING) return v;
+        cut = true;
+        return `${v.slice(0, MAX_STRING)}…`;
       case "boolean":
       case "undefined":
         return v;
@@ -121,7 +137,9 @@ function packValue(result) {
     }
   };
 
-  return result === undefined ? { undefined: true } : { value: walk(result, 0) };
+  if (result === undefined) return { undefined: true };
+  const value = walk(result, 0);
+  return cut ? { value, cut } : { value };
 }
 
 // A user script that runs `body` as an async function and evaluates to a

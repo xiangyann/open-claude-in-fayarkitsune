@@ -109,13 +109,52 @@ const SHARED_STORAGE_KEY = "sharedTabIds";
 
 let claudeGroupId = null;
 const sharedTabs = new Set(); // ids of the user's tabs shared with Claude
+// Ids of the tabs in Claude's group, kept in step with it for code that
+// can't wait for tabControl, like the webRequest listeners.
+const ownTabs = new Set();
 const lastWorkAt = new Map(); // tabId -> when a tool last worked in it
 
 async function rememberGroup(id) {
   claudeGroupId = id;
+  await syncOwnTabs();
   try {
     await chrome.storage.local.set({ [GROUP_STORAGE_KEY]: id });
   } catch {}
+}
+
+// A group is Claude's by its name and color: renamed or recolored, it's
+// the user's, as it would be after a Firefox restart.
+function isClaudeGroup(group) {
+  return group.title === GROUP_TITLE && group.color === GROUP_COLOR;
+}
+
+// Whether Claude may use a tab right now, without waiting: in its group or
+// shared. tabControl is the full check.
+function isControlledNow(tabId) {
+  return ownTabs.has(tabId) || sharedTabs.has(tabId);
+}
+
+// Claude can't use a tab anymore: forget what was recorded for it, and give
+// its dialogs back to the user (see releasePage).
+function forgetTab(tabId) {
+  networkRequests.delete(tabId);
+  releasePage(tabId);
+}
+
+async function syncOwnTabs() {
+  let ids = [];
+  if (claudeGroupId !== null) {
+    try {
+      ids = (await tabsInGroup(await chrome.tabGroups.get(claudeGroupId))).map((t) => t.id);
+    } catch {}
+  }
+  for (const id of ownTabs) {
+    if (!ids.includes(id)) {
+      ownTabs.delete(id);
+      if (!sharedTabs.has(id)) forgetTab(id);
+    }
+  }
+  for (const id of ids) ownTabs.add(id);
 }
 
 async function saveSharedTabs() {
@@ -127,16 +166,26 @@ async function saveSharedTabs() {
 async function findClaudeGroup() {
   if (claudeGroupId !== null) {
     try {
-      return await chrome.tabGroups.get(claudeGroupId);
-    } catch {
-      claudeGroupId = null;
-    }
+      const group = await chrome.tabGroups.get(claudeGroupId);
+      if (isClaudeGroup(group)) return group;
+    } catch {}
   }
   const [group] = await chrome.tabGroups.query({ title: GROUP_TITLE, color: GROUP_COLOR });
-  if (!group) return null;
-  await rememberGroup(group.id);
-  return group;
+  if (group) {
+    if (group.id !== claudeGroupId) await rememberGroup(group.id);
+  } else if (claudeGroupId !== null) {
+    claudeGroupId = null;
+    await syncOwnTabs(); // the group is gone or renamed: its tabs are the user's
+  }
+  return group || null;
 }
+
+// Renaming or recoloring Claude's group gives its tabs back to the user
+// right away, not only when Claude next looks for the group.
+chrome.tabGroups.onUpdated.addListener(async (group) => {
+  await stateReady;
+  if (group.id === claudeGroupId && !isClaudeGroup(group)) await findClaudeGroup();
+});
 
 async function ensureClaudeGroup() {
   const existing = await findClaudeGroup();
@@ -180,8 +229,10 @@ async function tabControl(tabId) {
   const group = await findClaudeGroup();
   if (group && tab.groupId === group.id) {
     if (sharedTabs.delete(tabId)) saveSharedTabs(); // dragged into the group
+    ownTabs.add(tabId);
     return { tab, kind: "own" };
   }
+  ownTabs.delete(tabId);
   if (sharedTabs.has(tabId)) return { tab, kind: "shared" };
   return { tab, kind: null };
 }
@@ -207,7 +258,7 @@ async function shareTabs(tabIds) {
 async function unshareTab(tabId) {
   if (!sharedTabs.delete(tabId)) return false;
   await saveSharedTabs();
-  releasePage(tabId);
+  forgetTab(tabId);
   return true;
 }
 
@@ -260,14 +311,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   networkRequests.delete(tabId);
   lastWorkAt.delete(tabId);
   hookedTabs.delete(tabId);
+  ownTabs.delete(tabId);
   if (sharedTabs.delete(tabId)) saveSharedTabs();
   if (tabOrigins.delete(tabId)) saveTabOrigins();
 });
 
 // --- Network monitoring via webRequest ---
+// Only tabs Claude can use are recorded, from the moment it can: a tab the
+// user shares later starts with an empty history, not with what it loaded
+// while it was private.
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (details.tabId < 0 || !isControlledNow(details.tabId)) return;
     const reqs = networkRequests.get(details.tabId) || [];
     reqs.push({
       url: details.url,
@@ -379,16 +434,31 @@ async function callPageHooks(tabId, settings, frameId = 0) {
 // group) gets its dialogs back right away: the page stops answering them,
 // and an answer chosen with handle_dialog is dropped. The glow goes too.
 function releasePage(tabId) {
-  setGlow(tabId, "remove");
+  // Only pages Claude worked in have hooks or a glow (the glow shows only
+  // while the hooks are in), so the user's other tabs aren't touched.
   if (!hookedTabs.delete(tabId)) return;
+  setGlow(tabId, "remove");
   callPageHooks(tabId, { answerUntil: 0, nextAnswer: null });
 }
 
-chrome.tabs.onUpdated.addListener(async (tabId, info) => {
-  if (!("groupId" in info) || !hookedTabs.has(tabId)) return;
+// A tab joined or left a group (dragged by the user, or moved by the
+// extension). tabControl brings ownTabs up to date; the page's hooks get
+// the dialog handling of its new standing: always answered in Claude's own
+// tabs, only while Claude works in a shared one, never in the user's.
+// Firefox reports a group change within a window as a groupId update, but
+// a tab dragged into a group in another window only as detached and
+// attached (already in the group), so moves are checked too.
+async function reconsiderTab(tabId) {
   await stateReady;
-  if (!(await tabControl(tabId)).kind) releasePage(tabId);
+  const { kind } = await tabControl(tabId);
+  if (!kind) forgetTab(tabId);
+  else if (hookedTabs.has(tabId)) callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+}
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if ("groupId" in info) reconsiderTab(tabId);
 });
+chrome.tabs.onAttached.addListener((tabId) => reconsiderTab(tabId));
+chrome.tabs.onMoved.addListener((tabId) => reconsiderTab(tabId));
 
 function describeDialogs(dialogs, dropped = 0) {
   if (!dialogs.length && !dropped) return null;
@@ -1265,6 +1335,8 @@ function formatJavascriptOutcome(outcome) {
   if (text === undefined) text = "undefined";
   if (text.length > JS_RESULT_LIMIT) {
     text = `${text.slice(0, JS_RESULT_LIMIT)}\n… (cut at ${JS_RESULT_LIMIT} of ${text.length} characters)`;
+  } else if (packed.cut) {
+    text += "\n… (the result was too large to return whole; parts marked … were left out)";
   }
   return textResult(text);
 }
@@ -1641,6 +1713,11 @@ async function restoreState() {
         }
       }
     }
+  } catch {}
+  try {
+    // Check the remembered group is still Claude's, and learn its tabs.
+    await findClaudeGroup();
+    await syncOwnTabs();
   } catch {}
 }
 
