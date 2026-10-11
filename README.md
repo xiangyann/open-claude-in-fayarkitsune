@@ -163,7 +163,7 @@ However you installed the extension, a setup page opens with its permissions. Yo
 - **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
 - **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
 
-The install prompt doesn't list two other permissions, because they don't come with a warning: **tab groups** (Claude's tabs live in a group named "Claude") and **menus** (the "Share Tab with Claude" and "Move Tab to Claude's Window" items when you right-click a tab).
+The install prompt doesn't list two other permissions, because they don't come with a warning: **tab groups** (Claude's tabs live in a group named "Claude") and **menus** (the Claude items when you right-click a tab).
 
 That's it. The extension connects to the server on its own whenever Claude is running.
 
@@ -234,9 +234,20 @@ Claude can also work in tabs you're already using, for example a site you're log
 - **You share a tab:** right-click it → **Share Tab with Claude** (with several tabs selected, all of them). **Stop Sharing Tab with Claude** in the same menu takes it back.
 - **Claude asks:** `tabs_request_access` opens a small window listing your tabs. You pick which ones to share, or none. Claude doesn't see the list, only the tabs you share.
 
-Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension.
+Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
 
-**Handing a tab over.** Working in a shared tab means switching your window to it for each screenshot, and its window can't be resized. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**. Drag a tab out of the group to take it back. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
+**Handing a tab over.** Working in a shared tab means switching your window to it for each screenshot, and its window can't be resized. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**.
+
+**The tab menu, both ways.** Each item does one thing:
+
+| Right-click a… | Item | Result |
+|---|---|---|
+| tab of yours | **Share Tab with Claude** | stays in your window; Claude can use it |
+| tab of yours, or a shared one | **Move Tab to Claude's Window** | joins Claude's group; it's Claude's |
+| tab in Claude's group | **Move Tab Out of Claude's Group** | back where it was before it joined, in whichever window; a tab Claude opened goes to the window you last used. Still shared |
+| shared tab, or one in Claude's group | **Stop Sharing Tab with Claude** | stays where it is; Claude can't use it |
+
+Dragging a tab out of the group also takes it back.
 
 ### Page dialogs
 

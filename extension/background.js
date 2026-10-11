@@ -261,6 +261,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastWorkAt.delete(tabId);
   hookedTabs.delete(tabId);
   if (sharedTabs.delete(tabId)) saveSharedTabs();
+  if (tabOrigins.delete(tabId)) saveTabOrigins();
 });
 
 // --- Network monitoring via webRequest ---
@@ -1291,6 +1292,13 @@ async function moveTabsToClaude(tabIds) {
     if (tab.pinned) await chrome.tabs.update(id, { pinned: false }); // pinned tabs can't be grouped
   }
   let group = await findClaudeGroup();
+  // Remember where each tab was, for "Move Tab Out of Claude's Group"; that
+  // can be Claude's own window, outside the group.
+  for (const id of tabIds) {
+    const tab = await chrome.tabs.get(id);
+    tabOrigins.set(id, { windowId: tab.windowId, index: tab.index });
+  }
+  await saveTabOrigins();
   if (group) {
     await chrome.tabs.move(tabIds, { windowId: group.windowId, index: -1 });
     await chrome.tabs.group({ groupId: group.id, tabIds });
@@ -1304,6 +1312,109 @@ async function moveTabsToClaude(tabIds) {
   for (const id of tabIds) sharedTabs.delete(id);
   await saveSharedTabs();
   return Promise.all(tabIds.map((id) => chrome.tabs.get(id)));
+}
+
+// The other way: tabs of Claude's leave the group and stay shared with
+// Claude ("Move Tab Out of Claude's Group"). A tab that was moved into the
+// group goes back where it was, in whichever window that was; one Claude
+// opened itself goes to the window the user last used that isn't Claude's,
+// or a new one.
+// Kept in storage.local, so they survive the extension being reloaded or
+// updated (which clears storage.session), and cleared when Firefox starts,
+// since tab and window ids start over then. They only decide where a tab
+// goes back to, so a stale entry can't give Claude anything.
+const ORIGINS_STORAGE_KEY = "tabOrigins";
+const LAST_WINDOW_STORAGE_KEY = "lastUserWindowId";
+const tabOrigins = new Map(); // tabId -> { windowId, index } before it joined Claude's group
+let lastUserWindowId = null;
+
+async function saveTabOrigins() {
+  try {
+    await chrome.storage.local.set({ [ORIGINS_STORAGE_KEY]: [...tabOrigins] });
+  } catch {}
+}
+
+chrome.runtime.onStartup.addListener(async () => {
+  await stateReady; // or the restore could bring the old entries back afterwards
+  tabOrigins.clear();
+  lastUserWindowId = null;
+  chrome.storage.local.remove([ORIGINS_STORAGE_KEY, LAST_WINDOW_STORAGE_KEY]).catch(() => {});
+});
+
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  try {
+    const win = await chrome.windows.get(windowId);
+    const group = await findClaudeGroup();
+    if (win.type !== "normal" || windowId === group?.windowId) return;
+    lastUserWindowId = windowId;
+    await chrome.storage.local.set({ [LAST_WINDOW_STORAGE_KEY]: windowId });
+  } catch {}
+});
+
+// A window `tab` can move to: a normal window other than its own, of the
+// same kind (private or not). Resolves the window id, or null.
+async function usableWindow(windowId, tab) {
+  if (windowId === null || windowId === undefined) return null;
+  try {
+    const win = await chrome.windows.get(windowId);
+    return win.type === "normal" && win.id !== tab.windowId && win.incognito === tab.incognito ? win.id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function userWindowFor(tab) {
+  const origin = tabOrigins.get(tab.id);
+  const home = (await usableWindow(origin?.windowId, tab)) ?? (await usableWindow(lastUserWindowId, tab));
+  if (home !== null) return home;
+  for (const win of await chrome.windows.getAll({ windowTypes: ["normal"] })) {
+    if ((await usableWindow(win.id, tab)) !== null) return win.id;
+  }
+  return null;
+}
+
+async function moveTabsToUser(tabIds) {
+  // Shared first, so the tab never looks uncontrolled while it leaves the group.
+  for (const id of tabIds) sharedTabs.add(id);
+  await saveSharedTabs();
+  await chrome.tabs.ungroup(tabIds);
+  let focusWindowId = null;
+  for (const id of tabIds) {
+    const tab = await chrome.tabs.get(id);
+    const origin = tabOrigins.get(id);
+    // It was in this same window (Claude's), just outside the group.
+    const stayHere = origin?.windowId === tab.windowId;
+    let windowId = stayHere ? tab.windowId : await userWindowFor(tab);
+    if (stayHere) {
+      await chrome.tabs.move(id, { index: origin.index });
+    } else if (windowId === null) {
+      windowId = (await chrome.windows.create({ tabId: id })).id;
+    } else {
+      // Back at its old position when it returns home.
+      const count = (await chrome.tabs.query({ windowId })).length;
+      const index = origin?.windowId === windowId ? Math.min(origin.index, count) : -1;
+      await chrome.tabs.move(id, { windowId, index });
+    }
+    // Dropped between two tabs of a group, a tab joins that group; it's
+    // meant to be on its own.
+    if ((await chrome.tabs.get(id)).groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) await chrome.tabs.ungroup([id]);
+    tabOrigins.delete(id);
+    focusWindowId ??= windowId;
+  }
+  await saveTabOrigins();
+  await chrome.tabs.update(tabIds[0], { active: true });
+  await chrome.windows.update(focusWindowId, { focused: true });
+  // Dialogs there are answered for Claude only while it's working, as in
+  // any shared tab.
+  for (const id of tabIds) callPageHooks(id, { answerUntil: dialogDeadline(id, "shared") });
+}
+
+// "Stop Sharing" on one of Claude's own tabs: it leaves the group and stays
+// where it is, no longer Claude's.
+async function takeTabsFromClaude(tabIds) {
+  await chrome.tabs.ungroup(tabIds);
+  for (const id of tabIds) releasePage(id);
 }
 
 async function requestTabAccess({ reason, query }) {
@@ -1371,14 +1482,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// Tab context menu: "Share Tab with Claude", "Stop Sharing Tab with Claude",
-// and "Move Tab to Claude's Window" (hands it over for good). Applies to all
-// selected tabs when the clicked one is part of a selection.
+// Tab context menu. Each item does one thing; together they move a tab
+// either way between the user and Claude:
+//   your tab --Share--> shared --Move to Claude's Window--> Claude's own
+//   Claude's own --Move Out of Claude's Group--> shared --Stop Sharing--> your tab
+// "Stop Sharing" on one of Claude's own tabs takes it straight back.
+// Items apply to all selected tabs when the clicked one is part of a
+// selection, to those tabs the item fits.
 function createMenus() {
   chrome.menus.removeAll().then(() => {
     chrome.menus.create({ id: "share-tab", title: "Share Tab with Claude", contexts: ["tab"] });
     chrome.menus.create({ id: "unshare-tab", title: "Stop Sharing Tab with Claude", contexts: ["tab"], visible: false });
     chrome.menus.create({ id: "handover-tab", title: "Move Tab to Claude's Window", contexts: ["tab"] });
+    chrome.menus.create({ id: "return-tab", title: "Move Tab Out of Claude's Group", contexts: ["tab"], visible: false });
   });
 }
 createMenus();
@@ -1389,8 +1505,9 @@ chrome.menus.onShown.addListener(async (info, tab) => {
   const { kind } = await tabControl(tab.id);
   const shareable = isShareableUrl(tab.url);
   await chrome.menus.update("share-tab", { visible: !kind && shareable });
-  await chrome.menus.update("unshare-tab", { visible: kind === "shared" });
+  await chrome.menus.update("unshare-tab", { visible: !!kind });
   await chrome.menus.update("handover-tab", { visible: kind !== "own" && shareable });
+  await chrome.menus.update("return-tab", { visible: kind === "own" });
   chrome.menus.refresh();
 });
 
@@ -1399,15 +1516,20 @@ chrome.menus.onClicked.addListener(async (info, tab) => {
   await stateReady;
   let tabs = [tab];
   if (tab.highlighted) tabs = await chrome.tabs.query({ windowId: tab.windowId, highlighted: true });
-  if (info.menuItemId === "share-tab") await shareTabs(tabs.map((t) => t.id));
-  if (info.menuItemId === "unshare-tab") for (const t of tabs) await unshareTab(t.id);
-  if (info.menuItemId === "handover-tab") {
-    const ids = [];
-    for (const t of tabs) {
-      if ((await tabControl(t.id)).kind !== "own" && isShareableUrl(t.url)) ids.push(t.id);
-    }
-    if (ids.length) await moveTabsToClaude(ids);
+  const byKind = { own: [], shared: [], none: [] };
+  for (const t of tabs) byKind[(await tabControl(t.id)).kind || "none"].push(t);
+  const ids = (list) => list.map((t) => t.id);
+
+  if (info.menuItemId === "share-tab") await shareTabs(ids(byKind.none));
+  if (info.menuItemId === "unshare-tab") {
+    for (const t of byKind.shared) await unshareTab(t.id);
+    if (byKind.own.length) await takeTabsFromClaude(ids(byKind.own));
   }
+  if (info.menuItemId === "handover-tab") {
+    const movable = [...byKind.shared, ...byKind.none].filter((t) => isShareableUrl(t.url));
+    if (movable.length) await moveTabsToClaude(ids(movable));
+  }
+  if (info.menuItemId === "return-tab" && byKind.own.length) await moveTabsToUser(ids(byKind.own));
 });
 
 // --- Permissions and the setup page ---
@@ -1466,12 +1588,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- Init ---
 
+// The format of what's kept in storage.local: claudeGroupId (number),
+// tabOrigins ([tabId, { windowId, index }] pairs) and lastUserWindowId
+// (number). Bump it when that changes. Data in any other format is
+// discarded rather than migrated: all of it rebuilds itself (the group is
+// found by name, a tab without a home goes to the last-used window). The
+// one exception is 1.1.x's mcpWindowId, from before there was a version,
+// which restoreState turns into the group. storage.session needs no
+// version: Firefox clears it whenever the extension is updated.
+const STORAGE_VERSION = 1;
+const STORAGE_VERSION_KEY = "storageVersion";
+
+async function checkStorageVersion() {
+  const stored = await chrome.storage.local.get(null);
+  if (stored[STORAGE_VERSION_KEY] === STORAGE_VERSION) return;
+  const keep = stored[STORAGE_VERSION_KEY] === undefined ? [LEGACY_WINDOW_STORAGE_KEY] : [];
+  const discard = Object.keys(stored).filter((key) => !keep.includes(key));
+  if (discard.length) await chrome.storage.local.remove(discard);
+  await chrome.storage.local.set({ [STORAGE_VERSION_KEY]: STORAGE_VERSION });
+}
+
 // Restores what this background script knew before it was suspended or
 // restarted. Every listener that reads the state waits for this first.
 async function restoreState() {
   try {
+    await checkStorageVersion();
+  } catch {}
+  try {
+    // Shared tabs only last for the extension's session: an id kept longer
+    // could point at a different tab after Firefox restarts.
     const { [SHARED_STORAGE_KEY]: shared = [] } = await chrome.storage.session.get(SHARED_STORAGE_KEY);
     for (const id of shared) sharedTabs.add(id);
+  } catch {}
+  try {
+    const stored = await chrome.storage.local.get([ORIGINS_STORAGE_KEY, LAST_WINDOW_STORAGE_KEY]);
+    for (const [id, origin] of stored[ORIGINS_STORAGE_KEY] || []) tabOrigins.set(id, origin);
+    if (typeof stored[LAST_WINDOW_STORAGE_KEY] === "number") lastUserWindowId ??= stored[LAST_WINDOW_STORAGE_KEY];
   } catch {}
   try {
     const stored = await chrome.storage.local.get([GROUP_STORAGE_KEY, LEGACY_WINDOW_STORAGE_KEY]);
