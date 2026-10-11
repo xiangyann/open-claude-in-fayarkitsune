@@ -17,10 +17,13 @@ function installPageHooks(settings) {
   let hooks = window[STATE];
 
   if (!hooks) {
-    hooks = { logs: [], dialogs: [], answerUntil: 0, nextAnswer: null };
+    hooks = { logs: [], dialogs: [], droppedDialogs: 0, answerUntil: 0, nextAnswer: null };
     Object.defineProperty(window, STATE, { value: hooks });
 
     const MAX_LOGS = 1000;
+    // A page can open dialogs in a loop; only the first ones since the last
+    // report are kept, and the rest are counted.
+    const MAX_DIALOGS = 50;
     const record = (level, text) => {
       hooks.logs.push({ level, text, url: location.href, timestamp: Date.now() });
       if (hooks.logs.length > MAX_LOGS) hooks.logs.splice(0, hooks.logs.length - MAX_LOGS);
@@ -58,7 +61,8 @@ function installPageHooks(settings) {
     const native = { alert: window.alert, confirm: window.confirm, prompt: window.prompt };
     const handle = (type, message, defaultText) => {
       const note = { type, message: String(message ?? "").slice(0, 500) };
-      hooks.dialogs.push(note);
+      if (hooks.dialogs.length < MAX_DIALOGS) hooks.dialogs.push(note);
+      else hooks.droppedDialogs++;
       if (Date.now() > hooks.answerUntil) {
         note.answer = "left open for the user";
         return { native: true };
@@ -102,5 +106,7 @@ function installPageHooks(settings) {
     if (settings.clear) hooks.logs.length = 0;
     return { logs };
   }
-  return { dialogs: hooks.dialogs.splice(0) };
+  const dropped = hooks.droppedDialogs;
+  hooks.droppedDialogs = 0;
+  return { dialogs: hooks.dialogs.splice(0), dropped };
 }

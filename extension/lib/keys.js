@@ -75,6 +75,14 @@ function keyForChar(ch) {
   return null;
 }
 
+// The character a key gives with shift held (US layout); others unchanged.
+function shiftedChar(ch) {
+  if (/^[a-z]$/.test(ch)) return ch.toUpperCase();
+  if (/^[0-9]$/.test(ch)) return SHIFTED_DIGITS[Number(ch)];
+  const symbol = SYMBOL_KEYS.find(([plain]) => plain === ch);
+  return symbol ? symbol[1] : ch;
+}
+
 // Parses one entry of the `key` action, e.g. "Enter", "ctrl+a", "shift+Tab".
 // Returns { key, code, keyCode, modifiers }.
 function parseKeyCombo(combo) {
@@ -104,8 +112,8 @@ function parseKeyCombo(combo) {
   if (named) return { ...named, modifiers };
 
   if ([...main].length === 1) {
-    // shift+a means "A", as on a real keyboard.
-    const ch = modifiers & SHIFT_BIT && /^[a-z]$/.test(main) ? main.toUpperCase() : main;
+    // shift+a means "A", shift+1 "!" and shift+/ "?", as on a real keyboard.
+    const ch = modifiers & SHIFT_BIT ? shiftedChar(main) : main;
     const info = keyForChar(ch);
     if (info) return { key: info.key, code: info.code, keyCode: info.keyCode, modifiers };
     return { key: ch, code: "", keyCode: 0, modifiers };

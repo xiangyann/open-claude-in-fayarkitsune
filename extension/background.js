@@ -207,7 +207,7 @@ async function shareTabs(tabIds) {
 async function unshareTab(tabId) {
   if (!sharedTabs.delete(tabId)) return false;
   await saveSharedTabs();
-  setGlow(tabId, "remove");
+  releasePage(tabId);
   return true;
 }
 
@@ -255,6 +255,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   networkRequests.delete(tabId);
   lastWorkAt.delete(tabId);
+  hookedTabs.delete(tabId);
   if (sharedTabs.delete(tabId)) saveSharedTabs();
 });
 
@@ -335,10 +336,11 @@ async function sendContentMessage(tabId, message) {
 // tabs they're always answered.
 const SHARED_DIALOG_WINDOW_MS = 15000;
 const ALWAYS = Number.MAX_SAFE_INTEGER;
-const capturingTabs = new Set(); // tabs with a screenshot in progress
+const capturing = new Map(); // tabId -> screenshots in progress (they can overlap)
+const hookedTabs = new Set(); // tabs whose page may be answering dialogs for Claude
 
 function setGlow(tabId, mode) {
-  if (mode === "show" && capturingTabs.has(tabId)) return;
+  if (mode === "show" && capturing.has(tabId)) return;
   chrome.tabs.sendMessage(tabId, { type: "glow", mode }).catch(() => {});
 }
 
@@ -347,7 +349,8 @@ function dialogDeadline(tabId, kind) {
 }
 
 // Installs or updates the hooks in the tab's page and returns what they
-// recorded ({ dialogs } or { logs }); null where pages can't be scripted.
+// recorded ({ dialogs, dropped } or { logs }); null where pages can't be
+// scripted.
 async function callPageHooks(tabId, settings, frameId = 0) {
   try {
     const [res] = await chrome.scripting.executeScript({
@@ -357,20 +360,37 @@ async function callPageHooks(tabId, settings, frameId = 0) {
       func: installPageHooks,
       args: [settings],
     });
+    if (settings?.answerUntil > 0) hookedTabs.add(tabId);
     return res?.result ?? null;
   } catch {
     return null;
   }
 }
 
-function describeDialogs(dialogs) {
-  if (!dialogs.length) return null;
+// A tab Claude no longer controls (released, or dragged out of Claude's
+// group) gets its dialogs back right away: the page stops answering them,
+// and an answer chosen with handle_dialog is dropped. The glow goes too.
+function releasePage(tabId) {
+  setGlow(tabId, "remove");
+  if (!hookedTabs.delete(tabId)) return;
+  callPageHooks(tabId, { answerUntil: 0, nextAnswer: null });
+}
+
+chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+  if (!("groupId" in info) || !hookedTabs.has(tabId)) return;
+  await stateReady;
+  if (!(await tabControl(tabId)).kind) releasePage(tabId);
+});
+
+function describeDialogs(dialogs, dropped = 0) {
+  if (!dialogs.length && !dropped) return null;
   const lines = dialogs.map((d) => {
     const msg = d.message ? ` "${d.message}"` : "";
     return d.answer === "left open for the user"
       ? `- ${d.type}${msg}: shown to the user (it opened while you weren't working in this tab); the page is paused until they answer it`
       : `- ${d.type}${msg}: answered ${d.answer} automatically`;
   });
+  if (dropped) lines.push(`- … and ${dropped} more, not listed`);
   return `The page opened dialogs:\n${lines.join("\n")}\nUse handle_dialog to choose how the next confirm or prompt is answered.`;
 }
 
@@ -386,7 +406,10 @@ async function startPageWork(tabId, kind) {
     lastWorkAt.set(tabId, Date.now());
     setGlow(tabId, "show"); // it fades out a few seconds after the last refresh
     const after = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
-    const note = describeDialogs([...(before?.dialogs || []), ...(after?.dialogs || [])]);
+    const note = describeDialogs(
+      [...(before?.dialogs || []), ...(after?.dialogs || [])],
+      (before?.dropped || 0) + (after?.dropped || 0)
+    );
     if (note && result?.content) result.content.push({ type: "text", text: note });
     return result;
   };
@@ -424,16 +447,22 @@ async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
     return dataUrl.replace(/^data:image\/jpeg;base64,/, "");
   };
 
-  // Keep the glow out of the picture.
-  capturingTabs.add(tabId);
+  // Keep the glow out of the picture, until the last of any overlapping
+  // screenshots of this tab is done.
+  capturing.set(tabId, (capturing.get(tabId) || 0) + 1);
   let base64;
   try {
     await chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }).catch(() => {});
     base64 = await capture(55);
     if (base64.length > 500000) base64 = await capture(30);
   } finally {
-    capturingTabs.delete(tabId);
-    setGlow(tabId, "show");
+    const left = capturing.get(tabId) - 1;
+    if (left > 0) {
+      capturing.set(tabId, left);
+    } else {
+      capturing.delete(tabId);
+      setGlow(tabId, "show");
+    }
   }
 
   const imageId = `screenshot_${Date.now()}`;

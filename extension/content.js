@@ -791,10 +791,11 @@
       if (key) {
         const modifiers = key.shift ? 8 : 0;
         insert = dispatchKey(focusedElement(), "keydown", key, modifiers);
-        // keypress is deprecated but still fired for keys that produce text,
-        // and older sites listen for it.
-        if (insert && key.key.length === 1) {
-          insert = dispatchKey(focusedElement(), "keypress", { ...key, charCode: key.key.charCodeAt(0) }, modifiers);
+        // keypress is deprecated but still fired for keys that produce text
+        // (Enter included), and older sites listen for it.
+        if (insert && (key.key.length === 1 || key.key === "Enter")) {
+          const charCode = key.key === "Enter" ? 13 : key.key.charCodeAt(0);
+          insert = dispatchKey(focusedElement(), "keypress", { ...key, charCode }, modifiers);
         }
       }
       if (insert) insertText(focusedElement(), text);
