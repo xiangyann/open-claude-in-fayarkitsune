@@ -42,8 +42,8 @@ Execute these steps in order:
 21. Call `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"document.querySelectorAll('a').length"`.
 22. Call `read_console_messages` on TAB_1 with pattern `".*"`.
 23. Call `read_network_requests` on TAB_1.
-24. Call `javascript_tool` on TAB_1 with text `"const n = await Promise.resolve(document.title.length); n"` (top-level await should return a number).
-25. Call `handle_dialog` on TAB_1 with `accept: true`, then `javascript_tool` on TAB_1 with text `"confirm('integration test')"`. Expected: `true`, with a note that the page opened a confirm dialog.
+24. Call `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"const n = await Promise.resolve(document.title.length); n"` (top-level await should return a number).
+25. Call `handle_dialog` on TAB_1 with `accept: true`, then `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"confirm('integration test')"`. Expected: `true`, with a note that the page opened a confirm dialog.
 
 ## Second Tab
 26. Call `navigate` to go to `https://news.ycombinator.com` in TAB_2.
@@ -67,8 +67,9 @@ Execute these steps in order:
 
 ## Shared tabs + closing
 36. Call `tabs_request_access` with reason `"Integration test: share any tab, or choose Don't share"`. The user answers in Firefox; any answer counts.
-37. If a tab was shared, call `tabs_request_handover` on it (the user answers in the app's prompt, or you ask them in the conversation if the result says so), then `tabs_release` on any tab that's still shared. Otherwise call `tabs_request_handover` on TAB_2 (expected: an error that it isn't shared) and `tabs_release` on TAB_2 (expected: a message that it's one of Claude's own tabs).
-38. Call `tabs_close_mcp` on TAB_2.
+37. If a tab was shared, call `tabs_request_handover` on it (the user answers in the app's prompt, or you ask them in the conversation if the result says so). Otherwise call `tabs_request_handover` on TAB_2 (expected: an error that it isn't shared).
+38. Call `tabs_release` once: on a tab that's still shared if there is one, otherwise on TAB_2 (expected: a message that it's one of Claude's own tabs).
+39. Call `tabs_close_mcp` on TAB_2.
 
 ## Validation
 
