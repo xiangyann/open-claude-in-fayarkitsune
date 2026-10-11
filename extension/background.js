@@ -1,5 +1,8 @@
-// Background service worker for Claude MCP in Fayar kitsune extension.
-// Handles: WebSocket link to the MCP server, Firefox WebExtension APIs, tool dispatch, window management.
+// Background script for Claude MCP in Fayar kitsune extension.
+// Handles: WebSocket link to the MCP server, Firefox WebExtension APIs, tool
+// dispatch, Claude's tab group and the tabs the user shares with Claude.
+// Also loaded (see manifest.json): lib/keys.js, lib/redact.js,
+// lib/js-source.js and lib/page-hooks.js.
 
 self.addEventListener("unhandledrejection", (event) => {
   event.preventDefault();
@@ -7,18 +10,13 @@ self.addEventListener("unhandledrejection", (event) => {
 
 // Must match the MCP server's port (host/mcp-server.js, default 18765).
 const SERVER_URL = "ws://127.0.0.1:18765";
-const MCP_WINDOW_STORAGE_KEY = "mcpWindowId";
 
 // --- State ---
 let serverSocket = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
-let mcpWindowId = null;
-const mcpTabs = new Set();
-const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp, requestId}]
 const screenshotStore = new Map(); // imageId -> base64
-const consoleInterceptors = new Set(); // tabIds with interceptor installed
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -90,79 +88,174 @@ function sendError(id, error) {
   postToServer({ id, type: "tool_error", error: String(error) });
 }
 
-// --- MCP window management (replaces Chrome tab groups) ---
-async function saveMcpWindowId(id) {
+function textResult(text) {
+  return { content: [{ type: "text", text }] };
+}
+
+// --- Claude's tabs ---
+// Claude works in tabs of its own, kept in a tab group named "Claude" (in a
+// window of its own, unless the user moves the group), and in tabs the user
+// shares with it. The group keeps Claude's tabs together and findable when
+// Claude restarts or loses track of them. After a Firefox restart, session
+// restore brings the group back with a new id, so it's found by name and
+// color. A tab the user drags into the group becomes Claude's; a tab dragged
+// out of it doesn't belong to Claude anymore.
+
+const GROUP_TITLE = "Claude";
+const GROUP_COLOR = "orange";
+const GROUP_STORAGE_KEY = "claudeGroupId";
+const LEGACY_WINDOW_STORAGE_KEY = "mcpWindowId"; // 1.1.x: a window of its own, no group
+const SHARED_STORAGE_KEY = "sharedTabIds";
+
+let claudeGroupId = null;
+const sharedTabs = new Set(); // ids of the user's tabs shared with Claude
+const lastWorkAt = new Map(); // tabId -> when a tool last worked in it
+
+async function rememberGroup(id) {
+  claudeGroupId = id;
   try {
-    if (id === null) {
-      await chrome.storage.local.remove(MCP_WINDOW_STORAGE_KEY);
-    } else {
-      await chrome.storage.local.set({ [MCP_WINDOW_STORAGE_KEY]: id });
-    }
+    await chrome.storage.local.set({ [GROUP_STORAGE_KEY]: id });
   } catch {}
 }
 
-async function ensureMcpWindow(createIfEmpty) {
-  if (mcpWindowId !== null) {
+async function saveSharedTabs() {
+  try {
+    await chrome.storage.session.set({ [SHARED_STORAGE_KEY]: [...sharedTabs] });
+  } catch {}
+}
+
+async function findClaudeGroup() {
+  if (claudeGroupId !== null) {
     try {
-      await chrome.windows.get(mcpWindowId);
-      const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-      mcpTabs.clear();
-      tabs.forEach((t) => mcpTabs.add(t.id));
-      if (tabs.length > 0) return;
+      return await chrome.tabGroups.get(claudeGroupId);
     } catch {
-      mcpWindowId = null;
-      mcpTabs.clear();
-      await saveMcpWindowId(null);
+      claudeGroupId = null;
     }
   }
+  const [group] = await chrome.tabGroups.query({ title: GROUP_TITLE, color: GROUP_COLOR });
+  if (!group) return null;
+  await rememberGroup(group.id);
+  return group;
+}
 
-  if (!createIfEmpty) return;
-
+async function ensureClaudeGroup() {
+  const existing = await findClaudeGroup();
+  if (existing) return existing;
   const win = await chrome.windows.create({ focused: true, url: "about:blank" });
-  mcpWindowId = win.id;
-  mcpTabs.clear();
-  win.tabs.forEach((t) => mcpTabs.add(t.id));
-  await saveMcpWindowId(mcpWindowId);
+  const groupId = await chrome.tabs.group({
+    tabIds: [win.tabs[0].id],
+    createProperties: { windowId: win.id },
+  });
+  await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
+  await rememberGroup(groupId);
+  return chrome.tabGroups.get(groupId);
 }
 
-function formatTabContext(tabs) {
-  const available = tabs.map((t) => ({
-    tabId: t.id,
-    title: t.title || "Untitled",
-    url: t.url || "",
-  }));
+async function tabsInGroup(group) {
+  const tabs = await chrome.tabs.query({ windowId: group.windowId });
+  return tabs.filter((t) => t.groupId === group.id);
+}
 
-  let text = `Tab Context:\n- Available tabs:\n`;
-  for (const t of available) {
-    text += `  • tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+async function sharedTabList() {
+  const tabs = [];
+  for (const id of sharedTabs) {
+    try {
+      tabs.push(await chrome.tabs.get(id));
+    } catch {
+      sharedTabs.delete(id);
+    }
   }
-
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify({ availableTabs: available, mcpWindowId }) + "\n\n" + text,
-      },
-    ],
-  };
+  return tabs;
 }
 
-async function isInGroup(tabId) {
-  if (mcpWindowId === null) return false;
+// Whether Claude may use a tab: { tab, kind } with kind "own" (in Claude's
+// group), "shared" (shared by the user) or null. tab is null if it's gone.
+async function tabControl(tabId) {
+  let tab;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    return tab.windowId === mcpWindowId;
+    tab = await chrome.tabs.get(tabId);
   } catch {
-    return false;
+    return { tab: null, kind: null };
   }
+  const group = await findClaudeGroup();
+  if (group && tab.groupId === group.id) {
+    if (sharedTabs.delete(tabId)) saveSharedTabs(); // dragged into the group
+    return { tab, kind: "own" };
+  }
+  if (sharedTabs.has(tabId)) return { tab, kind: "shared" };
+  return { tab, kind: null };
 }
 
-// Clean up when tab is closed
+// Only web pages can be shared: Firefox doesn't let extensions script its
+// own pages (about:, addons.mozilla.org, other extensions).
+function isShareableUrl(url) {
+  return /^(https?|file):/i.test(url || "") && !/^https:\/\/addons\.mozilla\.org\//i.test(url);
+}
+
+async function shareTabs(tabIds) {
+  const added = [];
+  for (const id of tabIds) {
+    const { tab, kind } = await tabControl(id);
+    if (!tab || kind || !isShareableUrl(tab.url)) continue;
+    sharedTabs.add(id);
+    added.push(tab);
+  }
+  if (added.length) await saveSharedTabs();
+  return added;
+}
+
+async function unshareTab(tabId) {
+  if (!sharedTabs.delete(tabId)) return false;
+  await saveSharedTabs();
+  setGlow(tabId, "remove");
+  return true;
+}
+
+function tabLine(t) {
+  return `  • tabId ${t.id}: "${t.title || "Untitled"}" (${t.url || ""})\n`;
+}
+
+function formatTabContext(group, own, shared) {
+  const available = [
+    ...own.map((t) => ({ tabId: t.id, title: t.title || "Untitled", url: t.url || "" })),
+    ...shared.map((t) => ({ tabId: t.id, title: t.title || "Untitled", url: t.url || "", sharedByUser: true })),
+  ];
+  let text = "Tab Context:\n";
+  text += `- Claude's tabs (tab group "${GROUP_TITLE}"):\n`;
+  text += own.length ? own.map(tabLine).join("") : "  (none)\n";
+  if (shared.length) {
+    text += "- Tabs the user shared with you (their own tabs, in their windows):\n";
+    text += shared.map(tabLine).join("");
+  }
+  return textResult(
+    JSON.stringify({ availableTabs: available, groupId: group?.id ?? null, windowId: group?.windowId ?? null }) +
+      "\n\n" +
+      text
+  );
+}
+
+// Tabs opened from Claude's tabs (links with target=_blank, window.open)
+// join Claude's group. Tabs opened from a shared tab while Claude is working
+// in it are shared too.
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (tab.openerTabId === undefined) return;
+  await stateReady;
+  const { kind } = await tabControl(tab.openerTabId);
+  if (kind === "own" && tab.groupId !== claudeGroupId) {
+    try {
+      await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] });
+    } catch {}
+  } else if (kind === "shared" && Date.now() - (lastWorkAt.get(tab.openerTabId) || 0) < 5000) {
+    sharedTabs.add(tab.id);
+    saveSharedTabs();
+  }
+});
+
+// Clean up when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  mcpTabs.delete(tabId);
-  consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
-  consoleInterceptors.delete(tabId);
+  lastWorkAt.delete(tabId);
+  if (sharedTabs.delete(tabId)) saveSharedTabs();
 });
 
 // --- Network monitoring via webRequest ---
@@ -220,44 +313,6 @@ chrome.webRequest.onErrorOccurred.addListener(
   { urls: ["<all_urls>"] }
 );
 
-// --- Key code mapping ---
-const KEY_MAP = {
-  enter: "Enter", return: "Enter", tab: "Tab", escape: "Escape", esc: "Escape",
-  backspace: "Backspace", delete: "Delete", space: "Space", " ": "Space",
-  arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight",
-  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight",
-  home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown",
-  f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
-  f7: "F7", f8: "F8", f9: "F9", f10: "F10", f11: "F11", f12: "F12",
-};
-
-function parseKeyCombo(keyStr) {
-  const parts = keyStr.split("+").map((p) => p.trim().toLowerCase());
-  let modifiers = 0;
-  let key = "";
-  for (const part of parts) {
-    if (part === "ctrl" || part === "control") modifiers |= 2;
-    else if (part === "alt") modifiers |= 1;
-    else if (part === "shift") modifiers |= 8;
-    else if (part === "meta" || part === "cmd" || part === "command" || part === "win" || part === "windows") modifiers |= 4;
-    else key = KEY_MAP[part] || part;
-  }
-  return { key, modifiers };
-}
-
-function parseModifierString(modStr) {
-  if (!modStr) return 0;
-  let modifiers = 0;
-  const parts = modStr.split("+").map((p) => p.trim().toLowerCase());
-  for (const part of parts) {
-    if (part === "ctrl" || part === "control") modifiers |= 2;
-    else if (part === "alt") modifiers |= 1;
-    else if (part === "shift") modifiers |= 8;
-    else if (part === "meta" || part === "cmd" || part === "command" || part === "win" || part === "windows") modifiers |= 4;
-  }
-  return modifiers;
-}
-
 // --- Content script communication ---
 async function sendContentMessage(tabId, message) {
   try {
@@ -273,12 +328,80 @@ async function sendContentMessage(tabId, message) {
   }
 }
 
-// --- Resolve ref to coordinates ---
-async function resolveRefToCoordinates(tabId, ref) {
-  const resp = await sendContentMessage(tabId, { type: "getRefCoordinates", ref });
-  if (resp?.result) return [resp.result.x, resp.result.y];
-  return null;
+// --- Working in a page: glow, page hooks, dialog reports ---
+
+// Dialogs on a shared tab are only answered for Claude this long after its
+// last action there; after that they're left for the user. In Claude's own
+// tabs they're always answered.
+const SHARED_DIALOG_WINDOW_MS = 15000;
+const ALWAYS = Number.MAX_SAFE_INTEGER;
+const capturingTabs = new Set(); // tabs with a screenshot in progress
+
+function setGlow(tabId, mode) {
+  if (mode === "show" && capturingTabs.has(tabId)) return;
+  chrome.tabs.sendMessage(tabId, { type: "glow", mode }).catch(() => {});
 }
+
+function dialogDeadline(tabId, kind) {
+  return kind === "own" ? ALWAYS : (lastWorkAt.get(tabId) || 0) + SHARED_DIALOG_WINDOW_MS;
+}
+
+// Installs or updates the hooks in the tab's page and returns what they
+// recorded ({ dialogs } or { logs }); null where pages can't be scripted.
+async function callPageHooks(tabId, settings, frameId = 0) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: "MAIN",
+      injectImmediately: true,
+      func: installPageHooks,
+      args: [settings],
+    });
+    return res?.result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function describeDialogs(dialogs) {
+  if (!dialogs.length) return null;
+  const lines = dialogs.map((d) => {
+    const msg = d.message ? ` "${d.message}"` : "";
+    return d.answer === "left open for the user"
+      ? `- ${d.type}${msg}: shown to the user (it opened while you weren't working in this tab); the page is paused until they answer it`
+      : `- ${d.type}${msg}: answered ${d.answer} automatically`;
+  });
+  return `The page opened dialogs:\n${lines.join("\n")}\nUse handle_dialog to choose how the next confirm or prompt is answered.`;
+}
+
+// Tools that work inside a tab's page get the glow, page hooks, and a report
+// of any dialogs the page opened.
+async function startPageWork(tabId, kind) {
+  lastWorkAt.set(tabId, Date.now());
+  const before = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+  setGlow(tabId, "show");
+  const keepGlowing = setInterval(() => setGlow(tabId, "show"), 2000);
+  return async function finish(result) {
+    clearInterval(keepGlowing);
+    lastWorkAt.set(tabId, Date.now());
+    setGlow(tabId, "show"); // it fades out a few seconds after the last refresh
+    const after = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+    const note = describeDialogs([...(before?.dialogs || []), ...(after?.dialogs || [])]);
+    if (note && result?.content) result.content.push({ type: "text", text: note });
+    return result;
+  };
+}
+
+// A new page started loading in a tab (content.js runs at document_start):
+// hook it early if Claude controls the tab.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type !== "pageStarted" || !sender.tab) return;
+  (async () => {
+    await stateReady;
+    const { kind } = await tabControl(sender.tab.id);
+    if (kind) await callPageHooks(sender.tab.id, { answerUntil: dialogDeadline(sender.tab.id, kind) }, sender.frameId);
+  })();
+});
 
 // --- Screenshot helper ---
 // Firefox uses tabs.captureVisibleTab() — the tab must be active in its window.
@@ -301,8 +424,17 @@ async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
     return dataUrl.replace(/^data:image\/jpeg;base64,/, "");
   };
 
-  let base64 = await capture(55);
-  if (base64.length > 500000) base64 = await capture(30);
+  // Keep the glow out of the picture.
+  capturingTabs.add(tabId);
+  let base64;
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }).catch(() => {});
+    base64 = await capture(55);
+    if (base64.length > 500000) base64 = await capture(30);
+  } finally {
+    capturingTabs.delete(tabId);
+    setGlow(tabId, "show");
+  }
 
   const imageId = `screenshot_${Date.now()}`;
   screenshotStore.set(imageId, base64);
@@ -316,88 +448,114 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// --- Console interceptor ---
-// Installs a console override in the page's MAIN world to capture log messages.
-// Messages before the interceptor is installed are not captured.
-async function ensureConsoleInterceptor(tabId) {
-  if (consoleInterceptors.has(tabId)) return;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: () => {
-        if (window.__firefoxConsoleInterceptor) return;
-        window.__firefoxConsoleInterceptor = true;
-        window.__firefoxConsoleQueue = [];
-        const methods = ["log", "info", "warn", "error", "debug"];
-        for (const level of methods) {
-          const orig = console[level].bind(console);
-          console[level] = function (...args) {
-            orig(...args);
-            window.__firefoxConsoleQueue.push({
-              level,
-              text: args
-                .map((a) => {
-                  try {
-                    return typeof a === "object" && a !== null
-                      ? JSON.stringify(a)
-                      : String(a);
-                  } catch {
-                    return String(a);
-                  }
-                })
-                .join(" "),
-              url: location.href,
-              timestamp: Date.now(),
-            });
-            if (window.__firefoxConsoleQueue.length > 1000) {
-              window.__firefoxConsoleQueue.splice(
-                0,
-                window.__firefoxConsoleQueue.length - 1000
-              );
-            }
-          };
-        }
-      },
-    });
-    consoleInterceptors.add(tabId);
-  } catch {}
+// A link Claude clicked that opens a new tab (see content.js): it opens in
+// the background next to the tab it came from, and belongs to Claude the
+// same way that tab does: in Claude's group, or shared.
+async function openLinkInNewTab(fromTabId, kind, url) {
+  const from = await chrome.tabs.get(fromTabId);
+  const tab = await chrome.tabs.create({
+    url,
+    windowId: from.windowId,
+    index: from.index + 1,
+    openerTabId: fromTabId,
+    active: false,
+  });
+  if (kind === "own") {
+    if (claudeGroupId !== null) await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] }).catch(() => {});
+  } else {
+    sharedTabs.add(tab.id);
+    await saveSharedTabs();
+  }
+  return tab;
 }
 
+const CLICKS = {
+  left_click: { button: "left", count: 1, verb: "Clicked" },
+  right_click: { button: "right", count: 1, verb: "Right-clicked" },
+  double_click: { button: "left", count: 2, verb: "Double-clicked" },
+  triple_click: { button: "left", count: 3, verb: "Triple-clicked" },
+};
+
 // --- Tool handlers ---
+// Handlers that take a tabId run only after handleToolRequest has checked
+// that Claude may use the tab; they get { tab, kind } from tabControl.
 const toolHandlers = {
   async tabs_context_mcp(args) {
-    await ensureMcpWindow(args.createIfEmpty);
-    if (mcpWindowId === null) {
-      return {
-        content: [{ type: "text", text: "No MCP window exists. Use createIfEmpty: true to create one." }],
-      };
+    let group = await findClaudeGroup();
+    if (!group && args.createIfEmpty) group = await ensureClaudeGroup();
+    const own = group ? await tabsInGroup(group) : [];
+    const shared = await sharedTabList();
+    if (!own.length && !shared.length) {
+      return textResult(`No "${GROUP_TITLE}" tab group exists. Use createIfEmpty: true to create one.`);
     }
-    const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-    return formatTabContext(tabs);
+    return formatTabContext(group, own, shared);
   },
 
-  async tabs_create_mcp(args) {
-    await ensureMcpWindow(true);
-    const tab = await chrome.tabs.create({ windowId: mcpWindowId, active: true });
-    mcpTabs.add(tab.id);
-    const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-    const result = formatTabContext(tabs);
+  async tabs_create_mcp() {
+    const group = await ensureClaudeGroup();
+    const tab = await chrome.tabs.create({ windowId: group.windowId, active: true });
+    await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+    const result = formatTabContext(group, await tabsInGroup(group), await sharedTabList());
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
   },
 
+  // Shared tabs too: sharing a tab hands it to Claude completely.
+  async tabs_close_mcp(args) {
+    await chrome.tabs.remove(args.tabId);
+    const group = await findClaudeGroup();
+    const own = group ? await tabsInGroup(group) : [];
+    const result = formatTabContext(group, own, await sharedTabList());
+    result.content[0].text = `Closed tab ${args.tabId}.\n\n` + result.content[0].text;
+    return result;
+  },
+
+  async tabs_request_access(args) {
+    const outcome = await requestTabAccess(args);
+    if (outcome.declined) return textResult("The user chose not to share any tabs.");
+    if (outcome.pending) {
+      return textResult(
+        "No answer yet. The request stays open in a Firefox window; call tabs_context_mcp later to see whether the user shared any tabs."
+      );
+    }
+    return textResult(
+      `The user shared ${outcome.tabs.length} tab${outcome.tabs.length === 1 ? "" : "s"} with you:\n` +
+        outcome.tabs.map(tabLine).join("") +
+        "These are the user's own tabs: use them for the task, and call tabs_release when you're done (or tabs_close_mcp to close one)."
+    );
+  },
+
+  // Moves shared tabs into Claude's group. The MCP server only sends this
+  // once the user agreed (tabs_request_handover asks them in Claude's own
+  // prompt); a shared tab is fully Claude's to use anyway.
+  async tabs_handover(args) {
+    const ids = [...new Set((args.tabIds || []).map(Number))];
+    const notShared = ids.filter((id) => !sharedTabs.has(id));
+    if (!ids.length || notShared.length) {
+      return textResult(
+        `Only tabs the user shared with you can be handed over${notShared.length ? `; not shared: ${notShared.join(", ")}` : ""}. Use tabs_context_mcp to see them.`
+      );
+    }
+    const tabs = await moveTabsToClaude(ids);
+    return textResult(
+      `Handed over ${tabs.length} tab${tabs.length === 1 ? "" : "s"}: now in Claude's tab group, in its window:\n` + tabs.map(tabLine).join("")
+    );
+  },
+
+  async tabs_release(args, { kind }) {
+    if (kind === "own") {
+      return textResult(`Tab ${args.tabId} is one of Claude's own tabs. Use tabs_close_mcp to close it.`);
+    }
+    await unshareTab(args.tabId);
+    return textResult(`Released tab ${args.tabId}: it's the user's again, and you can't use it anymore.`);
+  },
+
   async navigate(args) {
     const { url, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
-    if (url === "back") {
-      await chrome.tabs.goBack(tabId);
-    } else if (url === "forward") {
-      await chrome.tabs.goForward(tabId);
-    } else {
-      let targetUrl = url;
+    let targetUrl = null;
+    if (url !== "back" && url !== "forward") {
+      targetUrl = url;
       if (
         !targetUrl.match(/^https?:\/\//i) &&
         !targetUrl.startsWith("about:") &&
@@ -408,56 +566,75 @@ const toolHandlers = {
         targetUrl = "https://" + targetUrl;
       }
       try {
-        new URL(targetUrl);
+        targetUrl = new URL(targetUrl).href;
       } catch {
-        return { content: [{ type: "text", text: `Invalid URL: "${url}". Could not parse as a valid URL.` }] };
+        return textResult(`Invalid URL: "${url}". Could not parse as a valid URL.`);
       }
-      await chrome.tabs.update(tabId, { url: targetUrl });
-      // Console interceptor needs re-install after navigation
-      consoleInterceptors.delete(tabId);
     }
 
-    await new Promise((resolve) => {
-      const listener = (updatedTabId, info) => {
-        if (updatedTabId === tabId && info.status === "complete") {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
+    // Wait for this navigation's "complete", not one still on its way from
+    // the page that was loading before: only count it once the tab has
+    // started loading again. A jump within the same page (#anchor) doesn't
+    // load anything; it's done when the tab shows the requested URL (for
+    // back/forward, any new URL).
+    const loaded = new Promise((resolve) => {
+      let started = false;
+      const listener = (updatedTabId, info, tab) => {
+        if (updatedTabId !== tabId) return;
+        if (info.status === "loading") started = true;
+        else if (started && info.status === "complete") finish();
+        else if (!started && info.url && tab.status === "complete" && (targetUrl === null || info.url === targetUrl)) finish();
       };
-      chrome.tabs.onUpdated.addListener(listener);
-      setTimeout(() => {
+      const finish = () => {
         chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timer);
         resolve();
-      }, 10000);
+      };
+      const timer = setTimeout(finish, 10000);
+      chrome.tabs.onUpdated.addListener(listener);
     });
 
-    const tab = await chrome.tabs.get(tabId);
-    let tabs = [];
-    if (mcpWindowId !== null) {
-      tabs = await chrome.tabs.query({ windowId: mcpWindowId });
+    if (url === "back") {
+      await chrome.tabs.goBack(tabId);
+    } else if (url === "forward") {
+      await chrome.tabs.goForward(tabId);
+    } else {
+      await chrome.tabs.update(tabId, { url: targetUrl });
     }
+
+    await loaded;
+
+    const tab = await chrome.tabs.get(tabId);
+    const group = await findClaudeGroup();
+    const tabs = group && tab.groupId === group.id ? await tabsInGroup(group) : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text =
       `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
 
-    return { content: [{ type: "text", text }] };
+    return textResult(text);
   },
 
-  async computer(args) {
+  async computer(args, { kind }) {
     const { action, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
+    // A ref is turned into a point on screen. The element is scrolled into
+    // view first if needed: coordinates can only reach what's visible.
     let coordinate = args.coordinate;
-    if (args.ref && !coordinate) {
-      const coords = await resolveRefToCoordinates(tabId, args.ref);
-      if (!coords)
-        return { content: [{ type: "text", text: `Could not resolve ref "${args.ref}" to coordinates.` }] };
-      coordinate = coords;
+    let refNote = "";
+    if (args.ref && !coordinate && (action in CLICKS || action === "hover" || action === "scroll")) {
+      const resp = await sendContentMessage(tabId, { type: "locateRef", ref: args.ref });
+      const loc = resp?.result;
+      if (!loc) return textResult(`Could not resolve ref "${args.ref}" to coordinates.`);
+      if (loc.error) return textResult(`Error: ${loc.error}`);
+      coordinate = [loc.x, loc.y];
+      if (loc.scrolled) refNote += ` (scrolled ${args.ref} into view first)`;
+      if (loc.coveredBy) {
+        refNote += `. Note: ${loc.coveredBy} is on top of ${args.ref} at that point, so it received the input instead`;
+      }
     }
 
-    const modifiers = parseModifierString(args.modifiers);
+    const modifiers = modifierBits(args.modifiers);
 
     switch (action) {
       case "screenshot": {
@@ -479,105 +656,72 @@ const toolHandlers = {
         };
       }
 
-      case "left_click": {
-        if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
-        await sendContentMessage(tabId, {
-          type: "dispatchMouseClick",
-          x: coordinate[0], y: coordinate[1],
-          button: "left", clickCount: 1, modifiers,
-        });
-        return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
-      }
-
-      case "right_click": {
-        if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
-        await sendContentMessage(tabId, {
-          type: "dispatchMouseClick",
-          x: coordinate[0], y: coordinate[1],
-          button: "right", clickCount: 1, modifiers,
-        });
-        return { content: [{ type: "text", text: `Right-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
-      }
-
-      case "double_click": {
-        if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
-        await sendContentMessage(tabId, {
-          type: "dispatchMouseClick",
-          x: coordinate[0], y: coordinate[1],
-          button: "left", clickCount: 2, modifiers,
-        });
-        return { content: [{ type: "text", text: `Double-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
-      }
-
+      case "left_click":
+      case "right_click":
+      case "double_click":
       case "triple_click": {
-        if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
-        await sendContentMessage(tabId, {
+        if (!coordinate) return textResult(`coordinate or ref is required for ${action}`);
+        const { button, count, verb } = CLICKS[action];
+        const resp = await sendContentMessage(tabId, {
           type: "dispatchMouseClick",
           x: coordinate[0], y: coordinate[1],
-          button: "left", clickCount: 3, modifiers,
+          button, clickCount: count, modifiers,
         });
-        return { content: [{ type: "text", text: `Triple-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        if (resp?.error) return textResult(`Error: ${resp.error}`);
+        let opened = "";
+        if (resp?.openInNewTab) {
+          const tab = await openLinkInNewTab(tabId, kind, resp.openInNewTab);
+          opened = `. The link opens in a new tab: tab ${tab.id} (${resp.openInNewTab}), ${kind === "own" ? "in Claude's tab group" : "shared with you like the tab it came from"}`;
+        }
+        return textResult(`${verb} at (${coordinate[0]}, ${coordinate[1]})${refNote}${opened}`);
       }
 
       case "hover": {
         if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for hover" }] };
+          return textResult("coordinate or ref is required for hover");
         await sendContentMessage(tabId, {
           type: "dispatchMouseMove",
           x: coordinate[0], y: coordinate[1], modifiers,
         });
         await sleep(200);
-        return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return textResult(`Hovered at (${coordinate[0]}, ${coordinate[1]})${refNote}`);
       }
 
       case "type": {
         if (!args.text)
-          return { content: [{ type: "text", text: "text is required for type action" }] };
+          return textResult("text is required for type action");
         for (const char of args.text) {
-          await sendContentMessage(tabId, { type: "insertText", text: char });
+          await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) });
           await sleep(10);
         }
-        return {
-          content: [
-            { type: "text", text: `Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"` },
-          ],
-        };
+        return textResult(`Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`);
       }
 
       case "key": {
         if (!args.text)
-          return { content: [{ type: "text", text: "text is required for key action" }] };
+          return textResult("text is required for key action");
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
-            const { key, modifiers: keyMod } = parseKeyCombo(keyStr);
-            const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
+            const { key, code, keyCode, modifiers: keyMod } = parseKeyCombo(keyStr);
             await sendContentMessage(tabId, {
               type: "dispatchKeyEvent", eventType: "keyDown",
-              key, code, modifiers: keyMod,
+              key, code, keyCode, modifiers: keyMod,
             });
             await sendContentMessage(tabId, {
               type: "dispatchKeyEvent", eventType: "keyUp",
-              key, code, modifiers: keyMod,
+              key, code, keyCode, modifiers: keyMod,
             });
             await sleep(30);
           }
         }
-        return {
-          content: [
-            { type: "text", text: `Pressed ${repeat} key${repeat > 1 ? "s" : ""}: ${args.text}` },
-          ],
-        };
+        return textResult(`Pressed ${repeat} key${repeat > 1 ? "s" : ""}: ${args.text}`);
       }
 
       case "scroll": {
         if (!coordinate)
-          return { content: [{ type: "text", text: "coordinate is required for scroll" }] };
+          return textResult("coordinate is required for scroll");
         const dir = args.scroll_direction || "down";
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
@@ -603,7 +747,7 @@ const toolHandlers = {
 
       case "scroll_to": {
         if (!coordinate && !args.ref)
-          return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
+          return textResult("coordinate or ref is required for scroll_to");
         if (args.ref) {
           await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
         }
@@ -614,20 +758,18 @@ const toolHandlers = {
           });
         }
         await sleep(300);
-        return { content: [{ type: "text", text: `Scrolled to target` }] };
+        return textResult("Scrolled to target");
       }
 
       case "wait": {
         const duration = Math.min(args.duration || 1, 30);
         await sleep(duration * 1000);
-        return { content: [{ type: "text", text: `Waited for ${duration} second${duration !== 1 ? "s" : ""}` }] };
+        return textResult(`Waited for ${duration} second${duration !== 1 ? "s" : ""}`);
       }
 
       case "left_click_drag": {
         if (!args.start_coordinate || !coordinate) {
-          return {
-            content: [{ type: "text", text: "start_coordinate and coordinate are required for left_click_drag" }],
-          };
+          return textResult("start_coordinate and coordinate are required for left_click_drag");
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
@@ -635,16 +777,16 @@ const toolHandlers = {
           type: "dispatchDrag",
           startX: sx, startY: sy, endX: ex, endY: ey, modifiers,
         });
-        return { content: [{ type: "text", text: `Dragged from (${sx}, ${sy}) to (${ex}, ${ey})` }] };
+        return textResult(`Dragged from (${sx}, ${sy}) to (${ex}, ${ey})`);
       }
 
       case "zoom": {
         if (!args.region || args.region.length !== 4) {
-          return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
+          return textResult("region [x0, y0, x1, y1] is required for zoom");
         }
         const [x0, y0, x1, y1] = args.region.map(Number);
         if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) {
-          return { content: [{ type: "text", text: "region must be numbers with x1 > x0 and y1 > y0" }] };
+          return textResult("region must be numbers with x1 > x0 and y1 > y0");
         }
         // captureVisibleTab's rect is in page coordinates, so add the scroll offset.
         const [{ result: view }] = await chrome.scripting.executeScript({
@@ -672,14 +814,12 @@ const toolHandlers = {
       }
 
       default:
-        return { content: [{ type: "text", text: `Unknown computer action: ${action}` }] };
+        return textResult(`Unknown computer action: ${action}`);
     }
   },
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -700,127 +840,76 @@ const toolHandlers = {
       });
       if (vpResult[0]?.result) tree += `\n\nViewport: ${vpResult[0].result}`;
     } catch {}
-    return { content: [{ type: "text", text: tree }] };
+    return textResult(tree);
   },
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
-    if (!resp?.result)
-      return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
+    if (!resp?.result) return textResult("Error: Could not extract page text");
 
     try {
       const data = JSON.parse(resp.result);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Title: ${data.title}\nURL: ${data.url}\nSource: <${data.sourceTag}>\n\n${data.text}`,
-          },
-        ],
-      };
+      return textResult(`Title: ${data.title}\nURL: ${data.url}\nSource: <${data.sourceTag}>\n\n${data.text}`);
     } catch {
-      return { content: [{ type: "text", text: resp.result }] };
+      return textResult(resp.result);
     }
   },
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
 
     if (results.length === 0) {
-      return { content: [{ type: "text", text: `No elements found matching "${query}"` }] };
+      return textResult(`No elements found matching "${query}"`);
     }
 
     let text = `Found ${results.length} element(s) matching "${query}":\n\n`;
     for (const r of results) {
-      text += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})\n`;
+      const where = `at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      text += `[${r.ref}] ${r.role} "${r.name}" ${where}${r.offscreen ? " (off-screen: click it by ref, or scroll first)" : ""}\n`;
     }
 
-    return { content: [{ type: "text", text }] };
+    return textResult(text);
   },
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
 
-    if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
-    return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
+    if (result?.error) return textResult(`Error: ${result.error}`);
+    return textResult(`Set ${ref} to "${value}". Result: ${JSON.stringify(result)}`);
   },
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const seconds = jsTimeoutSeconds(args.timeout);
+    const deadline = Date.now() + seconds * 1000;
 
+    let outcome;
     try {
-      let result = await evalInPage(tabId, text);
-      if (result?.error && isCspError(result.error)) {
-        if (chrome.userScripts?.execute) {
-          result = await runAsUserScript(tabId, text);
-        } else {
-          // The namespace only exists once the permission is granted;
-          // userScripts.execute itself needs Firefox 153+.
-          const fix = chrome.userScripts
-            ? "Running scripts on sites like this needs Firefox 153 or later."
-            : `To run scripts on sites like this, click the ${EXTENSION_NAME} toolbar button and allow "User scripts".`;
-          result = { error: `${result.error}. This site's security policy blocks eval(). ${fix}` };
-        }
-      }
-
-      if (!result) return { content: [{ type: "text", text: "undefined" }] };
-      if (result.error)
-        return { content: [{ type: "text", text: `Error: ${result.error}` }] };
-      const val = result.value;
-      if (val === "__undefined__") return { content: [{ type: "text", text: "undefined" }] };
-      return {
-        content: [
-          {
-            type: "text",
-            text: typeof val === "object" && val !== null ? JSON.stringify(val) : String(val),
-          },
-        ],
-      };
+      outcome = await Promise.race([runJavascript(tabId, text, deadline), sleep(seconds * 1000).then(() => null)]);
     } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${withPermissionHelp(e.message)}` }] };
+      return textResult(`Error: ${withPermissionHelp(errorText(e))}`);
     }
+    if (!outcome || outcome.timedOut) {
+      return textResult(
+        `Error: the script didn't finish within ${seconds}s. It may still be running in the page: Firefox can't stop it from here, so navigate or reload the tab if the page is stuck.`
+      );
+    }
+    return formatJavascriptOutcome(outcome);
   },
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
-    await ensureConsoleInterceptor(tabId);
-
-    let msgs = [];
-    try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: (shouldClear) => {
-          const queue = window.__firefoxConsoleQueue || [];
-          const copy = queue.slice();
-          if (shouldClear) window.__firefoxConsoleQueue = [];
-          return copy;
-        },
-        args: [!!clear],
-      });
-      msgs = results[0]?.result || [];
-    } catch {}
-
-    if (clear) consoleMessages.delete(tabId);
+    const res = await callPageHooks(tabId, { read: "logs", clear: !!clear });
+    let msgs = res?.logs || [];
 
     if (onlyErrors) {
       msgs = msgs.filter((m) => ["error", "exception"].includes(m.level));
@@ -838,20 +927,18 @@ const toolHandlers = {
     msgs = msgs.slice(-limit);
 
     if (msgs.length === 0) {
-      return { content: [{ type: "text", text: "No console messages matching the pattern." }] };
+      return textResult("No console messages matching the pattern.");
     }
 
     const text = msgs
       .map((m) => `[${m.level}] ${m.text}${m.url ? ` (${m.url})` : ""}`)
       .join("\n");
 
-    return { content: [{ type: "text", text: `Console messages (${msgs.length}):\n${text}` }] };
+    return textResult(`Console messages (${msgs.length}):\n${text}`);
   },
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
 
     let reqs = networkRequests.get(tabId) || [];
 
@@ -866,7 +953,7 @@ const toolHandlers = {
     }
 
     if (reqs.length === 0) {
-      return { content: [{ type: "text", text: "No network requests matching the pattern." }] };
+      return textResult("No network requests matching the pattern.");
     }
 
     const text = reqs
@@ -876,51 +963,48 @@ const toolHandlers = {
       )
       .join("\n");
 
-    return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
+    return textResult(`Network requests (${reqs.length}):\n${text}`);
   },
 
-  async resize_window(args) {
-    const { width, height, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
-
-    const tab = await chrome.tabs.get(tabId);
+  async resize_window(args, { tab, kind }) {
+    const { width, height } = args;
+    if (kind === "shared") {
+      // The window holds the user's other tabs too, which they didn't share.
+      return textResult(
+        "This tab is in one of the user's windows, which holds their other tabs too, so it keeps its size. To resize, ask the user to hand the tab over with tabs_request_handover: it moves into Claude's own window."
+      );
+    }
     await chrome.windows.update(tab.windowId, { width, height });
-    return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
+    return textResult(`Resized window to ${width}x${height}`);
+  },
+
+  async handle_dialog(args) {
+    const { tabId, accept, promptText } = args;
+    const nextAnswer = { accept: !!accept, promptText: promptText ?? null };
+    const res = await callPageHooks(tabId, { nextAnswer });
+    if (!res) return textResult("Error: this page can't be scripted, so its dialogs can't be handled.");
+    const what = accept ? `accepted${promptText !== undefined ? ` with "${promptText}"` : ""}` : "cancelled";
+    return textResult(`The next confirm or prompt on this page will be ${what}. Alerts are always acknowledged.`);
   },
 
   async upload_image(args) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Image upload via file input is not supported in Firefox WebExtensions. Use drag & drop on the page instead.",
-        },
-      ],
-    };
+    return textResult("Image upload via file input is not supported in Firefox WebExtensions. Use drag & drop on the page instead.");
   },
 
   async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
+    return textResult("GIF recording is not yet implemented in this extension.");
   },
 
   async shortcuts_list(args) {
-    return { content: [{ type: "text", text: "No shortcuts available. Shortcuts are not supported in this extension." }] };
+    return textResult("No shortcuts available. Shortcuts are not supported in this extension.");
   },
 
   async shortcuts_execute(args) {
-    return { content: [{ type: "text", text: "Shortcuts are not supported in this extension." }] };
+    return textResult("Shortcuts are not supported in this extension.");
   },
 
   async switch_browser(args) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Browser switching is not yet supported. The extension connects to whichever Firefox browser has it loaded.",
-        },
-      ],
-    };
+    return textResult("Browser switching is not yet supported. The extension connects to whichever Firefox browser has it loaded.");
   },
 
   async update_plan(args) {
@@ -930,9 +1014,21 @@ const toolHandlers = {
       text += `- ${step}\n`;
     }
     text += "\nPlan auto-approved (no permission restrictions in this extension).";
-    return { content: [{ type: "text", text }] };
+    return textResult(text);
   },
 };
+
+// Tools that act on one tab, which must be Claude's or shared with Claude.
+const TAB_TOOLS = new Set([
+  "navigate", "computer", "read_page", "get_page_text", "find", "form_input",
+  "javascript_tool", "read_console_messages", "read_network_requests",
+  "resize_window", "handle_dialog", "tabs_close_mcp", "tabs_release",
+]);
+// Of those, the ones that work inside the page.
+const PAGE_TOOLS = new Set([
+  "navigate", "computer", "read_page", "get_page_text", "find", "form_input",
+  "javascript_tool", "read_console_messages", "handle_dialog",
+]);
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
@@ -942,38 +1038,132 @@ async function handleToolRequest(id, tool, args) {
     return;
   }
 
+  let finish = null;
   try {
-    const result = await handler(args);
+    await stateReady;
+    let control = null;
+    if (TAB_TOOLS.has(tool)) {
+      control = await tabControl(args.tabId);
+      if (!control.tab) {
+        sendResponse(id, textResult(`Tab ${args.tabId} doesn't exist anymore. Use tabs_context_mcp to see the tabs you can use.`));
+        return;
+      }
+      if (!control.kind) {
+        sendResponse(id, textResult(
+          `Tab ${args.tabId} isn't in Claude's tab group and the user hasn't shared it. Use tabs_context_mcp to see the tabs you can use, or tabs_request_access to ask the user to share one of theirs.`
+        ));
+        return;
+      }
+      if (PAGE_TOOLS.has(tool)) finish = await startPageWork(args.tabId, control.kind);
+    }
+    let result = await handler(args, control);
+    if (finish) result = await finish(result);
     sendResponse(id, result);
   } catch (err) {
+    if (finish) await finish(null).catch(() => {});
     sendError(id, `${tool} failed: ${withPermissionHelp(err.message)}`);
   }
 }
 
-// --- javascript_tool helpers ---
+// --- javascript_tool ---
 
-// eval() in the page's own world, so page variables are visible. Pages whose
-// CSP forbids eval (reddit, HN, ...) make this fail with a CSP error.
+const JS_TIMEOUT_DEFAULT = 30;
+const JS_TIMEOUT_MAX = 50; // the MCP server gives up on a tool call at 60s
+const JS_RESULT_LIMIT = 50000;
+
+function jsTimeoutSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return JS_TIMEOUT_DEFAULT;
+  return Math.min(Math.max(n, 1), JS_TIMEOUT_MAX);
+}
+
+// Resolves to { ok: packed result }, { thrown: error text } or { timedOut }.
+async function runJavascript(tabId, code, deadline) {
+  let outcome = await evalInPage(tabId, code);
+  if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, functionBodies(code));
+  if (!outcome.csp) return outcome;
+
+  // The page's Content Security Policy blocks eval().
+  if (chrome.userScripts?.execute) return runAsUserScript(tabId, code, deadline);
+  // The namespace only exists once the permission is granted;
+  // userScripts.execute itself needs Firefox 153+.
+  const fix = chrome.userScripts
+    ? "Running scripts on sites like this needs Firefox 153 or later."
+    : `To run scripts on sites like this, click the ${EXTENSION_NAME} toolbar button and allow "User scripts".`;
+  return { thrown: `${outcome.csp}. This site's security policy blocks eval(). ${fix}` };
+}
+
+// eval() in the page's own world (indirect, so it runs at global scope like a
+// console), so page variables are visible. Pages whose CSP forbids eval
+// (reddit, HN, ...) make it fail with { csp }. Code that uses top-level
+// await or return comes back as { needsFunctionBody }, without having run.
 async function evalInPage(tabId, code) {
-  const results = await chrome.scripting.executeScript({
+  const [res] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: (code) => {
+    func: async (code, packSource) => {
+      const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
+      let pack;
       try {
-        const val = eval(code); // eslint-disable-line no-eval
-        if (val && typeof val.then === "function") {
-          return val
-            .then((v) => ({ value: v === undefined ? "__undefined__" : v }))
-            .catch((e) => ({ error: e.message }));
-        }
-        return { value: val === undefined ? "__undefined__" : val };
+        pack = (0, eval)(`(${packSource})`); // eslint-disable-line no-eval
       } catch (e) {
-        return { error: e.message };
+        return { csp: describe(e) };
+      }
+      let value;
+      try {
+        value = (0, eval)(code); // eslint-disable-line no-eval
+      } catch (e) {
+        if (e instanceof SyntaxError && /await is only valid in async functions|return not in function/.test(e.message)) {
+          return { needsFunctionBody: true };
+        }
+        return { thrown: describe(e) };
+      }
+      try {
+        return { ok: pack(await value) };
+      } catch (e) {
+        return { thrown: describe(e) };
       }
     },
-    args: [code],
+    args: [code, packValue.toString()],
   });
-  return results[0]?.result;
+  if (res?.error) return { thrown: errorText(res.error) };
+  return res?.result ?? { thrown: "The script produced no result." };
+}
+
+// Runs the first of `bodies` that parses as an async function body.
+async function evalBodiesInPage(tabId, bodies) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: async (bodies, packSource) => {
+      const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
+      const pack = (0, eval)(`(${packSource})`); // eslint-disable-line no-eval
+      let parseError = null;
+      for (const body of bodies) {
+        let pending;
+        try {
+          // Parsing happens before anything runs: a body that doesn't parse
+          // has no effects.
+          pending = (0, eval)(`(async () => {\n${body}\n})()`); // eslint-disable-line no-eval
+        } catch (e) {
+          if (e instanceof SyntaxError) {
+            parseError = e;
+            continue;
+          }
+          return { thrown: describe(e) };
+        }
+        try {
+          return { ok: pack(await pending) };
+        } catch (e) {
+          return { thrown: describe(e) };
+        }
+      }
+      return { thrown: describe(parseError) };
+    },
+    args: [bodies, packValue.toString()],
+  });
+  if (res?.error) return { thrown: errorText(res.error) };
+  return res?.result ?? { thrown: "The script produced no result." };
 }
 
 function isCspError(error) {
@@ -987,26 +1177,202 @@ function errorText(error) {
 // Runs code as a user script: Firefox injects it itself instead of through
 // eval(), so the page's CSP doesn't stop it. Needs the optional "userScripts"
 // permission. Tries the page's world first (page variables visible), then the
-// isolated user-script world. The block keeps top-level const/let from
-// leaking into the page between calls, and keeps the completion value.
-async function runAsUserScript(tabId, code) {
-  let lastError;
-  for (const world of ["MAIN", "USER_SCRIPT"]) {
+// isolated user-script world. Each candidate body is a separate script; one
+// that doesn't parse is reported as an error without running, and the next
+// is tried.
+const USER_SCRIPT_MAX_TRIES = 150;
+
+async function runAsUserScript(tabId, code, deadline) {
+  const bodies = functionBodies(code);
+  const tries = bodies.length > USER_SCRIPT_MAX_TRIES
+    ? [...bodies.slice(0, USER_SCRIPT_MAX_TRIES - 1), bodies[bodies.length - 1]]
+    : bodies;
+  let world = "MAIN";
+  let lastError = "The script produced no result.";
+  for (const body of tries) {
+    if (Date.now() > deadline) return { timedOut: true };
+    let res;
     try {
-      const [res] = await chrome.userScripts.execute({
+      [res] = await chrome.userScripts.execute({
         target: { tabId },
-        js: [{ code: `{\n${code}\n}` }],
+        js: [{ code: userScriptSource(body) }],
         world,
       });
-      if (!res?.error) return { value: res?.result === undefined ? "__undefined__" : res.result };
-      lastError = res.error;
     } catch (e) {
-      lastError = e;
+      return { thrown: errorText(e) };
     }
-    if (!isCspError(lastError)) break;
+    if (res && !res.error) return res.result ?? { thrown: lastError };
+    lastError = errorText(res?.error);
+    if (isCspError(lastError) && world === "MAIN") {
+      // Retry the same body in the isolated world.
+      world = "USER_SCRIPT";
+      const [again] = await chrome.userScripts.execute({
+        target: { tabId },
+        js: [{ code: userScriptSource(body) }],
+        world,
+      });
+      if (again && !again.error) return again.result ?? { thrown: lastError };
+      lastError = errorText(again?.error);
+    }
   }
-  return { error: errorText(lastError) };
+  return { thrown: lastError };
 }
+
+// Credentials are hidden (lib/redact.js) and long output is cut.
+function formatJavascriptOutcome(outcome) {
+  if (outcome.thrown !== undefined) return textResult(`Error: ${redactTokens(outcome.thrown)}`);
+  const packed = outcome.ok;
+  if (!packed || packed.undefined) return textResult("undefined");
+  const value = redactValue(packed.value);
+  let text = typeof value === "string" ? value : JSON.stringify(value);
+  if (text === undefined) text = "undefined";
+  if (text.length > JS_RESULT_LIMIT) {
+    text = `${text.slice(0, JS_RESULT_LIMIT)}\n… (cut at ${JS_RESULT_LIMIT} of ${text.length} characters)`;
+  }
+  return textResult(text);
+}
+
+// --- Sharing the user's tabs ---
+// Claude asks with tabs_request_access: a small Firefox window lists the
+// user's tabs and they pick which to share (Claude never sees the others).
+// Or the user right-clicks a tab and shares it.
+//
+// A shared tab stays in the user's window. When Claude needs it to itself
+// (to resize its window, or to work without switching the tab the user is
+// looking at), it can be moved into Claude's group: Claude asks with
+// tabs_request_handover (the MCP server asks the user in Claude's own
+// prompt), or the user does it from the tab menu.
+
+const SHARE_PAGE = "share.html";
+const SHARE_WAIT_MS = 50000; // the tool call itself times out at 60s
+const shareRequests = new Map(); // requestId -> { reason, query, windowId, settle }
+
+// Moves tabs into Claude's group, in its window; with no group yet, the
+// first tab starts a new Claude window. They're Claude's own tabs afterwards.
+async function moveTabsToClaude(tabIds) {
+  for (const id of tabIds) {
+    const tab = await chrome.tabs.get(id);
+    if (tab.pinned) await chrome.tabs.update(id, { pinned: false }); // pinned tabs can't be grouped
+  }
+  let group = await findClaudeGroup();
+  if (group) {
+    await chrome.tabs.move(tabIds, { windowId: group.windowId, index: -1 });
+    await chrome.tabs.group({ groupId: group.id, tabIds });
+  } else {
+    const win = await chrome.windows.create({ tabId: tabIds[0] });
+    if (tabIds.length > 1) await chrome.tabs.move(tabIds.slice(1), { windowId: win.id, index: -1 });
+    const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: win.id } });
+    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
+    await rememberGroup(groupId);
+  }
+  for (const id of tabIds) sharedTabs.delete(id);
+  await saveSharedTabs();
+  return Promise.all(tabIds.map((id) => chrome.tabs.get(id)));
+}
+
+async function requestTabAccess({ reason, query }) {
+  const requestId = crypto.randomUUID();
+  let settle;
+  const decided = new Promise((resolve) => (settle = resolve));
+  shareRequests.set(requestId, { reason: reason || "", query: query || "", windowId: null, settle });
+  const win = await chrome.windows.create({
+    url: chrome.runtime.getURL(`${SHARE_PAGE}#${requestId}`),
+    type: "popup",
+    width: 560,
+    height: 640,
+    focused: true,
+  });
+  const open = shareRequests.get(requestId);
+  if (open) open.windowId = win.id;
+  // The window stays open after this times out, and an answer given later
+  // still shares the tabs.
+  return Promise.race([decided, sleep(SHARE_WAIT_MS).then(() => ({ pending: true }))]);
+}
+
+function finishShareRequest(requestId, outcome) {
+  const request = shareRequests.get(requestId);
+  if (!request) return;
+  shareRequests.delete(requestId);
+  request.settle(outcome);
+  if (request.windowId !== null) chrome.windows.remove(request.windowId).catch(() => {});
+}
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  for (const [requestId, request] of shareRequests) {
+    if (request.windowId === windowId) finishShareRequest(requestId, { declined: true });
+  }
+});
+
+// Only the extension's own share page may answer a request: web pages and
+// scripts Claude runs can't send these messages.
+function fromSharePage(sender) {
+  return typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(SHARE_PAGE));
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "getShareRequest" && fromSharePage(sender)) {
+    (async () => {
+      await stateReady;
+      const request = shareRequests.get(msg.requestId);
+      if (!request) return sendResponse({ missing: true });
+      const group = await findClaudeGroup();
+      const tabs = (await chrome.tabs.query({}))
+        .filter((t) => t.groupId !== group?.id && !sharedTabs.has(t.id) && isShareableUrl(t.url))
+        .map((t) => ({ id: t.id, title: t.title || "", url: t.url, favIconUrl: t.favIconUrl || "" }));
+      sendResponse({ reason: request.reason, query: request.query, tabs });
+    })();
+    return true;
+  }
+  if (msg?.type === "shareDecision" && fromSharePage(sender)) {
+    (async () => {
+      await stateReady;
+      if (!shareRequests.has(msg.requestId)) return sendResponse({ ok: false });
+      const tabs = Array.isArray(msg.tabIds) && msg.tabIds.length ? await shareTabs(msg.tabIds.map(Number)) : [];
+      finishShareRequest(msg.requestId, tabs.length ? { tabs } : { declined: true });
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+});
+
+// Tab context menu: "Share Tab with Claude", "Stop Sharing Tab with Claude",
+// and "Move Tab to Claude's Window" (hands it over for good). Applies to all
+// selected tabs when the clicked one is part of a selection.
+function createMenus() {
+  chrome.menus.removeAll().then(() => {
+    chrome.menus.create({ id: "share-tab", title: "Share Tab with Claude", contexts: ["tab"] });
+    chrome.menus.create({ id: "unshare-tab", title: "Stop Sharing Tab with Claude", contexts: ["tab"], visible: false });
+    chrome.menus.create({ id: "handover-tab", title: "Move Tab to Claude's Window", contexts: ["tab"] });
+  });
+}
+createMenus();
+
+chrome.menus.onShown.addListener(async (info, tab) => {
+  if (!info.contexts.includes("tab") || !tab) return;
+  await stateReady;
+  const { kind } = await tabControl(tab.id);
+  const shareable = isShareableUrl(tab.url);
+  await chrome.menus.update("share-tab", { visible: !kind && shareable });
+  await chrome.menus.update("unshare-tab", { visible: kind === "shared" });
+  await chrome.menus.update("handover-tab", { visible: kind !== "own" && shareable });
+  chrome.menus.refresh();
+});
+
+chrome.menus.onClicked.addListener(async (info, tab) => {
+  if (!tab) return;
+  await stateReady;
+  let tabs = [tab];
+  if (tab.highlighted) tabs = await chrome.tabs.query({ windowId: tab.windowId, highlighted: true });
+  if (info.menuItemId === "share-tab") await shareTabs(tabs.map((t) => t.id));
+  if (info.menuItemId === "unshare-tab") for (const t of tabs) await unshareTab(t.id);
+  if (info.menuItemId === "handover-tab") {
+    const ids = [];
+    for (const t of tabs) {
+      if ((await tabControl(t.id)).kind !== "own" && isShareableUrl(t.url)) ids.push(t.id);
+    }
+    if (ids.length) await moveTabsToClaude(ids);
+  }
+});
 
 // --- Permissions and the setup page ---
 // Website access is in the install prompt (Firefox 127+), but users can revoke
@@ -1064,24 +1430,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- Init ---
 
-// Recover MCP window state after service worker restart
-async function recoverMcpWindowState() {
+// Restores what this background script knew before it was suspended or
+// restarted. Every listener that reads the state waits for this first.
+async function restoreState() {
   try {
-    const stored = await chrome.storage.local.get(MCP_WINDOW_STORAGE_KEY);
-    const savedId = stored[MCP_WINDOW_STORAGE_KEY];
-    if (savedId) {
-      try {
-        await chrome.windows.get(savedId);
-        mcpWindowId = savedId;
-        const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-        tabs.forEach((t) => mcpTabs.add(t.id));
-      } catch {
-        await chrome.storage.local.remove(MCP_WINDOW_STORAGE_KEY);
+    const { [SHARED_STORAGE_KEY]: shared = [] } = await chrome.storage.session.get(SHARED_STORAGE_KEY);
+    for (const id of shared) sharedTabs.add(id);
+  } catch {}
+  try {
+    const stored = await chrome.storage.local.get([GROUP_STORAGE_KEY, LEGACY_WINDOW_STORAGE_KEY]);
+    if (typeof stored[GROUP_STORAGE_KEY] === "number") claudeGroupId = stored[GROUP_STORAGE_KEY];
+    const legacyWindowId = stored[LEGACY_WINDOW_STORAGE_KEY];
+    if (legacyWindowId !== undefined) {
+      // Upgrading from 1.1.x: group the tabs of the old MCP window.
+      await chrome.storage.local.remove(LEGACY_WINDOW_STORAGE_KEY);
+      if (!(await findClaudeGroup())) {
+        const tabs = (await chrome.tabs.query({ windowId: legacyWindowId })).filter((t) => !t.pinned);
+        if (tabs.length) {
+          const groupId = await chrome.tabs.group({ tabIds: tabs.map((t) => t.id), createProperties: { windowId: legacyWindowId } });
+          await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
+          await rememberGroup(groupId);
+        }
       }
     }
   } catch {}
 }
 
-recoverMcpWindowState();
+const stateReady = restoreState();
 connectToServer();
 updateBadge();
