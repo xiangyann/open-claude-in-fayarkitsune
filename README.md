@@ -121,13 +121,17 @@ After installing, a setup page opens with the extension's permissions. You can r
 
 #### Claude Desktop
 
-Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest), or build it:
+Get the `.mcpb` bundle in one of two ways:
 
-```bash
-cd host
-npm install
-npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
-```
+- **From Releases:** download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest).
+- **Build it yourself** (needs Node.js v18+):
+  ```bash
+  git clone https://github.com/xiangyann/open-claude-in-fayarkitsune
+  cd open-claude-in-fayarkitsune/host
+  npm install
+  npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
+  ```
+  This writes `open-claude-in-fayarkitsune.mcpb` to the repo root.
 
 Then double-click the `.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so nothing else needs installing.
 
