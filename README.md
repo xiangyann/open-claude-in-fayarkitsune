@@ -88,7 +88,11 @@ Download the `.xpi` from the [latest release](https://github.com/xiangyann/open-
 
 #### Claude Desktop (`.mcpb`)
 
-Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest) and double-click it to install it in Claude Desktop. The bundle carries its own dependencies and runs on Claude Desktop's built-in Node.js, so nothing else needs installing.
+1. Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest).
+2. In Claude Desktop, click your profile in the bottom-left corner → **Settings** → **Extensions**.
+3. Drag the `.mcpb` file onto the drop area there and confirm the install.
+
+Double-clicking the file usually doesn't work, because Claude Desktop often doesn't register the `.mcpb` file type. The bundle carries its own dependencies and runs on Claude Desktop's built-in Node.js, so nothing else needs installing.
 
 Releases have nothing to install for Claude Code: follow [From source → Claude Code](#claude-code) for the server.
 
@@ -139,7 +143,7 @@ npm install
 npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
 ```
 
-This writes `open-claude-in-fayarkitsune.mcpb` to the repo root. Double-click it to install it in Claude Desktop.
+This writes `open-claude-in-fayarkitsune.mcpb` to the repo root. Install it like the release file: Claude Desktop → your profile in the bottom-left corner → **Settings** → **Extensions**, then drag the file onto the drop area.
 
 #### Claude Code
 
