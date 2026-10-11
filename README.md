@@ -74,15 +74,19 @@ No native messaging host, registry keys or install script: the extension finds t
 
 - **Firefox** 142+
 - **Claude Desktop** and/or **Claude Code** v2.0.73+
-- **Node.js** v18+ to build the MCP server (Claude Desktop then runs it with its own built-in Node.js)
+- **Node.js** v18+, only for building from source or using Claude Code (Claude Desktop runs the `.mcpb` with its own built-in Node.js)
 
-No signed build is published, so you build both parts from this repo.
+Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page: the `.xpi` is the Firefox extension and the `.mcpb` is the server for Claude Desktop. There are no automatic updates, so check Releases for new versions. You can also build both parts from this repo, as described below.
 
 ### Step 1: Install the extension
 
 Pick one of these.
 
-#### Temporary (quickest, any Firefox)
+#### From Releases (recommended)
+
+Download the `.xpi` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest). GitHub only downloads the file, so install it yourself: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
+
+#### Temporary (quickest from source, any Firefox)
 
 `about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `extension/manifest.json`. Firefox removes temporary add-ons when it restarts, so you'll repeat this after each restart.
 
@@ -117,7 +121,7 @@ After installing, a setup page opens with the extension's permissions. You can r
 
 #### Claude Desktop
 
-Build the `.mcpb` bundle:
+Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest), or build it:
 
 ```bash
 cd host
@@ -125,7 +129,7 @@ npm install
 npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
 ```
 
-Then double-click `open-claude-in-fayarkitsune.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so you can also hand the file to someone without Node.js installed.
+Then double-click the `.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so nothing else needs installing.
 
 #### Claude Code
 
