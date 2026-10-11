@@ -74,23 +74,42 @@ No native messaging host, registry keys or install script: the extension finds t
 
 - **Firefox** 142+
 - **Claude Desktop** and/or **Claude Code** v2.0.73+
-- **Node.js** v18+, only for building from source or using Claude Code (Claude Desktop runs the `.mcpb` with its own built-in Node.js)
+- **Node.js** v18+, only for installing from source or using Claude Code (Claude Desktop runs the `.mcpb` with its own built-in Node.js)
 
-Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page: the `.xpi` is the Firefox extension and the `.mcpb` is the server for Claude Desktop. There are no automatic updates, so check Releases for new versions. You can also build both parts from this repo, as described below.
+There are two parts to install: the **Firefox extension** and the **MCP server** that Claude talks to. Get both from Releases, or build them from source.
 
-### Step 1: Install the extension
+### 1. From Releases
 
-Pick one of these.
+Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page. There are no automatic updates, so check there for new versions.
 
-#### From Releases (recommended)
+#### Firefox extension (`.xpi`)
 
 Download the `.xpi` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest). GitHub only downloads the file, so install it yourself: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
 
-#### Temporary (quickest from source, any Firefox)
+#### Claude Desktop (`.mcpb`)
+
+Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest) and double-click it to install it in Claude Desktop. The bundle carries its own dependencies and runs on Claude Desktop's built-in Node.js, so nothing else needs installing.
+
+Releases have nothing to install for Claude Code: follow [From source → Claude Code](#claude-code) for the server.
+
+### 2. From source
+
+Clone the repo first:
+
+```bash
+git clone https://github.com/xiangyann/open-claude-in-fayarkitsune
+cd open-claude-in-fayarkitsune
+```
+
+#### Firefox extension
+
+Pick one of these.
+
+##### Temporary (any Firefox)
 
 `about:debugging` → **This Firefox** → **Load Temporary Add-on...** → select `extension/manifest.json`. Firefox removes temporary add-ons when it restarts, so you'll repeat this after each restart.
 
-#### Permanent: sign your own copy
+##### Permanent: sign your own copy
 
 Release Firefox only installs add-ons signed by Mozilla. Signing as **unlisted** is free, automated, and doesn't publish anything on addons.mozilla.org:
 
@@ -102,7 +121,7 @@ Release Firefox only installs add-ons signed by Mozilla. Signing as **unlisted**
    ```
 4. Install the `.xpi` it saves in `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
 
-#### Permanent: unsigned, on Firefox Developer Edition, Nightly or ESR
+##### Permanent: unsigned, on Firefox Developer Edition, Nightly or ESR
 
 Those builds can turn off the signature check (release and beta Firefox ignore it):
 
@@ -110,30 +129,17 @@ Those builds can turn off the signature check (release and beta Firefox ignore i
 2. Build: `npx web-ext build -s extension`
 3. Install the `.zip` from `web-ext-artifacts/`: `about:addons` → gear icon → **Install Add-on From File...**
 
-#### Permissions
+#### Claude Desktop (`.mcpb`)
 
-After installing, a setup page opens with the extension's permissions. You can reopen it any time from the toolbar button, which shows a red **!** while website access is missing:
+Build the bundle:
 
-- **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
-- **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
+```bash
+cd host
+npm install
+npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
+```
 
-### Step 2: Add the MCP server
-
-#### Claude Desktop
-
-Get the `.mcpb` bundle in one of two ways:
-
-- **From Releases:** download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest).
-- **Build it yourself** (needs Node.js v18+):
-  ```bash
-  git clone https://github.com/xiangyann/open-claude-in-fayarkitsune
-  cd open-claude-in-fayarkitsune/host
-  npm install
-  npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
-  ```
-  This writes `open-claude-in-fayarkitsune.mcpb` to the repo root.
-
-Then double-click the `.mcpb` to install it in Claude Desktop. The bundle carries its own dependencies, and Claude Desktop runs it with its built-in Node.js, so nothing else needs installing.
+This writes `open-claude-in-fayarkitsune.mcpb` to the repo root. Double-click it to install it in Claude Desktop.
 
 #### Claude Code
 
@@ -144,6 +150,13 @@ claude mcp add open-claude-in-fayarkitsune -- node "$(pwd)/mcp-server.js"
 ```
 
 On Windows PowerShell, use `"$PWD\mcp-server.js"` for the path.
+
+### Permissions
+
+However you installed the extension, a setup page opens with its permissions. You can reopen it any time from the toolbar button, which shows a red **!** while website access is missing:
+
+- **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
+- **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
 
 That's it. The extension connects to the server on its own whenever Claude is running.
 
