@@ -67,6 +67,7 @@ No native messaging host, registry keys or install script: the extension finds t
 - **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header.
 - **Other Firefox add-ons can.** Every add-on has a `moz-extension://` origin, and the server doesn't check which add-on is connecting. If another add-on in the same Firefox profile connects first, it takes the server's single browser slot. It would then see the tool requests Claude sends (URLs, text to type, JavaScript to run) and could send fake results back to Claude. It can't use that connection to control the browser. Use a Firefox profile with only add-ons you trust.
 - **Programs on your computer can.** Anything running as your user can connect to `127.0.0.1:18765` and send tool requests, the same way a second Claude session does. Such a program already has your user's access to the machine, so this adds little, but it's worth knowing.
+- **Your other tabs are off limits.** Tools only work in Claude's tab group and in tabs you shared. Sharing is something only you can do, from the tab menu or the window `tabs_request_access` opens; neither Claude nor a web page can click "Share" for you. Moving a shared tab into Claude's window also takes your yes (or your drag), though a program connecting to the server directly, as described above, could move a tab you shared.
 
 ## Installation
 
@@ -162,6 +163,8 @@ However you installed the extension, a setup page opens with its permissions. Yo
 - **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
 - **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
 
+The install prompt doesn't list two other permissions, because they don't come with a warning: **tab groups** (Claude's tabs live in a group named "Claude") and **menus** (the "Share Tab with Claude" and "Move Tab to Claude's Window" items when you right-click a tab).
+
 That's it. The extension connects to the server on its own whenever Claude is running.
 
 ### Upgrading from extension 1.0.0
@@ -186,20 +189,25 @@ Reddit loads. No domain restriction.
 
 ## Available Tools
 
-All 18 tools, matching the Claude in Chrome interface:
+The Claude in Chrome tools, plus a few for tabs you share and page dialogs:
 
 | Tool | Description |
 |------|-------------|
-| `tabs_context_mcp` | Get MCP window tab context |
-| `tabs_create_mcp` | Create new tab in MCP window |
+| `tabs_context_mcp` | List Claude's tab group and the tabs you shared |
+| `tabs_create_mcp` | Create a new tab in Claude's tab group |
+| `tabs_close_mcp` | Close a tab in Claude's tab group, or a tab you shared |
+| `tabs_request_access` | Ask you to share some of your own tabs |
+| `tabs_request_handover` | Ask you to move shared tabs into Claude's window |
+| `tabs_release` | Give a shared tab back |
 | `navigate` | Navigate to URL, back, forward |
 | `computer` | Mouse, keyboard, screenshots (13 actions) |
 | `read_page` | Accessibility tree with element refs |
 | `get_page_text` | Extract article/main text |
 | `find` | Find elements by text/purpose |
 | `form_input` | Set form values by ref |
-| `javascript_tool` | Execute JS in page context |
-| `read_console_messages` | Console output (filtered) |
+| `javascript_tool` | Execute JS in page context (top-level `await` and `return` work; credentials are hidden from results) |
+| `handle_dialog` | Choose the answer to the page's next `confirm()` or `prompt()` |
+| `read_console_messages` | Console output, uncaught errors and promise rejections (filtered) |
 | `read_network_requests` | Network activity |
 | `resize_window` | Resize browser window |
 | `upload_image` | Not supported in Firefox WebExtensions |
@@ -211,9 +219,36 @@ All 18 tools, matching the Claude in Chrome interface:
 
 ## Firefox Notes
 
-### Tab groups → MCP window
+### Claude's tabs: a tab group
 
-The Chrome version uses tab groups to track Claude's tabs. Firefox has no tab groups API, so this extension instead opens a dedicated **MCP window**. All tabs Claude creates live in that window. The window ID is saved to extension storage and recovered automatically after Firefox restarts or the service worker is reloaded.
+Claude works in a tab group named **Claude** (orange), which it opens in a window of its own so it doesn't take over the tab you're looking at. The group keeps Claude's tabs together when Claude restarts or a conversation loses track of them: `tabs_context_mcp` lists them again. Tabs that Claude's pages open join the group. Firefox's popup blocker ignores a link that opens a new tab (`target="_blank"`, or a ctrl-click) when Claude clicks it, since Claude's clicks are synthetic, so the extension opens such links itself, in a background tab next to the one Claude clicked in.
+
+After a Firefox restart, the group comes back with a new ID, so the extension finds it again by its name and color. That's also the rule for which tabs are Claude's: a tab you drag into an orange group named "Claude" becomes Claude's, and one you drag out of it isn't anymore. Upgrading from 1.1.x turns the old MCP window's tabs into the group.
+
+While Claude works in a tab, the page has a pulsing orange border and a "Claude is using this tab" label. Both are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
+
+### Sharing your own tabs
+
+Claude can also work in tabs you're already using, for example a site you're logged in to, but only the ones you share:
+
+- **You share a tab:** right-click it → **Share Tab with Claude** (with several tabs selected, all of them). **Stop Sharing Tab with Claude** in the same menu takes it back.
+- **Claude asks:** `tabs_request_access` opens a small window listing your tabs. You pick which ones to share, or none. Claude doesn't see the list, only the tabs you share.
+
+Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension.
+
+**Handing a tab over.** Working in a shared tab means switching your window to it for each screenshot, and its window can't be resized. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**. Drag a tab out of the group to take it back. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
+
+### Page dialogs
+
+A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it only applies for 15 seconds after Claude's last action there; otherwise dialogs show up for you as usual.
+
+### javascript_tool
+
+Code runs like in the browser console: the value of the last expression comes back. Top-level `await` and `return` also work.
+
+Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and string values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
+
+A script is given 30 seconds (up to 50 with `timeout`). Firefox can't stop a script that's still running after that; the tool reports the timeout, and reloading the tab stops it.
 
 ### Synthetic events
 
@@ -224,7 +259,11 @@ Firefox WebExtensions cannot use the Chrome DevTools Protocol. Mouse clicks, key
 
 ### Screenshots
 
-`tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. If the MCP window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused.
+`tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. If Claude's window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused. In a tab you shared, the switch happens in your window.
+
+### Clicking by ref
+
+Clicks land at viewport coordinates, so an element given by ref (from `read_page` or `find`) is scrolled into view first if it isn't fully visible. If something else covers it, such as a cookie banner, the click goes to whatever is on top, as a real click would, and the result says what that was. `find` marks results that are off-screen.
 
 ### Content security policy
 
@@ -232,7 +271,7 @@ The manifest sets the `extension_pages` CSP to `script-src 'self'`. This drops F
 
 ### Console monitoring
 
-Console messages are captured via a MAIN-world interceptor injected into the page. Messages logged **before** `read_console_messages` is first called on a tab are not captured. Call `read_console_messages` early in a session to start capturing.
+Console messages, uncaught errors and unhandled promise rejections are captured by hooks in the page's own JavaScript world. The hooks go into every page loaded in a tab Claude can use, as soon as the page starts loading, so `read_console_messages` sees what the page logged from early on. A few messages from scripts that run before the hooks are in place can still be missed.
 
 ## Updating After Code Changes
 
@@ -240,7 +279,7 @@ No build step. All files are plain JavaScript. After pulling or editing:
 
 | What changed | What to do |
 |---|---|
-| `extension/background.js`, `content.js`, or `manifest.json` | Reload: `about:debugging` → click the reload icon next to the extension |
+| Anything in `extension/` | Reload: `about:debugging` → click the reload icon next to the extension |
 | `host/mcp-server.js` (Claude Code) | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
 | `host/mcp-server.js` (Claude Desktop) | Rebuild the `.mcpb` (bump `version` in `host/manifest.json`) and install it again |
 
