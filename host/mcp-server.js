@@ -257,6 +257,20 @@ function setupExtensionWebSocket(ws) {
   });
 }
 
+// The legacy native host only ever sends JSON lines (or nothing until the
+// extension speaks). Anything else is refused: a web page can reach this
+// port with fetch(), but only as an HTTP request ("POST / HTTP/1.1"), and
+// must never be taken for the browser.
+function couldBeNativeHost(buffer) {
+  const first = buffer.toString("latin1").trimStart()[0];
+  return first === undefined || first === "{";
+}
+
+function refuseUnknownPeer(socket) {
+  process.stderr.write("Refused a connection that is neither the extension, a Claude session nor the native host\n");
+  socket.destroy();
+}
+
 const tcpServer = net.createServer((socket) => {
   // Without an error listener, a peer that resets the connection (any local
   // program that connects and quits) is an uncaught exception that takes this
@@ -267,14 +281,16 @@ const tcpServer = net.createServer((socket) => {
   // Classification:
   // - "GET " means an HTTP request: the extension's WebSocket handshake.
   // - Client MCP servers send client_hello immediately.
-  // - Anything else, or silence for 500ms, is a legacy native host.
+  // - JSON lines, or silence for 500ms, are a legacy native host.
+  // - Anything else is refused (see couldBeNativeHost).
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
   const classifyTimeout = setTimeout(() => {
     if (!classified) {
       classified = true;
-      setupNativeHostConnection(socket, earlyBuffer);
+      if (couldBeNativeHost(earlyBuffer)) setupNativeHostConnection(socket, earlyBuffer);
+      else refuseUnknownPeer(socket);
     }
   }, 500); // 500ms is plenty for a local client_hello
 
@@ -299,6 +315,14 @@ const tcpServer = net.createServer((socket) => {
       return;
     }
 
+    if (!couldBeNativeHost(earlyBuffer)) {
+      classified = true;
+      clearTimeout(classifyTimeout);
+      socket.removeListener("data", onEarlyData);
+      refuseUnknownPeer(socket);
+      return;
+    }
+
     const newlineIdx = earlyBuffer.indexOf(10);
     if (newlineIdx === -1) return; // No full line yet, keep buffering
 
@@ -314,7 +338,7 @@ const tcpServer = net.createServer((socket) => {
       }
     } catch {}
 
-    // Got data but it's not a client_hello, this is a native host
+    // A JSON line that isn't client_hello: the legacy native host.
     classified = true;
     clearTimeout(classifyTimeout);
     socket.removeListener("data", onEarlyData);
@@ -566,9 +590,12 @@ async function callTool(toolName, args) {
 // comes from this server and the answer from the user, not from the model.
 // Apps without that ask Claude to get the answer in the conversation.
 const HANDOVER_ANSWER_TIMEOUT_MS = 5 * 60 * 1000;
-// Tabs whose handover was sent to the conversation because the app's own
-// prompt failed: a retry with confirmed: true is honored for these.
-const handoverAskedInConversation = new Set();
+// Tabs whose handover was sent to the conversation because the app has no
+// prompt or its prompt failed, with when: a retry with confirmed: true is
+// honored for these, for a while. An answer in the app's own prompt, either
+// way, cancels it, so a "no" there can't be overridden afterwards.
+const HANDOVER_CONVERSATION_WINDOW_MS = 10 * 60 * 1000;
+const handoverAskedInConversation = new Map(); // tabId -> time asked
 
 async function requestHandover({ tabIds, reason, confirmed }) {
   const ids = [...new Set(tabIds)];
@@ -592,13 +619,15 @@ async function requestHandover({ tabIds, reason, confirmed }) {
     });
   } catch {}
 
-  const askedInConversation = ids.every((id) => handoverAskedInConversation.has(id));
+  const askedInConversation = ids.every(
+    (id) => Date.now() - (handoverAskedInConversation.get(id) ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS
+  );
   if (confirmed && askedInConversation) {
     for (const id of ids) handoverAskedInConversation.delete(id);
     return callTool("tabs_handover", { tabIds: ids });
   }
   const askInConversation = (why) => {
-    for (const id of ids) handoverAskedInConversation.add(id);
+    for (const id of ids) handoverAskedInConversation.set(id, Date.now());
     return textResult(
       `${why} Ask the user in the conversation whether to move these tabs out of their window into Claude's own window. If they agree, call tabs_request_handover again with confirmed: true.`
     );
@@ -630,6 +659,7 @@ async function requestHandover({ tabIds, reason, confirmed }) {
   } catch (err) {
     return askInConversation(`The app's confirmation prompt didn't work (${err.message}).`);
   }
+  for (const id of ids) handoverAskedInConversation.delete(id); // answered in the prompt
   if (answer.action !== "accept" || !answer.content?.move) {
     return textResult("The user chose to keep the tabs where they are. They're still shared with you.");
   }
