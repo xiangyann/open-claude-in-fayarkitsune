@@ -40,6 +40,15 @@ function connectToServer() {
 
   ws.onopen = () => {
     reconnectDelay = 1000;
+    // Servers from 2.0.0 on say their version right away; one that hasn't
+    // within a moment is older.
+    server.version = null;
+    server.settled = false;
+    clearTimeout(server.timer);
+    server.timer = setTimeout(() => {
+      server.settled = true;
+      updateBadge();
+    }, 2000);
   };
 
   ws.onmessage = (event) => {
@@ -51,14 +60,43 @@ function connectToServer() {
     }
     if (msg.type === "tool_request" && msg.id) {
       handleToolRequest(msg.id, msg.tool, msg.args || {});
+    } else if (msg.type === "server_hello") {
+      server.version = String(msg.version || "");
+      server.settled = true;
+      clearTimeout(server.timer);
+      updateBadge();
     }
   };
 
   // onerror is always followed by onclose
   ws.onclose = () => {
     if (serverSocket === ws) serverSocket = null;
+    clearTimeout(server.timer);
+    server.settled = false;
+    updateBadge();
     scheduleReconnect();
   };
+}
+
+// --- Matching versions ---
+// Firefox updates the extension by itself (update_url), but a .mcpb
+// installed in Claude Desktop isn't updated, so the two can drift apart.
+// The server says its version when the extension connects; when they
+// differ, the toolbar badge, the setup page and tabs_context_mcp say so.
+// version_name is the full version (e.g. 2.0.0-dev.3), the one the server
+// reports; version is the plain-number form Firefox needs (see
+// scripts/set-version.mjs).
+const EXTENSION_VERSION = chrome.runtime.getManifest().version_name || chrome.runtime.getManifest().version;
+const RELEASES_URL = "https://github.com/xiangyann/open-claude-in-fayarkitsune/releases";
+const server = { version: null, settled: false, timer: null };
+
+// null when the versions match (or nothing is connected yet), otherwise a
+// sentence for the user.
+function versionMismatch() {
+  if (!server.settled || serverSocket?.readyState !== WebSocket.OPEN) return null;
+  if (server.version === EXTENSION_VERSION) return null;
+  const serverText = server.version ? `version ${server.version}` : "older than 2.0.0";
+  return `Claude's MCP server is ${serverText}, and this extension is version ${EXTENSION_VERSION}. Install the matching .mcpb from ${RELEASES_URL} (or update the server you added to Claude Code).`;
 }
 
 // The server only runs while Claude is open, so back off up to 10s between tries.
@@ -627,10 +665,14 @@ const toolHandlers = {
     if (!group && args.createIfEmpty) group = await ensureClaudeGroup();
     const own = group ? await tabsInGroup(group) : [];
     const shared = await sharedTabList();
-    if (!own.length && !shared.length) {
-      return textResult(`No "${GROUP_TITLE}" tab group exists. Use createIfEmpty: true to create one.`);
-    }
-    return formatTabContext(group, own, shared);
+    const result = own.length || shared.length
+      ? formatTabContext(group, own, shared)
+      : textResult(`No "${GROUP_TITLE}" tab group exists. Use createIfEmpty: true to create one.`);
+    // Tools may not match when the server and extension versions differ;
+    // tell the user, who can fix it.
+    const mismatch = versionMismatch();
+    if (mismatch) result.content.push({ type: "text", text: `Note for the user: ${mismatch}` });
+    return result;
   },
 
   async tabs_create_mcp() {
@@ -1706,13 +1748,17 @@ async function openSetupPage() {
   }
 }
 
+// Red "!" while website access is missing; amber "!" while the server's
+// version differs from the extension's.
 async function updateBadge() {
   const hasSiteAccess = await chrome.permissions.contains(SITE_ACCESS);
-  await chrome.action.setBadgeBackgroundColor({ color: "#d70022" });
-  await chrome.action.setBadgeText({ text: hasSiteAccess ? "" : "!" });
-  await chrome.action.setTitle({
-    title: hasSiteAccess ? EXTENSION_NAME : `${EXTENSION_NAME}: needs website access, click to set up`,
-  });
+  const mismatch = versionMismatch();
+  let title = EXTENSION_NAME;
+  if (!hasSiteAccess) title = `${EXTENSION_NAME}: needs website access, click to set up`;
+  else if (mismatch) title = `${EXTENSION_NAME}: Claude's MCP server is a different version, click for details`;
+  await chrome.action.setBadgeBackgroundColor({ color: hasSiteAccess ? "#b25d00" : "#d70022" });
+  await chrome.action.setBadgeText({ text: !hasSiteAccess || mismatch ? "!" : "" });
+  await chrome.action.setTitle({ title });
 }
 
 chrome.action.onClicked.addListener(() => openSetupPage());
@@ -1730,7 +1776,12 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
 // The setup page shows whether Claude's MCP server is connected.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "getConnectionStatus") {
-    sendResponse({ connected: serverSocket?.readyState === WebSocket.OPEN });
+    sendResponse({
+      connected: serverSocket?.readyState === WebSocket.OPEN,
+      extensionVersion: EXTENSION_VERSION,
+      serverVersion: server.settled ? server.version : undefined,
+      mismatch: versionMismatch(),
+    });
   }
 });
 

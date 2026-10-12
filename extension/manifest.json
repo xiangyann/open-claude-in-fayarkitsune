@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Claude MCP in Fayar kitsune",
-  "version": "1.2.0",
+  "version": "2.0.0",
+  "version_name": "2.0.0-dev.1",
   "description": "Claude in Firefox, open source. No domain blocklist.",
   "browser_specific_settings": {
     "gecko": {
       "id": "open-claude-in-fayarkitsune@anthropic",
       "strict_min_version": "142.0",
+      "update_url": "https://raw.githubusercontent.com/xiangyann/open-claude-in-fayarkitsune/main/updates.json",
       "data_collection_permissions": {
         "required": ["none"],
         "optional": []
