@@ -9,8 +9,9 @@
 // after "dev.9"; "dev10" wouldn't.)
 //
 // Firefox wants an add-on's version to be 1 to 4 plain numbers, so the
-// extension gets the X.Y.Z part as its version and shows the full string as
-// version_name (which is also what it compares with the server's version).
+// extension's manifest gets the X.Y.Z part. The full string goes in
+// extension/lib/version.js, which the extension shows and compares with the
+// server's version. (Firefox has no version_name: it warns about the key.)
 // Dev builds are only loaded as temporary add-ons, and Firefox doesn't
 // compare versions for those, so they don't need a lower number than the
 // release.
@@ -25,7 +26,7 @@ if (!match) {
   console.error("usage: node scripts/set-version.mjs X.Y.Z[-dev.N]");
   process.exit(1);
 }
-const [x, y, z, dev] = match.slice(1).map((n) => (n === undefined ? undefined : Number(n)));
+const [x, y, z] = match.slice(1, 4).map(Number);
 const firefoxVersion = () => `${x}.${y}.${z}`;
 
 // Rewrites a JSON file, keeping its line endings.
@@ -46,18 +47,26 @@ updateJson("host/package-lock.json", (l) => {
 updateJson("host/manifest.json", (m) => (m.version = version));
 
 // The extension's manifest is edited as text, to keep its compact layout:
-// "version" is the first key of that name, and version_name goes right after.
+// "version" is the first key of that name.
 {
   const full = path.join(ROOT, "extension/manifest.json");
   let text = fs.readFileSync(full, "utf-8");
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  text = text.replace(/^ *"version_name": "[^"]*",\r?\n/m, "");
-  text = text.replace(/^( *)"version": "[^"]*",\r?\n/m, (line, indent) =>
-    `${indent}"version": "${firefoxVersion()}",${eol}` +
-    (dev === undefined ? "" : `${indent}"version_name": "${version}",${eol}`)
-  );
+  text = text.replace(/^ *"version_name": "[^"]*",\r?\n/m, ""); // 2.0.0-dev.1 had one
+  text = text.replace(/^( *"version": )"[^"]*"/m, `$1"${firefoxVersion()}"`);
   JSON.parse(text); // still valid
   fs.writeFileSync(full, text);
 }
 
-console.log(`server and .mcpb: ${version}\nextension: version ${firefoxVersion()}${dev === undefined ? "" : `, version_name ${version}`}`);
+// The constant's line in extension/lib/version.js.
+{
+  const full = path.join(ROOT, "extension/lib/version.js");
+  const line = /^const EXTENSION_VERSION = "[^"]*";/m;
+  const text = fs.readFileSync(full, "utf-8");
+  if (!line.test(text)) {
+    console.error("extension/lib/version.js has no EXTENSION_VERSION line");
+    process.exit(1);
+  }
+  fs.writeFileSync(full, text.replace(line, `const EXTENSION_VERSION = "${version}";`));
+}
+
+console.log(`server, .mcpb and extension: ${version}\nextension manifest: ${firefoxVersion()}`);

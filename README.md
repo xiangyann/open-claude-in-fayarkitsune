@@ -304,14 +304,14 @@ No build step. All files are plain JavaScript. After pulling or editing:
 
 ### Releasing
 
-Versions are set in one go with `node scripts/set-version.mjs <version>`. It updates the server's `package.json` and lockfile, the `.mcpb` manifest, and the extension manifest.
+Versions are set in one go with `node scripts/set-version.mjs <version>`. It updates the server's `package.json` and lockfile, the `.mcpb` manifest, the extension manifest, and `extension/lib/version.js`.
 
 - **Development builds** are `X.Y.Z-dev.N` (`2.0.0-dev.1`, `2.0.0-dev.2`, …), published as GitHub **pre-releases** (tag `vX.Y.Z-dev.N`). Each carries the unsigned extension zip and the `.mcpb`.
   - A new version each time lets Claude Desktop update the `.mcpb` in place, instead of treating it as already installed.
   - The zip loads as a temporary add-on, or installs on Firefox Developer Edition, Nightly or ESR with signature checks off.
 - **Releases** are `X.Y.Z`: the extension is signed on AMO (unlisted), and the release carries the signed `.xpi` (named `claude-mcp-in-fayar-kitsune-X.Y.Z.xpi`) and the `.mcpb`.
   - Then run `node scripts/add-update.mjs path/to/signed.xpi` and commit the updated `updates.json` to `main`. That's what makes installed copies update.
-- **How Firefox numbers dev builds:** Firefox only allows plain numbers as an add-on's version, so a dev build's extension is version `2.0.0`, with `2.0.0-dev.3` as its `version_name`. The extension compares `version_name` with the server's version. Dev builds only run as temporary add-ons, where Firefox doesn't compare versions.
+- **How Firefox numbers dev builds:** Firefox only allows plain numbers as an add-on's version, so a dev build's manifest says `2.0.0`. The full `2.0.0-dev.3` is in `extension/lib/version.js`, which the extension shows and compares with the server's version. Dev builds only run as temporary add-ons, where Firefox doesn't compare versions.
 - **Linting:** use `npx web-ext lint -s extension --self-hosted`. Without `--self-hosted`, the linter flags `update_url`, which only add-ons listed on addons.mozilla.org can't have.
 - **1.x:** fixes for the 1.x line go to the `release/1.x` branch.
 

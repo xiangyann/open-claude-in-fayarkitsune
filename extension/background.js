@@ -83,10 +83,9 @@ function connectToServer() {
 // installed in Claude Desktop isn't updated, so the two can drift apart.
 // The server says its version when the extension connects; when they
 // differ, the toolbar badge, the setup page and tabs_context_mcp say so.
-// version_name is the full version (e.g. 2.0.0-dev.3), the one the server
-// reports; version is the plain-number form Firefox needs (see
+// EXTENSION_VERSION (lib/version.js) is the full version, e.g. 2.0.0-dev.3;
+// the manifest's version is the plain-number form Firefox needs (see
 // scripts/set-version.mjs).
-const EXTENSION_VERSION = chrome.runtime.getManifest().version_name || chrome.runtime.getManifest().version;
 const RELEASES_URL = "https://github.com/xiangyann/open-claude-in-fayarkitsune/releases";
 const server = { version: null, settled: false, timer: null };
 

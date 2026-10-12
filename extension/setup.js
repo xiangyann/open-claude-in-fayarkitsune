@@ -49,7 +49,7 @@ async function renderConnection() {
 
   const versions = document.getElementById("versions");
   const server = status.serverVersion === undefined ? "" : ` · server ${status.serverVersion || "older than 2.0.0"}`;
-  versions.textContent = `Extension ${status.extensionVersion || chrome.runtime.getManifest().version_name || chrome.runtime.getManifest().version}${status.connected ? server : ""}`;
+  versions.textContent = `Extension ${EXTENSION_VERSION}${status.connected ? server : ""}`;
 
   // Firefox updates the extension by itself, Claude Desktop's .mcpb doesn't.
   const warning = document.getElementById("version-warning");
