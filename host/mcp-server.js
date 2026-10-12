@@ -4,15 +4,16 @@
 // Started by Claude Code via stdio MCP transport.
 //
 // Operates in one of two modes:
-// - PRIMARY: Owns the TCP port, accepts native host + client connections
+// - PRIMARY: Owns the TCP port, accepts the extension + client connections
 // - CLIENT: Port already taken by another session, connects as a client
 //
 // This allows multiple Claude Code sessions to share one browser extension.
 //
-// The primary's port accepts three kinds of connection:
-// - the browser extension over WebSocket (extension >= 1.1.0)
+// The primary's port accepts two kinds of connection:
+// - the browser extension over WebSocket
 // - client MCP servers (newline-delimited JSON, start with client_hello)
-// - the legacy native messaging host (extension 1.0.0)
+// (The original extension 1.0.0's native messaging host isn't accepted
+// anymore; the 1.x releases still take it.)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -26,9 +27,13 @@ import { z } from "zod";
 
 
 const DEFAULT_PORT = 18765;
+// One version for the server, from package.json (bundled in the .mcpb). The
+// extension is told it on connecting, to warn when the two differ.
+const SERVER_VERSION = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8")).version;
 
 function getPort() {
-  const configPath = path.join(os.homedir(), ".config", "open-claude-in-firefox", "config.json");
+  // Before 2.0.0 this was ~/.config/open-claude-in-firefox/config.json.
+  const configPath = path.join(os.homedir(), ".config", "open-claude-in-fayarkitsune", "config.json");
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     return config.port || DEFAULT_PORT;
@@ -95,7 +100,7 @@ function sendToExtension(tool, args) {
 
 // --- Pidfile management ---
 
-const pidfilePath = path.join(os.tmpdir(), `open-claude-in-firefox-mcp-${TCP_PORT}.pid`);
+const pidfilePath = path.join(os.tmpdir(), `open-claude-in-fayarkitsune-mcp-${TCP_PORT}.pid`);
 
 function writePidfile() {
   try { fs.writeFileSync(pidfilePath, String(process.pid)); } catch {}
@@ -167,7 +172,7 @@ function processLine(line) {
   } catch {}
 }
 
-// --- Browser extension connection (WebSocket, or legacy native host socket) ---
+// --- Browser extension connection (WebSocket) ---
 
 function extensionConnected() {
   return extensionConn !== null && extensionConn.isOpen();
@@ -249,6 +254,9 @@ function setupExtensionWebSocket(ws) {
     return;
   }
   process.stderr.write("Browser extension connected\n");
+  // Tell the extension which server it's talking to, so it can warn when the
+  // two versions differ (e.g. Firefox updated the extension, the .mcpb not).
+  conn.send({ type: "server_hello", version: SERVER_VERSION });
   ws.on("message", (data) => processLine(data.toString("utf-8")));
   ws.on("error", () => {});
   ws.on("close", () => {
@@ -257,17 +265,8 @@ function setupExtensionWebSocket(ws) {
   });
 }
 
-// The legacy native host only ever sends JSON lines (or nothing until the
-// extension speaks). Anything else is refused: a web page can reach this
-// port with fetch(), but only as an HTTP request ("POST / HTTP/1.1"), and
-// must never be taken for the browser.
-function couldBeNativeHost(buffer) {
-  const first = buffer.toString("latin1").trimStart()[0];
-  return first === undefined || first === "{";
-}
-
 function refuseUnknownPeer(socket) {
-  process.stderr.write("Refused a connection that is neither the extension, a Claude session nor the native host\n");
+  process.stderr.write("Refused a connection that is neither the extension nor a Claude session\n");
   socket.destroy();
 }
 
@@ -279,18 +278,17 @@ const tcpServer = net.createServer((socket) => {
   socket.on("error", () => {});
 
   // Classification:
-  // - "GET " means an HTTP request: the extension's WebSocket handshake.
+  // - "GET " means an HTTP request: the extension's WebSocket handshake
+  //   (a web page gets no further: see the origin check).
   // - Client MCP servers send client_hello immediately.
-  // - JSON lines, or silence for 500ms, are a legacy native host.
-  // - Anything else is refused (see couldBeNativeHost).
+  // - Anything else, or silence for 500ms, is refused.
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
   const classifyTimeout = setTimeout(() => {
     if (!classified) {
       classified = true;
-      if (couldBeNativeHost(earlyBuffer)) setupNativeHostConnection(socket, earlyBuffer);
-      else refuseUnknownPeer(socket);
+      refuseUnknownPeer(socket);
     }
   }, 500); // 500ms is plenty for a local client_hello
 
@@ -315,7 +313,10 @@ const tcpServer = net.createServer((socket) => {
       return;
     }
 
-    if (!couldBeNativeHost(earlyBuffer)) {
+    // Only a client_hello line can follow; anything not starting like JSON
+    // is refused right away.
+    const first = earlyBuffer.toString("latin1").trimStart()[0];
+    if (first !== undefined && first !== "{") {
       classified = true;
       clearTimeout(classifyTimeout);
       socket.removeListener("data", onEarlyData);
@@ -338,47 +339,12 @@ const tcpServer = net.createServer((socket) => {
       }
     } catch {}
 
-    // A JSON line that isn't client_hello: the legacy native host.
     classified = true;
     clearTimeout(classifyTimeout);
     socket.removeListener("data", onEarlyData);
-    setupNativeHostConnection(socket, earlyBuffer);
+    refuseUnknownPeer(socket);
   });
 });
-
-// Legacy: extension 1.0.0 talks to us through native-host.js over raw TCP.
-function setupNativeHostConnection(socket, initialBuffer) {
-  const conn = {
-    send: (msg) => socket.write(JSON.stringify(msg) + "\n"),
-    close: () => socket.destroy(),
-    isOpen: () => !socket.destroyed,
-  };
-  if (!attachExtension(conn)) {
-    socket.end(JSON.stringify({ type: "error", error: "Another browser profile is already connected." }) + "\n");
-    socket.destroy();
-    return;
-  }
-
-  let buffer = initialBuffer;
-
-  // Process any data already in the buffer
-  let idx;
-  while ((idx = buffer.indexOf(10)) !== -1) {
-    processLine(buffer.subarray(0, idx).toString("utf-8").trim());
-    buffer = buffer.subarray(idx + 1);
-  }
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf(10)) !== -1) {
-      processLine(buffer.subarray(0, newlineIdx).toString("utf-8").trim());
-      buffer = buffer.subarray(newlineIdx + 1);
-    }
-  });
-
-  socket.on("close", () => detachExtension(conn));
-}
 
 function setupClientConnection(socket, initialBuffer) {
   const clientId = String(++clientIdCounter);
@@ -528,7 +494,8 @@ function listenAsPrimary() {
 }
 
 async function start() {
-  // Clean up stale pidfiles (but don't kill live servers)
+  // Clean up stale pidfiles (but don't kill live servers), including the
+  // name servers before 2.0.0 used.
   const pidfiles = [
     pidfilePath,
     path.join(os.tmpdir(), `open-claude-in-firefox-mcp-${TCP_PORT}.pid`),
@@ -670,7 +637,7 @@ async function requestHandover({ tabIds, reason, confirmed }) {
 
 const server = new McpServer({
   name: "open-claude-in-fayarkitsune",
-  version: "1.2.0",
+  version: SERVER_VERSION,
 });
 
 // Pre-validation arg coercion
