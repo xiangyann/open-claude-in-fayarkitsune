@@ -42,52 +42,65 @@ Execute these steps in order:
 21. Call `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"document.querySelectorAll('a').length"`.
 22. Call `read_console_messages` on TAB_1 with pattern `".*"`.
 23. Call `read_network_requests` on TAB_1.
+24. Call `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"const n = await Promise.resolve(document.title.length); n"` (top-level await should return a number).
+25. Call `handle_dialog` on TAB_1 with `accept: true`, then `javascript_tool` on TAB_1 with action `"javascript_exec"` and text `"confirm('integration test')"`. Expected: `true`, with a note that the page opened a confirm dialog.
 
 ## Second Tab
-24. Call `navigate` to go to `https://news.ycombinator.com` in TAB_2.
-25. Call `computer` with action `screenshot` on TAB_2.
+26. Call `navigate` to go to `https://news.ycombinator.com` in TAB_2.
+27. Call `computer` with action `screenshot` on TAB_2.
 
 ## Drag
-26. Call `computer` with action `left_click_drag` on TAB_1 with start_coordinate `[100, 300]` and coordinate `[400, 300]`.
+28. Call `computer` with action `left_click_drag` on TAB_1 with start_coordinate `[100, 300]` and coordinate `[400, 300]`.
 
 ## Zoom
-27. Call `computer` with action `zoom` on TAB_1 with region `[0, 0, 640, 400]`.
+29. Call `computer` with action `zoom` on TAB_1 with region `[0, 0, 640, 400]`.
 
 ## Stub Tools (call them — they should return gracefully)
-28. Call `gif_creator` with action `"start_recording"` on TAB_1.
-29. Call `shortcuts_list` on TAB_1.
-30. Call `shortcuts_execute` on TAB_1 with command `"test"`.
-31. Call `switch_browser`.
+30. Call `gif_creator` with action `"start_recording"` on TAB_1.
+31. Call `shortcuts_list` on TAB_1.
+32. Call `shortcuts_execute` on TAB_1 with command `"test"`.
+33. Call `switch_browser`.
 
 ## Plan + Upload
-32. Call `update_plan` with domains `["reddit.com", "news.ycombinator.com"]` and approach `["Testing browser automation", "Validating all tools", "Checking parity with Claude in Chrome"]`.
-33. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9. (Expected: "not supported" response — this is correct behaviour on Firefox.)
+34. Call `update_plan` with domains `["reddit.com", "news.ycombinator.com"]` and approach `["Testing browser automation", "Validating all tools", "Checking parity with Claude in Chrome"]`.
+35. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9. (Expected: "not supported" response — this is correct behaviour on Firefox.)
+
+## Shared tabs + closing
+36. Call `tabs_request_access` with reason `"Integration test: share any tab, or choose Don't share"`. The user answers in Firefox; any answer counts.
+37. If a tab was shared, call `tabs_request_handover` on it (the user answers in the app's prompt, or you ask them in the conversation if the result says so). Otherwise call `tabs_request_handover` on TAB_2 (expected: an error that it isn't shared).
+38. Call `tabs_release` once: on a tab that's still shared if there is one, otherwise on TAB_2 (expected: a message that it's one of Claude's own tabs).
+39. Call `tabs_close_mcp` on TAB_2.
 
 ## Validation
 
-Now produce a final report. List every one of the 18 tools below and whether you successfully called it during this test. Use this exact format:
+Now produce a final report. List every one of the 23 tools below and whether you successfully called it during this test. Use this exact format:
 
 ```
 INTEGRATION TEST RESULTS
 ========================
-1.  tabs_context_mcp        : [PASS/FAIL] — step(s) used
+1.  tabs_context_mcp         : [PASS/FAIL] — step(s) used
 2.  tabs_create_mcp          : [PASS/FAIL] — step(s) used
-3.  navigate                 : [PASS/FAIL] — step(s) used
-4.  computer                 : [PASS/FAIL] — step(s) used (list actions exercised)
-5.  find                     : [PASS/FAIL] — step(s) used
-6.  form_input               : [PASS/FAIL] — step(s) used
-7.  get_page_text            : [PASS/FAIL] — step(s) used
-8.  gif_creator              : [PASS/FAIL] — step(s) used
-9.  javascript_tool          : [PASS/FAIL] — step(s) used
-10. read_console_messages    : [PASS/FAIL] — step(s) used
-11. read_network_requests    : [PASS/FAIL] — step(s) used
-12. read_page                : [PASS/FAIL] — step(s) used
-13. resize_window            : [PASS/FAIL] — step(s) used
-14. shortcuts_list           : [PASS/FAIL] — step(s) used
-15. shortcuts_execute        : [PASS/FAIL] — step(s) used
-16. switch_browser           : [PASS/FAIL] — step(s) used
-17. update_plan              : [PASS/FAIL] — step(s) used
-18. upload_image             : [PASS/FAIL] — step(s) used
+3.  tabs_close_mcp           : [PASS/FAIL] — step(s) used
+4.  tabs_request_access      : [PASS/FAIL] — step(s) used
+5.  tabs_request_handover    : [PASS/FAIL] — step(s) used
+6.  tabs_release             : [PASS/FAIL] — step(s) used
+7.  handle_dialog            : [PASS/FAIL] — step(s) used
+8.  navigate                 : [PASS/FAIL] — step(s) used
+9.  computer                 : [PASS/FAIL] — step(s) used (list actions exercised)
+10. find                     : [PASS/FAIL] — step(s) used
+11. form_input               : [PASS/FAIL] — step(s) used
+12. get_page_text            : [PASS/FAIL] — step(s) used
+13. gif_creator              : [PASS/FAIL] — step(s) used
+14. javascript_tool          : [PASS/FAIL] — step(s) used
+15. read_console_messages    : [PASS/FAIL] — step(s) used
+16. read_network_requests    : [PASS/FAIL] — step(s) used
+17. read_page                : [PASS/FAIL] — step(s) used
+18. resize_window            : [PASS/FAIL] — step(s) used
+19. shortcuts_list           : [PASS/FAIL] — step(s) used
+20. shortcuts_execute        : [PASS/FAIL] — step(s) used
+21. switch_browser           : [PASS/FAIL] — step(s) used
+22. update_plan              : [PASS/FAIL] — step(s) used
+23. upload_image             : [PASS/FAIL] — step(s) used
 
 Computer actions exercised:
 - screenshot: [PASS/FAIL]
@@ -104,7 +117,7 @@ Computer actions exercised:
 - left_click_drag: [PASS/FAIL]
 - zoom: [PASS/FAIL]
 
-OVERALL: [PASS if all 18 tools called / FAIL if any missed]
+OVERALL: [PASS if all 23 tools called / FAIL if any missed]
 ```
 
 Mark a tool as PASS only if you actually called it and received a response (even if the response was "not implemented" for stub tools). Mark it as FAIL if you skipped it or encountered an error that prevented the call.

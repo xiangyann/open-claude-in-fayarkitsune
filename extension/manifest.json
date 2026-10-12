@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude MCP in Fayar kitsune",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Claude in Firefox, open source. No domain blocklist.",
   "browser_specific_settings": {
     "gecko": {
@@ -15,11 +15,13 @@
   },
   "permissions": [
     "tabs",
+    "tabGroups",
     "activeTab",
     "scripting",
     "storage",
     "alarms",
-    "webRequest"
+    "webRequest",
+    "menus"
   ],
   "optional_permissions": [
     "userScripts"
@@ -28,7 +30,7 @@
     "<all_urls>"
   ],
   "background": {
-    "scripts": ["background.js"]
+    "scripts": ["lib/keys.js", "lib/redact.js", "lib/js-source.js", "lib/page-hooks.js", "background.js"]
   },
   "action": {
     "default_title": "Claude MCP in Fayar kitsune",
@@ -44,7 +46,7 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": false
     }
   ],

@@ -257,20 +257,48 @@ function setupExtensionWebSocket(ws) {
   });
 }
 
+// The legacy native host only ever sends JSON lines (or nothing until the
+// extension speaks). Anything else is refused: a web page can reach this
+// port with fetch(), but only as an HTTP request ("POST / HTTP/1.1"), and
+// must never be taken for the browser.
+function couldBeNativeHost(buffer) {
+  const first = buffer.toString("latin1").trimStart()[0];
+  return first === undefined || first === "{";
+}
+
+function refuseUnknownPeer(socket) {
+  process.stderr.write("Refused a connection that is neither the extension, a Claude session nor the native host\n");
+  socket.destroy();
+}
+
 const tcpServer = net.createServer((socket) => {
+  // Without an error listener, a peer that resets the connection (any local
+  // program that connects and quits) is an uncaught exception that takes this
+  // server down, and every Claude session using it loses the browser. This
+  // one covers the socket for its whole life, whatever it turns out to be.
+  socket.on("error", () => {});
+
   // Classification:
   // - "GET " means an HTTP request: the extension's WebSocket handshake.
   // - Client MCP servers send client_hello immediately.
-  // - Anything else, or silence for 500ms, is a legacy native host.
+  // - JSON lines, or silence for 500ms, are a legacy native host.
+  // - Anything else is refused (see couldBeNativeHost).
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
   const classifyTimeout = setTimeout(() => {
     if (!classified) {
       classified = true;
-      setupNativeHostConnection(socket, earlyBuffer);
+      if (couldBeNativeHost(earlyBuffer)) setupNativeHostConnection(socket, earlyBuffer);
+      else refuseUnknownPeer(socket);
     }
   }, 500); // 500ms is plenty for a local client_hello
+
+  // Gone before it said anything: there's nothing to set up.
+  socket.on("close", () => {
+    classified = true;
+    clearTimeout(classifyTimeout);
+  });
 
   socket.on("data", function onEarlyData(chunk) {
     if (classified) return; // Already classified, data handler was replaced
@@ -284,6 +312,14 @@ const tcpServer = net.createServer((socket) => {
       socket.unshift(earlyBuffer);
       httpServer.emit("connection", socket);
       socket.resume();
+      return;
+    }
+
+    if (!couldBeNativeHost(earlyBuffer)) {
+      classified = true;
+      clearTimeout(classifyTimeout);
+      socket.removeListener("data", onEarlyData);
+      refuseUnknownPeer(socket);
       return;
     }
 
@@ -302,7 +338,7 @@ const tcpServer = net.createServer((socket) => {
       }
     } catch {}
 
-    // Got data but it's not a client_hello, this is a native host
+    // A JSON line that isn't client_hello: the legacy native host.
     classified = true;
     clearTimeout(classifyTimeout);
     socket.removeListener("data", onEarlyData);
@@ -341,7 +377,6 @@ function setupNativeHostConnection(socket, initialBuffer) {
     }
   });
 
-  socket.on("error", () => {});
   socket.on("close", () => detachExtension(conn));
 }
 
@@ -389,7 +424,6 @@ function setupClientConnection(socket, initialBuffer) {
     processClientData();
   });
 
-  socket.on("error", () => {});
   socket.on("close", () => {
     clientSockets.delete(clientId);
     // Clean up any pending client requests
@@ -454,8 +488,17 @@ function startClientMode() {
         reject(new Error("Primary MCP server disconnected"));
       }
       pendingRequests.clear();
-      // Try to reconnect after a delay (primary might restart)
-      setTimeout(connect, 2000);
+      // Nobody else will open the port if the primary is gone for good, so
+      // try to take it over; if another session got there first (or the
+      // primary is back), connect to that one. The random delay keeps
+      // several waiting sessions from all trying at the same moment.
+      setTimeout(async () => {
+        if ((await listenAsPrimary()) === "listening") {
+          process.stderr.write("The primary MCP server went away; this session took over.\n");
+        } else {
+          connect();
+        }
+      }, 1000 + Math.random() * 1000);
     });
   }
 
@@ -463,6 +506,26 @@ function startClientMode() {
 }
 
 // --- Startup: try primary, fall back to client ---
+
+// Tries to own the port. Resolves "listening", "in-use", or the error.
+function listenAsPrimary() {
+  return new Promise((resolve) => {
+    const onError = (err) => {
+      tcpServer.removeListener("listening", onListening);
+      resolve(err.code === "EADDRINUSE" ? "in-use" : err);
+    };
+    const onListening = () => {
+      tcpServer.removeListener("error", onError);
+      mode = "primary";
+      writePidfile();
+      process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
+      resolve("listening");
+    };
+    tcpServer.once("error", onError);
+    tcpServer.once("listening", onListening);
+    tcpServer.listen(TCP_PORT, "127.0.0.1");
+  });
+}
 
 async function start() {
   // Clean up stale pidfiles (but don't kill live servers)
@@ -485,26 +548,14 @@ async function start() {
     } catch {}
   }
 
-  // Try to bind the port
-  return new Promise((resolve) => {
-    tcpServer.once("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        // Port taken by another live session. Run as client.
-        startClientMode();
-        resolve();
-      } else {
-        process.stderr.write(`TCP server error: ${err.message}\n`);
-        process.exit(1);
-      }
-    });
-
-    tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
-      mode = "primary";
-      writePidfile();
-      process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
-      resolve();
-    });
-  });
+  const outcome = await listenAsPrimary();
+  if (outcome === "in-use") {
+    // Port taken by another live session. Run as client.
+    startClientMode();
+  } else if (outcome !== "listening") {
+    process.stderr.write(`TCP server error: ${outcome.message}\n`);
+    process.exit(1);
+  }
 }
 
 await start();
@@ -534,11 +585,92 @@ async function callTool(toolName, args) {
   }
 }
 
-// --- MCP Server with all 18 tools ---
+// Moving shared tabs into Claude's window takes the user's yes. Claude Code
+// and Claude Desktop can ask it themselves (MCP elicitation): the question
+// comes from this server and the answer from the user, not from the model.
+// Apps without that ask Claude to get the answer in the conversation.
+const HANDOVER_ANSWER_TIMEOUT_MS = 5 * 60 * 1000;
+// Tabs whose handover was sent to the conversation because the app has no
+// prompt or its prompt failed, with when: a retry with confirmed: true is
+// honored for these, for a while. An answer in the app's own prompt, either
+// way, cancels it, so a "no" there can't be overridden afterwards.
+const HANDOVER_CONVERSATION_WINDOW_MS = 10 * 60 * 1000;
+const handoverAskedInConversation = new Map(); // tabId -> time asked
+
+async function requestHandover({ tabIds, reason, confirmed }) {
+  const ids = [...new Set(tabIds)];
+
+  // Check the tabs are shared before asking anything, and name them in the
+  // question. (If the extension can't answer, tabs_handover reports it.)
+  let described = ids.map((id) => `tab ${id}`);
+  try {
+    const context = await sendToExtension("tabs_context_mcp", {});
+    const { availableTabs = [] } = JSON.parse(context.content[0].text.split("\n")[0]);
+    const shared = availableTabs.filter((t) => t.sharedByUser);
+    const notShared = ids.filter((id) => !shared.some((t) => t.tabId === id));
+    if (notShared.length) {
+      return textResult(
+        `Only tabs the user shared with you can be handed over; not shared: ${notShared.join(", ")}. Use tabs_context_mcp to see them.`
+      );
+    }
+    described = ids.map((id) => {
+      const tab = shared.find((t) => t.tabId === id);
+      return `"${tab.title}" (${tab.url})`;
+    });
+  } catch {}
+
+  const askedInConversation = ids.every(
+    (id) => Date.now() - (handoverAskedInConversation.get(id) ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS
+  );
+  if (confirmed && askedInConversation) {
+    for (const id of ids) handoverAskedInConversation.delete(id);
+    return callTool("tabs_handover", { tabIds: ids });
+  }
+  const askInConversation = (why) => {
+    for (const id of ids) handoverAskedInConversation.set(id, Date.now());
+    return textResult(
+      `${why} Ask the user in the conversation whether to move these tabs out of their window into Claude's own window. If they agree, call tabs_request_handover again with confirmed: true.`
+    );
+  };
+
+  if (!server.server.getClientCapabilities()?.elicitation) {
+    return askInConversation("This app can't show a confirmation prompt.");
+  }
+
+  let answer;
+  try {
+    answer = await server.server.elicitInput(
+      {
+        message:
+          `Claude wants to move ${ids.length === 1 ? "a tab" : `${ids.length} tabs`} you shared out of your window, into Claude's own window and its "Claude" tab group:\n` +
+          described.map((d) => `• ${d}`).join("\n") +
+          (reason ? `\n\nClaude says: ${reason}` : "") +
+          "\n\nYou can take a tab back by dragging it out of the group.",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            move: { type: "boolean", title: "Move them to Claude's window", default: true },
+          },
+          required: ["move"],
+        },
+      },
+      { timeout: HANDOVER_ANSWER_TIMEOUT_MS }
+    );
+  } catch (err) {
+    return askInConversation(`The app's confirmation prompt didn't work (${err.message}).`);
+  }
+  for (const id of ids) handoverAskedInConversation.delete(id); // answered in the prompt
+  if (answer.action !== "accept" || !answer.content?.move) {
+    return textResult("The user chose to keep the tabs where they are. They're still shared with you.");
+  }
+  return callTool("tabs_handover", { tabIds: ids });
+}
+
+// --- MCP Server and its tools ---
 
 const server = new McpServer({
   name: "open-claude-in-fayarkitsune",
-  version: "1.1.1",
+  version: "1.2.0",
 });
 
 // Pre-validation arg coercion
@@ -566,7 +698,7 @@ const server = new McpServer({
 // 1. tabs_context_mcp
 server.tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+  "Get context information about the current MCP tab group (the Firefox tab group named \"Claude\"). Returns all tab IDs inside the group if it exists, plus any of the user's own tabs they shared with you. The group survives Claude restarts, so tabs from an earlier conversation may still be there. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
   { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
   async (args) => callTool("tabs_context_mcp", args)
 );
@@ -579,13 +711,63 @@ server.tool(
   async (args) => callTool("tabs_create_mcp", args)
 );
 
+server.tool(
+  "tabs_close_mcp",
+  "Close a tab in the MCP tab group, or a tab the user shared with you. To stop using a shared tab but leave it open, use tabs_release instead.",
+  {
+    tabId: z.number().describe("ID of the tab to close. Must be a tab in the MCP tab group, or one the user shared."),
+  },
+  async (args) => callTool("tabs_close_mcp", args)
+);
+
+server.tool(
+  "tabs_request_access",
+  "Ask the user to share some of their own open tabs with you, e.g. a page they're logged in to. Firefox shows them a list of their tabs and they choose which to share; you only learn about the tabs they share. Waits up to 50 seconds for an answer. Shared tabs then work with every tool like tabs in the MCP tab group, and appear in tabs_context_mcp. The user can also share a tab themselves (right-click it → Share Tab with Claude).",
+  {
+    reason: z.string().optional().describe("One short sentence, shown to the user, on what you need the tab for."),
+    query: z.string().optional().describe("Text that the wanted tab's title or URL contains (e.g. 'mail.google.com'). Matching tabs are listed first; the user still chooses."),
+  },
+  async (args) => callTool("tabs_request_access", args)
+);
+
+server.tool(
+  "tabs_request_handover",
+  "Ask the user to hand tabs they shared with you over to Claude: they move out of the user's window into the MCP tab group, in Claude's own window. Use it when you need a shared tab to yourself, e.g. to resize its window, or to work in it for a while without switching the tab the user is looking at (screenshots have to show the tab). The user is asked to confirm in this app's own prompt; if the app can't show one, the result tells you to ask them in the conversation and call again with confirmed: true.",
+  {
+    tabIds: z.array(z.number()).min(1).describe("IDs of tabs the user shared with you."),
+    reason: z.string().optional().describe("One short sentence, shown to the user, on why you need them in Claude's window."),
+    confirmed: z.boolean().optional().describe("Only when this tool told you to ask in the conversation: true once the user agreed there."),
+  },
+  async (args) => requestHandover(args)
+);
+
+server.tool(
+  "tabs_release",
+  "Stop using a tab the user shared with you. It stays open; it's theirs again.",
+  {
+    tabId: z.number().describe("ID of a tab the user shared with you."),
+  },
+  async (args) => callTool("tabs_release", args)
+);
+
+server.tool(
+  "handle_dialog",
+  "Choose how the next JavaScript confirm() or prompt() on a page is answered. Dialogs never block your tools: alerts are acknowledged, and confirm/prompt are cancelled unless you choose otherwise here. Each one is reported in the result of the tool call during which it opened. Applies to the page currently loaded in the tab.",
+  {
+    tabId: z.number().describe("Tab ID of the page. Must be a tab in the current group, or one the user shared with you."),
+    accept: z.boolean().describe("true to answer OK, false to answer Cancel."),
+    promptText: z.string().optional().describe("For prompt(): the text to answer with when accept is true. Defaults to the prompt's default value."),
+  },
+  async (args) => callTool("handle_dialog", args)
+);
+
 // 3. navigate
 server.tool(
   "navigate",
   'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
-    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("navigate", args)
 );
@@ -600,7 +782,7 @@ server.tool(
       "type", "screenshot", "wait", "scroll", "key",
       "left_click_drag", "zoom", "scroll_to", "hover"
     ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
-    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
@@ -621,7 +803,7 @@ server.tool(
   'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
     query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
-    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("find", args)
 );
@@ -633,7 +815,7 @@ server.tool(
   {
     ref: z.string().describe('Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")'),
     value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
-    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("form_input", args)
 );
@@ -643,7 +825,7 @@ server.tool(
   "get_page_text",
   "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("get_page_text", args)
 );
@@ -672,11 +854,12 @@ server.tool(
 // 9. javascript_tool
 server.tool(
   "javascript_tool",
-  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression (or of `return`) or any thrown errors. Top-level `await` works. Cookie strings, tokens and values stored under names like password, token, secret or session are hidden from the result. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
-    text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."),
-    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically (e.g., 'window.myData.value'); 'return' and top-level 'await' also work. You can access and modify the DOM, call page functions, and interact with page variables."),
+    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    timeout: z.number().optional().describe("Seconds to wait for the result (default 30, max 50). A script still running after that is reported as timed out."),
   },
   async (args) => callTool("javascript_tool", args)
 );
@@ -684,9 +867,9 @@ server.tool(
 // 10. read_console_messages
 server.tool(
   "read_console_messages",
-  "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
+  "Read browser console messages (console.log, console.error, console.warn, etc.), uncaught errors and unhandled promise rejections from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current page only, recorded since you started using the tab. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
   {
-    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
     limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
     onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
@@ -698,9 +881,9 @@ server.tool(
 // 11. read_network_requests
 server.tool(
   "read_network_requests",
-  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. In a tab the user shared, only requests made after they shared it are recorded. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
     limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
     clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
@@ -713,7 +896,7 @@ server.tool(
   "read_page",
   "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)'),
     depth: z.number().optional().describe("Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."),
     ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
@@ -729,7 +912,7 @@ server.tool(
   {
     width: z.number().describe("Target window width in pixels"),
     height: z.number().describe("Target window height in pixels"),
-    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group (a tab the user shared is in their window, which keeps its size: see tabs_request_handover). Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("resize_window", args)
 );

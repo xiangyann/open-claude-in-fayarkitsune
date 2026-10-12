@@ -1,10 +1,12 @@
 // Content script for Claude MCP in Fayar kitsune extension.
-// Injected into every page. Provides:
+// Injected into every page at document_start. Provides:
 // - Accessibility tree generation (read_page)
 // - Element ref mapping with WeakRef (persistent across calls)
 // - Form input handling
 // - Page text extraction
 // - Element finding by text/attributes
+// - Synthetic mouse, keyboard and scroll input
+// - The glow shown while Claude works in the tab
 
 (function () {
   if (window.__openClaudeInFirefoxLoaded) return;
@@ -109,9 +111,12 @@
       if (names.length) return names.join(" ");
     }
 
-    if (el.placeholder) return el.placeholder.trim();
-    if (el.title) return el.title.trim();
-    if (el.alt) return el.alt.trim();
+    // Attributes, not properties: on a <form>, el.title or el.placeholder is
+    // the form control *named* "title" or "placeholder", if there is one.
+    for (const attr of ["placeholder", "title", "alt"]) {
+      const value = el.getAttribute(attr)?.trim();
+      if (value) return value;
+    }
 
     // Associated <label>
     if (el.id) {
@@ -209,12 +214,18 @@
         // Extra info for specific elements
         if (tag === "a" && el.href) line += ` href="${el.href}"`;
         if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
-        if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
+        if (["input", "textarea"].includes(tag) && el.value) {
+          // A password (often filled in by Firefox) isn't shown, only that
+          // there is one; nor are card numbers and one-time codes.
+          const secret = el.type === "password" ||
+            /^(cc-number|cc-csc|one-time-code|current-password|new-password)$/.test(el.getAttribute("autocomplete") || "");
+          line += secret ? ` value="[hidden]"` : ` value="${el.value.substring(0, 100)}"`;
+        }
         if (tag === "input") line += ` type="${el.type || "text"}"`;
         if (el.getAttribute("aria-expanded")) line += ` expanded=${el.getAttribute("aria-expanded")}`;
         if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
         if (el.getAttribute("aria-selected")) line += ` selected=${el.getAttribute("aria-selected")}`;
-        if (el.disabled) line += " disabled";
+        if (el.disabled === true) line += " disabled";
 
         // Select options
         if (tag === "select") {
@@ -290,6 +301,7 @@
     function collectAll(root) {
       const elements = [];
       for (const el of root.querySelectorAll("*")) {
+        if (el === glowHost) continue; // the extension's own overlay
         elements.push(el);
         if (el.shadowRoot) {
           elements.push(...collectAll(el.shadowRoot));
@@ -310,21 +322,21 @@
       const role = getRole(el) || "";
       const name = getAccessibleName(el) || "";
       const text = el.textContent?.trim()?.substring(0, 200) || "";
-      const placeholder = el.placeholder || "";
-      const ariaLabel = el.getAttribute("aria-label") || "";
-      const title = el.title || "";
-      const type = el.type || "";
+      // Attributes, not properties (see getAccessibleName).
+      const attrs = ["placeholder", "aria-label", "title", "type"].map((a) => el.getAttribute(a) || "");
 
-      const searchable = `${role} ${name} ${text} ${placeholder} ${ariaLabel} ${title} ${type} ${tag}`.toLowerCase();
+      const searchable = `${role} ${name} ${text} ${attrs.join(" ")} ${tag}`.toLowerCase();
 
       if (searchable.includes(q)) {
         const ref = getOrAssignRef(el);
         const rect = el.getBoundingClientRect();
+        const center = [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)];
         results.push({
           ref,
           role: role || tag,
           name: name || text.substring(0, 80),
-          coordinates: [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)],
+          coordinates: center,
+          offscreen: !inViewport(...center),
         });
       }
     }
@@ -404,20 +416,204 @@
     return { success: true, value: target.value };
   }
 
-  // --- Get element coordinates for ref ---
-  function getRefCoordinates(refId) {
+  // --- Where to click an element given by ref ---
+
+  // The element at a viewport point, looking inside open shadow roots (the
+  // document only reports the shadow host). null outside the viewport.
+  function elementAtPoint(x, y) {
+    let hit = null;
+    for (let scope = document; scope; ) {
+      const found = scope.elementFromPoint(x, y);
+      if (!found || found === hit) break;
+      hit = found;
+      scope = found.shadowRoot;
+    }
+    return hit;
+  }
+
+  function inViewport(x, y) {
+    return 0 <= x && x < window.innerWidth && 0 <= y && y < window.innerHeight;
+  }
+
+  // Whether `node` is `el` or inside it, crossing shadow DOM boundaries.
+  function isWithin(node, el) {
+    for (let n = node; n; n = n.parentNode || n.host) {
+      if (n === el) return true;
+    }
+    return false;
+  }
+
+  function describeElement(el) {
+    if (!el) return "nothing";
+    const selector = el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "") +
+      [...el.classList].slice(0, 2).map((c) => `.${c}`).join("");
+    const name = getAccessibleName(el);
+    return name ? `<${selector}> "${name.slice(0, 60)}"` : `<${selector}>`;
+  }
+
+  // A viewport point that hits the element: { x, y, scrolled, coveredBy? },
+  // or { error }. Coordinates only reach what's on screen, so an element
+  // outside the viewport is scrolled into view first, and the point is
+  // re-measured afterwards. If something else is on top at every point tried,
+  // the center is returned with what covers it: that's what a real click
+  // there would hit.
+  function locateRef(refId) {
     const el = resolveRef(refId);
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    return {
-      x: Math.round(rect.x + rect.width / 2),
-      y: Math.round(rect.y + rect.height / 2),
+    if (!el || !el.isConnected) return { error: `Element ${refId} is no longer on the page. Use read_page or find again.` };
+
+    let rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return { error: `Element ${refId} has no size (it's hidden or empty).` };
+
+    // Fully visible already? Then leave the page where it is.
+    let scrolled = false;
+    if (!(inViewport(rect.left, rect.top) && inViewport(rect.right - 1, rect.bottom - 1))) {
+      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      rect = el.getBoundingClientRect();
+      scrolled = true;
+    }
+
+    // Points spread over the part of the element inside the viewport, and
+    // the first that hits it (null if none does).
+    const tryPoints = () => {
+      const left = Math.max(rect.left, 0);
+      const right = Math.min(rect.right, window.innerWidth);
+      const top = Math.max(rect.top, 0);
+      const bottom = Math.min(rect.bottom, window.innerHeight);
+      if (right - left < 1 || bottom - top < 1) return { points: [], hit: null };
+      const at = (fx, fy) => ({ x: Math.round(left + (right - left) * fx), y: Math.round(top + (bottom - top) * fy) });
+      const points = [at(0.5, 0.5), at(0.25, 0.5), at(0.75, 0.5), at(0.5, 0.25), at(0.5, 0.75)];
+      return { points, hit: points.find((p) => isWithin(elementAtPoint(p.x, p.y), el)) || null };
     };
+
+    let { points, hit } = tryPoints();
+    // Inside the viewport but hidden by a scrolling container (a long list,
+    // a modal): scrollIntoView scrolls those too.
+    if (!hit && !scrolled) {
+      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      rect = el.getBoundingClientRect();
+      scrolled = true;
+      ({ points, hit } = tryPoints());
+    }
+    if (hit) return { ...hit, scrolled };
+    if (!points.length) {
+      return { error: `Element ${refId} can't be brought into view (it may be inside a hidden or clipped container).` };
+    }
+    const center = points[0];
+    return { ...center, scrolled, coveredBy: describeElement(elementAtPoint(center.x, center.y)) };
   }
 
   // --- Helper for synthetic events ---
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // --- Links that open a new tab ---
+  // Firefox's popup blocker silently drops a new tab opened by a synthetic
+  // click, so a target=_blank link (or a ctrl/cmd/shift-click on any link)
+  // would do nothing. While a click is dispatched, this notices such a link
+  // being followed. If the page didn't handle the click itself, it cancels
+  // the browser's own attempt and reports the URL, for the background to
+  // open in a tab of its own.
+  function watchForNewTabLink() {
+    let url = null;
+    const onClick = (event) => {
+      if (event.defaultPrevented || url) return;
+      const link = event.composedPath().find(
+        (node) => (node instanceof HTMLAnchorElement || node instanceof HTMLAreaElement) && node.href
+      );
+      if (!link || link.hasAttribute("download") || !/^(https?|file):/i.test(link.href)) return;
+      const target = (link.getAttribute("target") || "").trim().toLowerCase();
+      const sameTab = ["", "_self", "_top", "_parent"].includes(target);
+      if (sameTab && !event.ctrlKey && !event.metaKey && !event.shiftKey) return;
+      event.preventDefault();
+      url = link.href;
+    };
+    // Added last, so the page's own click handlers on window have run.
+    window.addEventListener("click", onClick);
+    return {
+      stop() {
+        window.removeEventListener("click", onClick);
+        return url;
+      },
+    };
+  }
+
+  // --- Keyboard ---
+
+  // What a real mousedown focuses: the nearest focusable element at or above
+  // the one clicked (crossing shadow DOM), or nothing, which takes the focus
+  // away from where it was.
+  const FOCUSABLE = 'a[href], area[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable]:not([contenteditable="false"])';
+  function focusForClick(el) {
+    for (let node = el; node; node = node.parentElement || node.getRootNode().host) {
+      if (node.matches?.(FOCUSABLE) && !node.disabled) {
+        node.focus({ preventScroll: true });
+        return;
+      }
+    }
+    const current = focusedElement();
+    if (current && current !== document.body) current.blur?.();
+  }
+
+  // The focused element, looking inside open shadow roots.
+  function focusedElement() {
+    let el = document.activeElement || document.body;
+    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+    return el || document.documentElement;
+  }
+
+  // Returns false if a handler canceled the event.
+  function dispatchKey(el, type, { key, code, keyCode, charCode }, modifiers = 0) {
+    const legacy = type === "keypress" ? { charCode, keyCode: charCode, which: charCode } : { keyCode, which: keyCode };
+    return el.dispatchEvent(new KeyboardEvent(type, {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      key, code: code || "", repeat: false, ...legacy,
+      ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1),
+      shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
+    }));
+  }
+
+  // Fields the browser cleans up as you go (a number field turns "-" or
+  // "1." into "", since they aren't numbers yet) would lose characters when
+  // typed one at a time. What was typed is kept here, so the next character
+  // continues from it rather than from the cleaned-up value, while the page
+  // hasn't changed the field in between.
+  const typedAhead = new WeakMap(); // field -> { text, shown }
+  let lastTypedField = null; // gets one change event when typing ends
+
+  // Inserts text at the caret of a text field or editable element. Returns
+  // whether there was somewhere to put it.
+  function insertText(el, text) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "input" || tag === "textarea") {
+      const ahead = typedAhead.get(el);
+      const current = ahead && el.value === ahead.shown ? ahead.text : el.value;
+      // selectionStart is null on types like email and number: append.
+      const caretKnown = current === el.value && el.selectionStart !== null;
+      const start = caretKnown ? el.selectionStart : current.length;
+      const end = caretKnown ? el.selectionEnd : current.length;
+      const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      const newVal = current.slice(0, start) + text + current.slice(end);
+      if (setter) setter.call(el, newVal); else el.value = newVal;
+      if (el.value === newVal) {
+        typedAhead.delete(el);
+        try {
+          el.selectionStart = el.selectionEnd = start + text.length;
+        } catch {
+          // Those types throw on setting it; the value is right regardless.
+        }
+      } else {
+        typedAhead.set(el, { text: newVal, shown: el.value });
+      }
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text }));
+      lastTypedField = el;
+      return true;
+    }
+    if (el.isContentEditable) {
+      return document.execCommand("insertText", false, text);
+    }
+    return false;
   }
 
   // Whether a user-scrollable element can still move by (dx, dy).
@@ -468,8 +664,83 @@
     }
   }
 
+  // --- Glow while Claude is working in this tab ---
+  // A pulsing border and a small label. It ignores the mouse (and
+  // elementFromPoint), lives in a closed shadow root so page styles can't
+  // reach it, and removes itself a few seconds after the last refresh, so it
+  // can't get stuck if the extension or Claude goes away mid-task.
+
+  const GLOW_LINGER_MS = 4000;
+  let glowHost = null;
+  let glowTimer = null;
+
+  function buildGlow() {
+    const host = document.createElement("claude-mcp-glow");
+    host.style.cssText =
+      "all: initial !important; position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; pointer-events: none !important; display: block !important;";
+    const root = host.attachShadow({ mode: "closed" });
+    root.innerHTML = `
+      <style>
+        :host { --glow: 217, 119, 87; }
+        .frame {
+          position: fixed; inset: 0; pointer-events: none;
+          box-shadow: inset 0 0 0 2px rgba(var(--glow), 0.9), inset 0 0 28px 4px rgba(var(--glow), 0.45);
+          animation: breathe 2.4s ease-in-out infinite;
+        }
+        .label {
+          position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+          pointer-events: none; white-space: nowrap;
+          font: 600 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+          color: #fff; background: rgba(var(--glow), 0.92);
+          padding: 6px 11px; border-radius: 99px;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+        }
+        @keyframes breathe { 50% { box-shadow: inset 0 0 0 2px rgba(var(--glow), 0.55), inset 0 0 14px 2px rgba(var(--glow), 0.25); } }
+        @media (prefers-reduced-motion: reduce) { .frame { animation: none; } }
+      </style>
+      <div class="frame"></div>
+      <div class="label">Claude is using this tab</div>`;
+    return host;
+  }
+
+  function showGlow() {
+    if (!glowHost) glowHost = buildGlow();
+    if (!glowHost.isConnected) document.documentElement.appendChild(glowHost);
+    glowHost.style.setProperty("visibility", "visible", "important");
+    clearTimeout(glowTimer);
+    glowTimer = setTimeout(removeGlow, GLOW_LINGER_MS);
+  }
+
+  function removeGlow() {
+    clearTimeout(glowTimer);
+    glowHost?.remove();
+  }
+
+  // Hidden (not removed) while a screenshot is taken; resolves once the page
+  // has painted without it.
+  function hideGlowForCapture() {
+    if (!glowHost?.isConnected) return Promise.resolve();
+    glowHost.style.setProperty("visibility", "hidden", "important");
+    return new Promise((resolve) => {
+      const done = () => resolve();
+      requestAnimationFrame(() => requestAnimationFrame(done));
+      setTimeout(done, 150); // rAF doesn't run in background tabs
+    });
+  }
+
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === "glow") {
+      if (msg.mode === "show") showGlow();
+      else if (msg.mode === "remove") removeGlow();
+      else if (msg.mode === "hide") {
+        hideGlowForCapture().then(() => sendResponse({}));
+        return true;
+      }
+      sendResponse({});
+      return true;
+    }
+
     if (msg.type === "generateAccessibilityTree") {
       const result = generateAccessibilityTree(msg.options || {});
       sendResponse({ result });
@@ -494,9 +765,8 @@
       return true;
     }
 
-    if (msg.type === "getRefCoordinates") {
-      const result = getRefCoordinates(msg.ref);
-      sendResponse({ result });
+    if (msg.type === "locateRef") {
+      sendResponse({ result: locateRef(msg.ref) });
       return true;
     }
 
@@ -504,28 +774,45 @@
 
     if (msg.type === "dispatchMouseClick") {
       const { x, y, button, clickCount, modifiers } = msg;
-      const el = document.elementFromPoint(x, y) || document.body;
+      const el = elementAtPoint(x, y);
+      if (!el) {
+        // Off-screen coordinates hit nothing; don't pretend the page got a click.
+        sendResponse({
+          error: `(${x}, ${y}) is outside the visible area of the page (${window.innerWidth}x${window.innerHeight}). Scroll first, or click by ref.`,
+        });
+        return true;
+      }
       const buttonMap = { left: 0, middle: 1, right: 2 };
       const btn = buttonMap[button ?? "left"] ?? 0;
       const btns = btn === 0 ? 1 : btn === 1 ? 4 : 2;
       const shared = {
-        bubbles: true, cancelable: true, view: window,
+        // composed: real clicks cross shadow DOM boundaries, and el may be
+        // inside a shadow root.
+        bubbles: true, cancelable: true, composed: true, view: window,
         clientX: x, clientY: y, button: btn,
         ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1),
         shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
       };
       el.dispatchEvent(new MouseEvent("mousemove", { ...shared, buttons: 0, detail: 0 }));
-      el.dispatchEvent(new MouseEvent("mousedown", { ...shared, buttons: btns, detail: 1 }));
-      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      const pressed = el.dispatchEvent(new MouseEvent("mousedown", { ...shared, buttons: btns, detail: 1 }));
+      // A page that cancels mousedown (an editor's toolbar button) keeps the
+      // focus where it was, as with a real click.
+      if (pressed) focusForClick(el);
       el.dispatchEvent(new MouseEvent("mouseup", { ...shared, buttons: 0, detail: 1 }));
       if (button === "right") {
         el.dispatchEvent(new MouseEvent("contextmenu", { ...shared, buttons: 0, detail: 0 }));
       } else if (button !== "middle") {
+        const newTab = watchForNewTabLink();
         for (let i = 0; i < (clickCount || 1); i++) {
           el.dispatchEvent(new MouseEvent("click", { ...shared, buttons: 0, detail: i + 1 }));
         }
         if ((clickCount || 1) >= 2) {
           el.dispatchEvent(new MouseEvent("dblclick", { ...shared, buttons: 0, detail: 2 }));
+        }
+        const url = newTab.stop();
+        if (url) {
+          sendResponse({ openInNewTab: url });
+          return true;
         }
       }
       sendResponse({});
@@ -546,36 +833,48 @@
 
     if (msg.type === "dispatchKeyEvent") {
       const keyType = msg.eventType === "keyDown" ? "keydown" : "keyup";
-      const el = document.activeElement || document.body;
-      el.dispatchEvent(new KeyboardEvent(keyType, {
-        bubbles: true, cancelable: true, view: window,
-        key: msg.key, code: msg.code, repeat: false,
-        ctrlKey: !!(msg.modifiers & 2), altKey: !!(msg.modifiers & 1),
-        shiftKey: !!(msg.modifiers & 8), metaKey: !!(msg.modifiers & 4),
-      }));
+      const notCanceled = dispatchKey(focusedElement(), keyType, msg, msg.modifiers);
+      // keypress follows keydown for Enter and keys that type a character
+      // (not with ctrl, alt or meta held), as in a browser.
+      const typing = msg.key === "Enter" || (msg.key?.length === 1 && !(msg.modifiers & 7));
+      if (keyType === "keydown" && notCanceled && typing) {
+        const charCode = msg.key === "Enter" ? 13 : msg.key.charCodeAt(0);
+        dispatchKey(focusedElement(), "keypress", { ...msg, charCode }, msg.modifiers);
+      }
       sendResponse({});
       return true;
     }
 
-    if (msg.type === "insertText") {
-      const el = document.activeElement;
-      if (el) {
-        const tag = el.tagName.toLowerCase();
-        if (tag === "input" || tag === "textarea") {
-          const start = el.selectionStart ?? el.value.length;
-          const end = el.selectionEnd ?? el.value.length;
-          const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-          const newVal = el.value.slice(0, start) + msg.text + el.value.slice(end);
-          if (setter) setter.call(el, newVal); else el.value = newVal;
-          el.selectionStart = el.selectionEnd = start + msg.text.length;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        } else if (el.isContentEditable) {
-          document.execCommand("insertText", false, msg.text);
+    // The end of a `type` action: the field gets one change event, as when
+    // the user is done editing it.
+    if (msg.type === "endTyping") {
+      if (lastTypedField?.isConnected) lastTypedField.dispatchEvent(new Event("change", { bubbles: true }));
+      lastTypedField = null;
+      sendResponse({});
+      return true;
+    }
+
+    // One character of the `type` action. Pages see the key going down and
+    // up around the text, like real typing; if a keydown or keypress handler
+    // cancels the event, the character isn't inserted, as in a browser.
+    if (msg.type === "typeChar") {
+      const { text, key } = msg;
+      let insert = true;
+      if (key) {
+        const modifiers = key.shift ? 8 : 0;
+        insert = dispatchKey(focusedElement(), "keydown", key, modifiers);
+        // keypress is deprecated but still fired for keys that produce text
+        // (Enter included), and older sites listen for it.
+        if (insert && (key.key.length === 1 || key.key === "Enter")) {
+          const charCode = key.key === "Enter" ? 13 : key.key.charCodeAt(0);
+          insert = dispatchKey(focusedElement(), "keypress", { ...key, charCode }, modifiers);
         }
       }
-      sendResponse({});
+      // inserted: the text went into a field, or the page took the key
+      // itself (an editor that cancels keydown and inserts on its own).
+      const inserted = insert ? insertText(focusedElement(), text) : true;
+      if (key) dispatchKey(focusedElement(), "keyup", key, key.shift ? 8 : 0);
+      sendResponse({ inserted });
       return true;
     }
 
@@ -669,8 +968,13 @@
     getPageText,
     findElements,
     setFormValue,
-    getRefCoordinates,
+    locateRef,
     resolveRef,
     elementMap,
   };
+
+  // This script runs at document_start: tell the background a new page has
+  // started, so it can hook console and dialogs early if Claude controls
+  // this tab.
+  chrome.runtime.sendMessage({ type: "pageStarted" }).catch(() => {});
 })();
