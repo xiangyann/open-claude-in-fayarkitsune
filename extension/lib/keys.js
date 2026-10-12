@@ -89,7 +89,14 @@ function parseKeyCombo(combo) {
   let modifiers = 0;
   let lastModifier = null;
   let main = null;
-  for (const raw of combo.split("+")) {
+  // "+" is both the separator and a key: "+" alone or a trailing "++"
+  // ("ctrl++") means the + key.
+  let text = combo;
+  if (text === "+" || text.endsWith("++")) {
+    main = "+";
+    text = text.slice(0, -2);
+  }
+  for (const raw of text.split("+")) {
     const part = raw.trim();
     if (!part) continue;
     const modifier = MODIFIERS[part.toLowerCase()];
@@ -115,7 +122,8 @@ function parseKeyCombo(combo) {
     // shift+a means "A", shift+1 "!" and shift+/ "?", as on a real keyboard.
     const ch = modifiers & SHIFT_BIT ? shiftedChar(main) : main;
     const info = keyForChar(ch);
-    if (info) return { key: info.key, code: info.code, keyCode: info.keyCode, modifiers };
+    // A character typed with shift ("+", "!", "A") reports shift as held.
+    if (info) return { key: info.key, code: info.code, keyCode: info.keyCode, modifiers: info.shift ? modifiers | SHIFT_BIT : modifiers };
     return { key: ch, code: "", keyCode: 0, modifiers };
   }
 

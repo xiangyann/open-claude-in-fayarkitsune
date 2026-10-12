@@ -104,7 +104,6 @@ function textResult(text) {
 const GROUP_TITLE = "Claude";
 const GROUP_COLOR = "orange";
 const GROUP_STORAGE_KEY = "claudeGroupId";
-const LEGACY_WINDOW_STORAGE_KEY = "mcpWindowId"; // 1.1.x: a window of its own, no group
 const SHARED_STORAGE_KEY = "sharedTabIds";
 
 let claudeGroupId = null;
@@ -298,21 +297,21 @@ function formatTabContext(group, own, shared) {
 }
 
 // Tabs opened from Claude's tabs (links with target=_blank, window.open)
-// join Claude's group. Tabs opened from a shared tab while Claude is working
-// in it are shared too.
+// join Claude's group. A popup window's tab may not be movable into the
+// group's window (Firefox only moves tabs between normal windows); it's
+// still Claude's, so it's shared with Claude instead. (From a shared tab,
+// only links Claude itself clicks open as shared tabs: see
+// openLinkInNewTab. Tabs the user or the page opens there stay theirs.)
 chrome.tabs.onCreated.addListener(async (tab) => {
   if (tab.openerTabId === undefined) return;
   await stateReady;
   const { kind } = await tabControl(tab.openerTabId);
-  if (kind === "own" && tab.groupId !== claudeGroupId) {
-    try {
-      // A popup window's tab is elsewhere; a tab joins a group only in the
-      // group's own window.
-      const group = await findClaudeGroup();
-      if (tab.windowId !== group.windowId) await chrome.tabs.move(tab.id, { windowId: group.windowId, index: -1 });
-      await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
-    } catch {}
-  } else if (kind === "shared" && Date.now() - (lastWorkAt.get(tab.openerTabId) || 0) < 5000) {
+  if (kind !== "own" || tab.groupId === claudeGroupId) return;
+  try {
+    const group = await findClaudeGroup();
+    if (tab.windowId !== group.windowId) await chrome.tabs.move(tab.id, { windowId: group.windowId, index: -1 });
+    await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+  } catch {
     sharedTabs.add(tab.id);
     saveSharedTabs();
   }
@@ -416,8 +415,17 @@ function setGlow(tabId, mode) {
   chrome.tabs.sendMessage(tabId, { type: "glow", mode }).catch(() => {});
 }
 
+// While a tool is working in a shared tab, its dialogs are answered for the
+// longest a tool call can take; when it's done, for SHARED_DIALOG_WINDOW_MS
+// more. (Not "always" during the call: if the extension stopped mid-call,
+// the page would keep answering dialogs for good.)
+const TOOL_CALL_MAX_MS = 70000;
+const workingTabs = new Map(); // tabId -> tool calls working in it
+
 function dialogDeadline(tabId, kind) {
-  return kind === "own" ? ALWAYS : (lastWorkAt.get(tabId) || 0) + SHARED_DIALOG_WINDOW_MS;
+  if (kind === "own") return ALWAYS;
+  if (workingTabs.get(tabId)) return Date.now() + TOOL_CALL_MAX_MS;
+  return (lastWorkAt.get(tabId) || 0) + SHARED_DIALOG_WINDOW_MS;
 }
 
 // Installs or updates the hooks in the tab's page and returns what they
@@ -445,10 +453,11 @@ async function callPageHooks(tabId, settings, frameId = 0) {
 // A tab Claude no longer controls (released, or dragged out of Claude's
 // group) gets its dialogs back right away: the page stops answering them,
 // and an answer chosen with handle_dialog is dropped. The glow goes too.
+// Callers only release tabs Claude could use until now (hooked or
+// controlled), so the user's other tabs aren't touched. Not just hookedTabs:
+// that's in memory, and a page keeps its hooks across an extension reload.
 function releasePage(tabId) {
-  // Only pages Claude worked in have hooks or a glow (the glow shows only
-  // while the hooks are in), so the user's other tabs aren't touched.
-  if (!hookedTabs.delete(tabId)) return;
+  hookedTabs.delete(tabId);
   setGlow(tabId, "remove");
   callPageHooks(tabId, { answerUntil: 0, nextAnswer: null });
 }
@@ -462,9 +471,13 @@ function releasePage(tabId) {
 // attached (already in the group), so moves are checked too.
 async function reconsiderTab(tabId) {
   await stateReady;
+  const couldUse = isControlledNow(tabId) || hookedTabs.has(tabId);
   const { kind } = await tabControl(tabId);
-  if (!kind) forgetTab(tabId);
-  else if (hookedTabs.has(tabId)) callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+  if (!kind) {
+    if (couldUse) forgetTab(tabId);
+  } else if (couldUse) {
+    callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+  }
 }
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if ("groupId" in info) reconsiderTab(tabId);
@@ -488,14 +501,24 @@ function describeDialogs(dialogs, dropped = 0) {
 // of any dialogs the page opened.
 async function startPageWork(tabId, kind) {
   lastWorkAt.set(tabId, Date.now());
+  workingTabs.set(tabId, (workingTabs.get(tabId) || 0) + 1);
   const before = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
   setGlow(tabId, "show");
-  const keepGlowing = setInterval(() => setGlow(tabId, "show"), 2000);
+  const keepGlowing = setInterval(() => {
+    if (isControlledNow(tabId)) setGlow(tabId, "show");
+  }, 2000);
   return async function finish(result) {
     clearInterval(keepGlowing);
+    const left = workingTabs.get(tabId) - 1;
+    if (left > 0) workingTabs.set(tabId, left);
+    else workingTabs.delete(tabId);
     lastWorkAt.set(tabId, Date.now());
+    // The user may have taken the tab back while the tool ran: then it stays
+    // released, and its dialogs aren't Claude's to report.
+    const now = await tabControl(tabId);
+    if (!now.kind) return result;
     setGlow(tabId, "show"); // it fades out a few seconds after the last refresh
-    const after = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+    const after = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, now.kind) });
     const note = describeDialogs(
       [...(before?.dialogs || []), ...(after?.dialogs || [])],
       (before?.dropped || 0) + (after?.dropped || 0)
@@ -669,16 +692,24 @@ const toolHandlers = {
     return textResult(`Released tab ${args.tabId}: it's the user's again, and you can't use it anymore.`);
   },
 
-  async navigate(args) {
+  async navigate(args, control) {
     const { url, tabId } = args;
 
     let targetUrl = null;
     if (url !== "back" && url !== "forward") {
       targetUrl = url;
+      // Extension pages (this one's share and setup pages, or another
+      // add-on's) are off limits: scripting one could act with the
+      // extension's own powers, e.g. approve a share request.
+      if (/^moz-extension:/i.test(targetUrl)) {
+        return textResult("Claude can't open extension pages (moz-extension: URLs).");
+      }
+      if (/^javascript:/i.test(targetUrl) && /^moz-extension:/i.test(control?.tab?.url || "")) {
+        return textResult("This tab shows an extension page; navigate it to a web page first.");
+      }
       if (
         !targetUrl.match(/^https?:\/\//i) &&
         !targetUrl.startsWith("about:") &&
-        !targetUrl.startsWith("moz-extension:") &&
         !targetUrl.startsWith("javascript:")
       ) {
         targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
@@ -809,11 +840,28 @@ const toolHandlers = {
       case "type": {
         if (!args.text)
           return textResult("text is required for type action");
+        let inserted = 0;
+        let typed = 0;
         for (const char of args.text) {
-          await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) });
+          // The user can take the tab back mid-way; stop typing into it then.
+          if (!isControlledNow(tabId)) {
+            return textResult(`Stopped after ${typed} characters: the user took this tab back.`);
+          }
+          const resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) });
+          typed++;
+          if (resp?.inserted) inserted++;
           await sleep(10);
         }
-        return textResult(`Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`);
+        // Fields announce a finished edit with one change event, as when the
+        // user moves on.
+        await sendContentMessage(tabId, { type: "endTyping" });
+        const shown = `"${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
+        if (inserted === 0) {
+          return textResult(
+            `Sent the keys for ${shown}, but no text field had focus, so no text was inserted. Click the field first.`
+          );
+        }
+        return textResult(`Typed ${shown}`);
       }
 
       case "key": {
@@ -823,6 +871,7 @@ const toolHandlers = {
         const keys = args.text.split(" ").filter(Boolean);
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
+            if (!isControlledNow(tabId)) return textResult("Stopped: the user took this tab back.");
             const { key, code, keyCode, modifiers: keyMod } = parseKeyCombo(keyStr);
             await sendContentMessage(tabId, {
               type: "dispatchKeyEvent", eventType: "keyDown",
@@ -1171,6 +1220,12 @@ async function handleToolRequest(id, tool, args) {
         sendResponse(id, textResult(
           `Tab ${args.tabId} isn't in Claude's tab group and the user hasn't shared it. Use tabs_context_mcp to see the tabs you can use, or tabs_request_access to ask the user to share one of theirs.`
         ));
+        return;
+      }
+      // A tab can still show an extension page (dragged into the group, or
+      // opened by the user): only navigating away is allowed there.
+      if (PAGE_TOOLS.has(tool) && tool !== "navigate" && /^moz-extension:/i.test(control.tab.url || "")) {
+        sendResponse(id, textResult(`Tab ${args.tabId} shows an extension page, which Claude can't use. Navigate it to a web page first.`));
         return;
       }
       if (PAGE_TOOLS.has(tool)) finish = await startPageWork(args.tabId, control.kind);
@@ -1685,18 +1740,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // tabOrigins ([tabId, { windowId, index }] pairs) and lastUserWindowId
 // (number). Bump it when that changes. Data in any other format is
 // discarded rather than migrated: all of it rebuilds itself (the group is
-// found by name, a tab without a home goes to the last-used window). The
-// one exception is 1.1.x's mcpWindowId, from before there was a version,
-// which restoreState turns into the group. storage.session needs no
-// version: Firefox clears it whenever the extension is updated.
+// found by name, a tab without a home goes to the last-used window). That
+// includes 1.1.x's mcpWindowId: its window isn't adopted, because after a
+// Firefox restart the id can belong to one of the user's windows.
+// storage.session needs no version: Firefox clears it whenever the
+// extension is updated.
 const STORAGE_VERSION = 1;
 const STORAGE_VERSION_KEY = "storageVersion";
 
 async function checkStorageVersion() {
   const stored = await chrome.storage.local.get(null);
   if (stored[STORAGE_VERSION_KEY] === STORAGE_VERSION) return;
-  const keep = stored[STORAGE_VERSION_KEY] === undefined ? [LEGACY_WINDOW_STORAGE_KEY] : [];
-  const discard = Object.keys(stored).filter((key) => !keep.includes(key));
+  const discard = Object.keys(stored);
   if (discard.length) await chrome.storage.local.remove(discard);
   await chrome.storage.local.set({ [STORAGE_VERSION_KEY]: STORAGE_VERSION });
 }
@@ -1719,21 +1774,8 @@ async function restoreState() {
     if (typeof stored[LAST_WINDOW_STORAGE_KEY] === "number") lastUserWindowId ??= stored[LAST_WINDOW_STORAGE_KEY];
   } catch {}
   try {
-    const stored = await chrome.storage.local.get([GROUP_STORAGE_KEY, LEGACY_WINDOW_STORAGE_KEY]);
+    const stored = await chrome.storage.local.get(GROUP_STORAGE_KEY);
     if (typeof stored[GROUP_STORAGE_KEY] === "number") claudeGroupId = stored[GROUP_STORAGE_KEY];
-    const legacyWindowId = stored[LEGACY_WINDOW_STORAGE_KEY];
-    if (legacyWindowId !== undefined) {
-      // Upgrading from 1.1.x: group the tabs of the old MCP window.
-      await chrome.storage.local.remove(LEGACY_WINDOW_STORAGE_KEY);
-      if (!(await findClaudeGroup())) {
-        const tabs = (await chrome.tabs.query({ windowId: legacyWindowId })).filter((t) => !t.pinned);
-        if (tabs.length) {
-          const groupId = await chrome.tabs.group({ tabIds: tabs.map((t) => t.id), createProperties: { windowId: legacyWindowId } });
-          await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
-          await rememberGroup(groupId);
-        }
-      }
-    }
   } catch {}
   try {
     // Check the remembered group is still Claude's, and learn its tabs.

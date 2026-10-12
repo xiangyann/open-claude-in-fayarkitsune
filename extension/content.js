@@ -214,7 +214,13 @@
         // Extra info for specific elements
         if (tag === "a" && el.href) line += ` href="${el.href}"`;
         if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
-        if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
+        if (["input", "textarea"].includes(tag) && el.value) {
+          // A password (often filled in by Firefox) isn't shown, only that
+          // there is one; nor are card numbers and one-time codes.
+          const secret = el.type === "password" ||
+            /^(cc-number|cc-csc|one-time-code|current-password|new-password)$/.test(el.getAttribute("autocomplete") || "");
+          line += secret ? ` value="[hidden]"` : ` value="${el.value.substring(0, 100)}"`;
+        }
         if (tag === "input") line += ` type="${el.type || "text"}"`;
         if (el.getAttribute("aria-expanded")) line += ` expanded=${el.getAttribute("aria-expanded")}`;
         if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
@@ -295,6 +301,7 @@
     function collectAll(root) {
       const elements = [];
       for (const el of root.querySelectorAll("*")) {
+        if (el === glowHost) continue; // the extension's own overlay
         elements.push(el);
         if (el.shadowRoot) {
           elements.push(...collectAll(el.shadowRoot));
@@ -465,21 +472,33 @@
       scrolled = true;
     }
 
-    // The part of the element that's inside the viewport.
-    const left = Math.max(rect.left, 0);
-    const right = Math.min(rect.right, window.innerWidth);
-    const top = Math.max(rect.top, 0);
-    const bottom = Math.min(rect.bottom, window.innerHeight);
-    if (right - left < 1 || bottom - top < 1) {
+    // Points spread over the part of the element inside the viewport, and
+    // the first that hits it (null if none does).
+    const tryPoints = () => {
+      const left = Math.max(rect.left, 0);
+      const right = Math.min(rect.right, window.innerWidth);
+      const top = Math.max(rect.top, 0);
+      const bottom = Math.min(rect.bottom, window.innerHeight);
+      if (right - left < 1 || bottom - top < 1) return { points: [], hit: null };
+      const at = (fx, fy) => ({ x: Math.round(left + (right - left) * fx), y: Math.round(top + (bottom - top) * fy) });
+      const points = [at(0.5, 0.5), at(0.25, 0.5), at(0.75, 0.5), at(0.5, 0.25), at(0.5, 0.75)];
+      return { points, hit: points.find((p) => isWithin(elementAtPoint(p.x, p.y), el)) || null };
+    };
+
+    let { points, hit } = tryPoints();
+    // Inside the viewport but hidden by a scrolling container (a long list,
+    // a modal): scrollIntoView scrolls those too.
+    if (!hit && !scrolled) {
+      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      rect = el.getBoundingClientRect();
+      scrolled = true;
+      ({ points, hit } = tryPoints());
+    }
+    if (hit) return { ...hit, scrolled };
+    if (!points.length) {
       return { error: `Element ${refId} can't be brought into view (it may be inside a hidden or clipped container).` };
     }
-
-    const at = (fx, fy) => ({ x: Math.round(left + (right - left) * fx), y: Math.round(top + (bottom - top) * fy) });
-    const candidates = [at(0.5, 0.5), at(0.25, 0.5), at(0.75, 0.5), at(0.5, 0.25), at(0.5, 0.75)];
-    for (const p of candidates) {
-      if (isWithin(elementAtPoint(p.x, p.y), el)) return { ...p, scrolled };
-    }
-    const center = candidates[0];
+    const center = points[0];
     return { ...center, scrolled, coveredBy: describeElement(elementAtPoint(center.x, center.y)) };
   }
 
@@ -521,6 +540,21 @@
 
   // --- Keyboard ---
 
+  // What a real mousedown focuses: the nearest focusable element at or above
+  // the one clicked (crossing shadow DOM), or nothing, which takes the focus
+  // away from where it was.
+  const FOCUSABLE = 'a[href], area[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable]:not([contenteditable="false"])';
+  function focusForClick(el) {
+    for (let node = el; node; node = node.parentElement || node.getRootNode().host) {
+      if (node.matches?.(FOCUSABLE) && !node.disabled) {
+        node.focus({ preventScroll: true });
+        return;
+      }
+    }
+    const current = focusedElement();
+    if (current && current !== document.body) current.blur?.();
+  }
+
   // The focused element, looking inside open shadow roots.
   function focusedElement() {
     let el = document.activeElement || document.body;
@@ -539,27 +573,47 @@
     }));
   }
 
-  // Inserts text at the caret of a text field or editable element.
+  // Fields the browser cleans up as you go (a number field turns "-" or
+  // "1." into "", since they aren't numbers yet) would lose characters when
+  // typed one at a time. What was typed is kept here, so the next character
+  // continues from it rather than from the cleaned-up value, while the page
+  // hasn't changed the field in between.
+  const typedAhead = new WeakMap(); // field -> { text, shown }
+  let lastTypedField = null; // gets one change event when typing ends
+
+  // Inserts text at the caret of a text field or editable element. Returns
+  // whether there was somewhere to put it.
   function insertText(el, text) {
     const tag = el.tagName.toLowerCase();
     if (tag === "input" || tag === "textarea") {
-      // selectionStart is null on types like email and number.
-      const start = el.selectionStart ?? el.value.length;
-      const end = el.selectionEnd ?? el.value.length;
+      const ahead = typedAhead.get(el);
+      const current = ahead && el.value === ahead.shown ? ahead.text : el.value;
+      // selectionStart is null on types like email and number: append.
+      const caretKnown = current === el.value && el.selectionStart !== null;
+      const start = caretKnown ? el.selectionStart : current.length;
+      const end = caretKnown ? el.selectionEnd : current.length;
       const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      const newVal = el.value.slice(0, start) + text + el.value.slice(end);
+      const newVal = current.slice(0, start) + text + current.slice(end);
       if (setter) setter.call(el, newVal); else el.value = newVal;
-      try {
-        el.selectionStart = el.selectionEnd = start + text.length;
-      } catch {
-        // Those types throw on setting it; the value is right regardless.
+      if (el.value === newVal) {
+        typedAhead.delete(el);
+        try {
+          el.selectionStart = el.selectionEnd = start + text.length;
+        } catch {
+          // Those types throw on setting it; the value is right regardless.
+        }
+      } else {
+        typedAhead.set(el, { text: newVal, shown: el.value });
       }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } else if (el.isContentEditable) {
-      document.execCommand("insertText", false, text);
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text }));
+      lastTypedField = el;
+      return true;
     }
+    if (el.isContentEditable) {
+      return document.execCommand("insertText", false, text);
+    }
+    return false;
   }
 
   // Whether a user-scrollable element can still move by (dx, dy).
@@ -740,8 +794,10 @@
         shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
       };
       el.dispatchEvent(new MouseEvent("mousemove", { ...shared, buttons: 0, detail: 0 }));
-      el.dispatchEvent(new MouseEvent("mousedown", { ...shared, buttons: btns, detail: 1 }));
-      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      const pressed = el.dispatchEvent(new MouseEvent("mousedown", { ...shared, buttons: btns, detail: 1 }));
+      // A page that cancels mousedown (an editor's toolbar button) keeps the
+      // focus where it was, as with a real click.
+      if (pressed) focusForClick(el);
       el.dispatchEvent(new MouseEvent("mouseup", { ...shared, buttons: 0, detail: 1 }));
       if (button === "right") {
         el.dispatchEvent(new MouseEvent("contextmenu", { ...shared, buttons: 0, detail: 0 }));
@@ -777,7 +833,23 @@
 
     if (msg.type === "dispatchKeyEvent") {
       const keyType = msg.eventType === "keyDown" ? "keydown" : "keyup";
-      dispatchKey(focusedElement(), keyType, msg, msg.modifiers);
+      const notCanceled = dispatchKey(focusedElement(), keyType, msg, msg.modifiers);
+      // keypress follows keydown for Enter and keys that type a character
+      // (not with ctrl, alt or meta held), as in a browser.
+      const typing = msg.key === "Enter" || (msg.key?.length === 1 && !(msg.modifiers & 7));
+      if (keyType === "keydown" && notCanceled && typing) {
+        const charCode = msg.key === "Enter" ? 13 : msg.key.charCodeAt(0);
+        dispatchKey(focusedElement(), "keypress", { ...msg, charCode }, msg.modifiers);
+      }
+      sendResponse({});
+      return true;
+    }
+
+    // The end of a `type` action: the field gets one change event, as when
+    // the user is done editing it.
+    if (msg.type === "endTyping") {
+      if (lastTypedField?.isConnected) lastTypedField.dispatchEvent(new Event("change", { bubbles: true }));
+      lastTypedField = null;
       sendResponse({});
       return true;
     }
@@ -798,9 +870,11 @@
           insert = dispatchKey(focusedElement(), "keypress", { ...key, charCode }, modifiers);
         }
       }
-      if (insert) insertText(focusedElement(), text);
+      // inserted: the text went into a field, or the page took the key
+      // itself (an editor that cancels keydown and inserts on its own).
+      const inserted = insert ? insertText(focusedElement(), text) : true;
       if (key) dispatchKey(focusedElement(), "keyup", key, key.shift ? 8 : 0);
-      sendResponse({});
+      sendResponse({ inserted });
       return true;
     }
 

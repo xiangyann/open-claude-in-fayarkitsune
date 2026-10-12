@@ -64,7 +64,7 @@ No native messaging host, registry keys or install script: the extension finds t
 
 ### Security
 
-- **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header.
+- **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header. Plain HTTP requests, the only other thing a page can send to the port, are refused.
 - **Other Firefox add-ons can.** Every add-on has a `moz-extension://` origin, and the server doesn't check which add-on is connecting. If another add-on in the same Firefox profile connects first, it takes the server's single browser slot. It would then see the tool requests Claude sends (URLs, text to type, JavaScript to run) and could send fake results back to Claude. It can't use that connection to control the browser. Use a Firefox profile with only add-ons you trust.
 - **Programs on your computer can.** Anything running as your user can connect to `127.0.0.1:18765` and send tool requests, the same way a second Claude session does. Such a program already has your user's access to the machine, so this adds little, but it's worth knowing.
 - **Your other tabs are off limits.** Tools only work in Claude's tab group and in tabs you shared. Sharing is something only you can do, from the tab menu or the window `tabs_request_access` opens; neither Claude nor a web page can click "Share" for you. Moving a shared tab into Claude's window also takes your yes (or your drag), though a program connecting to the server directly, as described above, could move a tab you shared.
@@ -223,7 +223,7 @@ The Claude in Chrome tools, plus a few for tabs you share and page dialogs:
 
 Claude works in a tab group named **Claude** (orange), which it opens in a window of its own so it doesn't take over the tab you're looking at. The group keeps Claude's tabs together when Claude restarts or a conversation loses track of them: `tabs_context_mcp` lists them again. Tabs that Claude's pages open join the group. Firefox's popup blocker ignores a link that opens a new tab (`target="_blank"`, or a ctrl-click) when Claude clicks it, since Claude's clicks are synthetic, so the extension opens such links itself, in a background tab next to the one Claude clicked in.
 
-After a Firefox restart, the group comes back with a new ID, so the extension finds it again by its name and color. That's also the rule for which tabs are Claude's: a tab you drag into an orange group named "Claude" becomes Claude's, and one you drag out of it isn't anymore. Rename or recolor the group and it's yours, tabs included, until it's an orange "Claude" again. Upgrading from 1.1.x turns the old MCP window's tabs into the group.
+After a Firefox restart, the group comes back with a new ID, so the extension finds it again by its name and color. That's also the rule for which tabs are Claude's: a tab you drag into an orange group named "Claude" becomes Claude's, and one you drag out of it isn't anymore. Rename or recolor the group and it's yours, tabs included, until it's an orange "Claude" again. The 1.1.x MCP window isn't reused (after a Firefox restart its saved ID could point at one of your windows): it stays an ordinary window, and Claude starts a new group.
 
 While Claude works in a tab, the page has a pulsing orange border and a "Claude is using this tab" label. Both are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
 
@@ -251,13 +251,13 @@ Dragging a tab out of the group also takes it back.
 
 ### Page dialogs
 
-A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it only applies for 15 seconds after Claude's last action there; otherwise dialogs show up for you as usual.
+A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it applies while a tool is working there and for 15 seconds after; otherwise dialogs show up for you as usual. When Claude loses a tab (you stop sharing it, drag it out of the group, or rename the group), its dialogs go back to you right away. Dialogs opened by frames inside a page aren't handled.
 
 ### javascript_tool
 
 Code runs like in the browser console: the value of the last expression comes back. Top-level `await` and `return` also work.
 
-Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and string values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
+Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and string values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude, in returned values and in thrown errors alike. `read_page` likewise shows `[hidden]` for the value of password fields. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
 
 A script is given 30 seconds (up to 50 with `timeout`). Firefox can't stop a script that's still running after that; the tool reports the timeout, and reloading the tab stops it.
 

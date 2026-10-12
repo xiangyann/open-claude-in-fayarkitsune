@@ -8,6 +8,8 @@ const SECRET_NAME_WORDS = new Set([
   "password", "passwd", "passphrase", "pwd", "secret", "token", "cookie", "cookies",
   "credential", "credentials", "auth", "authorization", "bearer", "jwt", "csrf", "xsrf",
   "session", "sessionid", "sid", "apikey", "otp",
+  // Common session and anti-forgery cookie names, written as one word.
+  "sessid", "phpsessid", "jsessionid", "csrftoken", "xsrftoken",
 ]);
 const SECRET_NAME_PAIRS = [
   ["api", "key"], ["private", "key"], ["access", "key"], ["secret", "key"],
@@ -33,11 +35,20 @@ const COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=(?:"[^"]*"|[^\s",;\\]*)$/;
 const JWT_ANYWHERE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g;
 const BEARER_ANYWHERE = /\b(Bearer)\s+[A-Za-z0-9\-._~+/]{12,}=*/gi;
 
-// The whole string is a Cookie header / document.cookie: "a=1; b=2".
+// Any value up to the next ";": browsers accept spaces, commas, quotes and
+// JSON in cookie values, and one such cookie mustn't expose all the others.
+const LOOSE_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[^;]*$/;
+
+// The whole string is a Cookie header / document.cookie: "a=1; b=2". With
+// two or more pairs, values may be anything; a single pair has to look like
+// a real cookie value, so text like "width=device-width, initial-scale=1"
+// isn't taken for one.
 function looksLikeCookieString(s) {
   const parts = s.split(";").map((p) => p.trim());
   if (parts[parts.length - 1] === "") parts.pop();
-  return parts.length > 0 && parts.every((p) => COOKIE_PAIR.test(p));
+  if (parts.length === 0) return false;
+  if (parts.length === 1) return COOKIE_PAIR.test(parts[0]);
+  return parts.every((p) => LOOSE_COOKIE_PAIR.test(p));
 }
 
 function redactString(s) {

@@ -23,15 +23,106 @@ function needsFunctionBody(message) {
 }
 
 // Offsets where the last statement could begin, earliest first: the start of
-// a line, or after a semicolon (most of these won't parse, which is fine).
+// a line, or after a semicolon, outside any brackets. Comments, strings,
+// template literals and regular expressions are skipped: a `;` in a comment
+// isn't a statement boundary, and starting a candidate there would turn
+// commented-out code into code that runs.
 function statementStarts(code) {
   if (code.length > AUTO_RETURN_MAX_LENGTH) return [];
   const from = Math.max(0, code.length - LAST_STATEMENT_WINDOW);
   const starts = from === 0 ? [0] : [];
-  for (let i = from; i < code.length; i++) {
-    if (code[i] === "\n" || code[i] === ";") starts.push(i + 1);
+  for (const at of topLevelBoundaries(code)) {
+    if (at >= from) starts.push(at);
   }
   return starts.slice(-MAX_CANDIDATES);
+}
+
+// A small scanner, enough to tell code from comments, strings, template
+// literals and regular expressions. Returns the offsets just after each
+// newline or semicolon that sits in code outside any (), [] or {}. A `/`
+// starts a regular expression unless it follows something a value ends
+// with (an identifier, a number, `)` or `]`); keywords like `return` are
+// the usual exception.
+function topLevelBoundaries(code) {
+  const out = [];
+  const closers = []; // expected closing characters; "`" marks a template's ${ }
+  let lastSignificant = ""; // the last code character that isn't whitespace
+  let lastWord = "";
+  const regexCanFollowWord = /^(return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    const next = code[i + 1];
+
+    if (ch === "/" && next === "/") {
+      while (i < code.length && code[i] !== "\n") i++;
+      i--; // the newline is handled as code, so it can be a boundary
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = code.indexOf("*/", i + 2);
+      i = end === -1 ? code.length : end + 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      for (i++; i < code.length && code[i] !== ch && code[i] !== "\n"; i++) {
+        if (code[i] === "\\") i++;
+      }
+      lastSignificant = ch;
+      lastWord = "";
+      continue;
+    }
+    if (ch === "`" || (ch === "}" && closers[closers.length - 1] === "`")) {
+      // A template literal, or the rest of one after a ${ } expression.
+      if (ch === "}") closers.pop();
+      for (i++; i < code.length; i++) {
+        if (code[i] === "\\") {
+          i++;
+        } else if (code[i] === "`") {
+          break;
+        } else if (code[i] === "$" && code[i + 1] === "{") {
+          closers.push("`");
+          i++;
+          break;
+        }
+      }
+      lastSignificant = "`";
+      lastWord = "";
+      continue;
+    }
+    if (ch === "/") {
+      const valueEnds = /[\w$)\]]/.test(lastSignificant) && !regexCanFollowWord.test(lastWord);
+      if (!valueEnds) {
+        let inClass = false;
+        for (i++; i < code.length && code[i] !== "\n"; i++) {
+          if (code[i] === "\\") i++;
+          else if (code[i] === "[") inClass = true;
+          else if (code[i] === "]") inClass = false;
+          else if (code[i] === "/" && !inClass) break;
+        }
+        while (/[a-z]/i.test(code[i + 1] || "")) i++; // flags
+        lastSignificant = "/";
+        lastWord = "";
+        continue;
+      }
+    }
+
+    if (ch === "(" || ch === "[" || ch === "{") {
+      closers.push({ "(": ")", "[": "]", "{": "}" }[ch]);
+    } else if (ch === ")" || ch === "]" || ch === "}") {
+      if (closers[closers.length - 1] === ch) closers.pop();
+    } else if ((ch === "\n" || ch === ";") && closers.length === 0) {
+      out.push(i + 1);
+    }
+
+    if (/[\w$]/.test(ch)) {
+      lastWord = /[\w$]/.test(lastSignificant) && code[i - 1] && /[\w$]/.test(code[i - 1]) ? lastWord + ch : ch;
+    } else if (!/\s/.test(ch)) {
+      lastWord = "";
+    }
+    if (!/\s/.test(ch)) lastSignificant = ch;
+  }
+  return out;
 }
 
 // The async function body that returns the expression starting at `at`, or
