@@ -313,7 +313,7 @@ Versions are set in one go with `node scripts/set-version.mjs <version>`. It upd
   - Then run `node scripts/add-update.mjs path/to/signed.xpi` and commit the updated `updates.json` to `main`. That's what makes installed copies update.
 - **How Firefox numbers dev builds:** Firefox only allows plain numbers as an add-on's version, so a dev build's manifest says `2.0.0`. The full `2.0.0-dev.3` is in `extension/lib/version.js`, which the extension shows and compares with the server's version. Dev builds only run as temporary add-ons, where Firefox doesn't compare versions.
 - **Linting:** use `npx web-ext lint -s extension --self-hosted`. Without `--self-hosted`, the linter flags `update_url`, which only add-ons listed on addons.mozilla.org can't have.
-- **1.x:** fixes for the 1.x line go to the `release/1.x` branch.
+- **1.x:** fixes for the 1.x line go to the `release/1.x` branch as `1.2.0-hotfixN` (the extension's manifest says `1.2.0.N`). They aren't signed or released: 1.2.0 is the last signed 1.x build, and anyone staying on 1.x builds and signs their own copy.
 
 ### Quick reset
 
