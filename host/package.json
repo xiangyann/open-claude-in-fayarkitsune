@@ -1,6 +1,6 @@
 {
   "name": "open-claude-in-fayarkitsune-host",
-  "version": "1.2.0",
+  "version": "1.2.0-hotfix1",
   "private": true,
   "description": "MCP server for Claude MCP in Fayar kitsune",
   "type": "module",

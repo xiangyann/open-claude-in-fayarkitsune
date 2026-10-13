@@ -670,7 +670,7 @@ async function requestHandover({ tabIds, reason, confirmed }) {
 
 const server = new McpServer({
   name: "open-claude-in-fayarkitsune",
-  version: "1.2.0",
+  version: "1.2.0-hotfix1",
 });
 
 // Pre-validation arg coercion

@@ -81,15 +81,15 @@ There are two parts to install: the **Firefox extension** and the **MCP server**
 
 ### 1. From Releases
 
-Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page. There are no automatic updates, so check there for new versions.
+The last signed 1.x build is [1.2.0](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/tag/v1.2.0). Fixes since then (1.2.0-hotfix1 on) are only in the source, on this `release/1.x` branch: [build from source](#2-from-source) and sign your own copy. Signed builds go on with 2.x, which no longer works with the original 1.0.0 extension.
 
 #### Firefox extension (`.xpi`)
 
-Download the `.xpi` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest). GitHub only downloads the file, so install it yourself: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
+Download the `.xpi` from the [1.2.0 release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/tag/v1.2.0). GitHub only downloads the file, so install it yourself: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
 
 #### Claude Desktop (`.mcpb`)
 
-1. Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest).
+1. Download the `.mcpb` from the [1.2.0 release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/tag/v1.2.0).
 2. In Claude Desktop, click your profile in the bottom-left corner → **Settings** → **Extensions**.
 3. Drag the `.mcpb` file onto the drop area there and confirm the install.
 
@@ -102,7 +102,7 @@ Releases have nothing to install for Claude Code: follow [From source → Claude
 Clone the repo first:
 
 ```bash
-git clone https://github.com/xiangyann/open-claude-in-fayarkitsune
+git clone -b release/1.x https://github.com/xiangyann/open-claude-in-fayarkitsune
 cd open-claude-in-fayarkitsune
 ```
 
