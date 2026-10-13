@@ -24,12 +24,26 @@ function installPageHooks(settings) {
     // A page can open dialogs in a loop; only the first ones since the last
     // report are kept, and the rest are counted.
     const MAX_DIALOGS = 50;
+    // Messages are cut to a sane size. Bundlers can put a whole list of chunks
+    // in a script's query string, so each stack frame may be kilobytes long:
+    // long query strings are left out, and only the first frames are kept.
+    const MAX_TEXT = 4000;
+    const MAX_FRAMES = 10;
+    const MAX_FRAME = 300;
+    const cut = (text, max) => (text.length > max ? `${text.slice(0, max)}… (${text.length - max} more characters)` : text);
+    const shortUrl = (text) => text.replace(/\?[^\s()]{40,}?(?=:\d+:\d+\)?$|$)/, "?…");
+    const showStack = (stack) => {
+      const frames = stack.split("\n").filter((frame) => frame.trim());
+      const shown = frames.slice(0, MAX_FRAMES).map((frame) => cut(shortUrl(frame), MAX_FRAME));
+      if (frames.length > MAX_FRAMES) shown.push(`… ${frames.length - MAX_FRAMES} more frames`);
+      return shown.join("\n");
+    };
     const record = (level, text) => {
-      hooks.logs.push({ level, text, url: location.href, timestamp: Date.now() });
+      hooks.logs.push({ level, text: cut(text, MAX_TEXT), url: location.href, timestamp: Date.now() });
       if (hooks.logs.length > MAX_LOGS) hooks.logs.splice(0, hooks.logs.length - MAX_LOGS);
     };
     const show = (arg) => {
-      if (arg instanceof Error) return arg.stack ? `${arg.name}: ${arg.message}\n${arg.stack}` : `${arg.name}: ${arg.message}`;
+      if (arg instanceof Error) return arg.stack ? `${arg.name}: ${arg.message}\n${showStack(arg.stack)}` : `${arg.name}: ${arg.message}`;
       if (typeof arg === "string") return arg;
       if (typeof arg !== "object" || arg === null) return String(arg);
       try {
@@ -51,7 +65,7 @@ function installPageHooks(settings) {
 
     window.addEventListener("error", (event) => {
       if (!(event instanceof ErrorEvent)) return; // resource load failures
-      const where = event.filename ? ` (${event.filename}:${event.lineno}:${event.colno})` : "";
+      const where = event.filename ? ` (${shortUrl(event.filename)}:${event.lineno}:${event.colno})` : "";
       record("exception", `Uncaught ${event.error ? show(event.error) : event.message}${where}`);
     });
     window.addEventListener("unhandledrejection", (event) => {
