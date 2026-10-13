@@ -59,7 +59,7 @@ function connectToServer() {
       return;
     }
     if (msg.type === "tool_request" && msg.id) {
-      handleToolRequest(msg.id, msg.tool, msg.args || {});
+      handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion);
     } else if (msg.type === "server_hello") {
       server.version = String(msg.version || "");
       server.settled = true;
@@ -90,11 +90,17 @@ const RELEASES_URL = "https://github.com/xiangyann/open-claude-in-fayarkitsune/r
 const server = { version: null, settled: false, timer: null };
 
 // null when the versions match (or nothing is connected yet), otherwise a
-// sentence for the user.
-function versionMismatch() {
-  if (!server.settled || serverSocket?.readyState !== WebSocket.OPEN) return null;
-  if (server.version === EXTENSION_VERSION) return null;
-  const serverText = server.version ? `version ${server.version}` : "older than 2.0.0";
+// sentence for the user. Without a version, it's about the server the
+// extension is connected to; a tool request says which server sent it,
+// which may be another Claude session's, forwarded by that one ("" for one
+// before 2.0.0).
+function versionMismatch(version) {
+  if (version === undefined) {
+    if (!server.settled || serverSocket?.readyState !== WebSocket.OPEN) return null;
+    version = server.version;
+  }
+  if (version === EXTENSION_VERSION) return null;
+  const serverText = version ? `version ${version}` : "older than 2.0.0";
   return `Claude's MCP server is ${serverText}, and this extension is version ${EXTENSION_VERSION}. Install the matching .mcpb from ${RELEASES_URL} (or update the server you added to Claude Code).`;
 }
 
@@ -667,7 +673,7 @@ const CLICKS = {
 // Handlers that take a tabId run only after handleToolRequest has checked
 // that Claude may use the tab; they get { tab, kind } from tabControl.
 const toolHandlers = {
-  async tabs_context_mcp(args) {
+  async tabs_context_mcp(args, control, request) {
     let group = await findClaudeGroup();
     if (!group && args.createIfEmpty) group = await ensureClaudeGroup();
     const own = group ? await tabsInGroup(group) : [];
@@ -677,7 +683,7 @@ const toolHandlers = {
       : textResult(`No "${GROUP_TITLE}" tab group exists. Use createIfEmpty: true to create one.`);
     // Tools may not match when the server and extension versions differ;
     // tell the user, who can fix it.
-    const mismatch = versionMismatch();
+    const mismatch = versionMismatch(request.serverVersion);
     if (mismatch) addNote(result, `Note for the user: ${mismatch}`);
     return result;
   },
@@ -1248,7 +1254,7 @@ const PAGE_TOOLS = new Set([
 ]);
 
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args) {
+async function handleToolRequest(id, tool, args, serverVersion) {
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
@@ -1279,7 +1285,7 @@ async function handleToolRequest(id, tool, args) {
       }
       if (PAGE_TOOLS.has(tool)) finish = await startPageWork(args.tabId, control.kind);
     }
-    let result = await handler(args, control);
+    let result = await handler(args, control, { serverVersion });
     if (finish) result = await finish(result);
     sendResponse(id, result);
   } catch (err) {

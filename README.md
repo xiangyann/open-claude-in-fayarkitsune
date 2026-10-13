@@ -306,7 +306,7 @@ No build step. All files are plain JavaScript. After pulling or editing:
 
 Versions are set in one go with `node scripts/set-version.mjs <version>`. It updates the server's `package.json` and lockfile, the `.mcpb` manifest, the extension manifest, and `extension/lib/version.js`.
 
-- **Development builds** are `X.Y.Z-dev.N` (`2.0.0-dev.1`, `2.0.0-dev.2`, …), published as GitHub **pre-releases** (tag `vX.Y.Z-dev.N`). Each carries the unsigned extension zip and the `.mcpb`.
+- **Development builds** are `X.Y.Z-dev.N` (`2.0.0-dev.1`, `2.0.0-dev.2`, …), then **release candidates** `X.Y.Z-rc.N`, published as GitHub **pre-releases** (tag `vX.Y.Z-dev.N` or `vX.Y.Z-rc.N`). Each carries the unsigned extension zip and the `.mcpb`.
   - A new version each time lets Claude Desktop update the `.mcpb` in place, instead of treating it as already installed.
   - The zip loads as a temporary add-on, or installs on Firefox Developer Edition, Nightly or ESR with signature checks off.
 - **Releases** are `X.Y.Z`: the extension is signed on AMO (unlisted), and the release carries the signed `.xpi` (named `claude-mcp-in-fayar-kitsune-X.Y.Z.xpi`) and the `.mcpb`.

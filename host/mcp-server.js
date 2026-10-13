@@ -74,7 +74,7 @@ function sendToExtension(tool, args) {
       pendingRequests.delete(id);
       reject(new Error("Tool request timed out after 60s"));
     }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
+    pendingRequests.set(id, { resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, resent: false });
 
     if (mode === "primary") {
       if (!extensionConnected()) {
@@ -83,7 +83,7 @@ function sendToExtension(tool, args) {
         reject(new Error("Browser extension is not connected. Make sure Firefox is running with the Claude MCP in Fayar kitsune extension installed and enabled."));
         return;
       }
-      extensionConn.send({ id, type: "tool_request", tool, args });
+      extensionConn.send({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION });
     } else {
       // Client mode: send to primary server
       if (!primarySocket || primarySocket.destroyed) {
@@ -92,7 +92,7 @@ function sendToExtension(tool, args) {
         reject(new Error("Lost connection to primary MCP server."));
         return;
       }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
+      const msg = JSON.stringify({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION }) + "\n";
       primarySocket.write(msg);
     }
   });
@@ -201,7 +201,7 @@ function detachExtension(conn) {
       if (!entry) continue; // answered or timed out meanwhile
       if (extensionConnected() && !entry.resent) {
         entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion });
       } else {
         clearTimeout(entry.timer);
         pendingRequests.delete(id);
@@ -213,7 +213,7 @@ function detachExtension(conn) {
       if (!entry) continue; // answered, or the client left
       if (extensionConnected() && !entry.resent) {
         entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args });
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion });
       } else {
         clientRequestMap.delete(id);
         const clientSocket = clientSockets.get(entry.clientId);
@@ -365,17 +365,20 @@ function setupClientConnection(socket, initialBuffer) {
       try {
         const msg = JSON.parse(line);
         if (msg.type === "tool_request" && msg.id) {
-          // Forward to the extension with a prefixed ID
+          // Forward to the extension with a prefixed ID, and the version of
+          // the client's server: its tools are the ones Claude sees there
+          // (a client before 2.0.0 doesn't say it: "").
           const prefixedId = `c${clientId}_${msg.id}`;
+          const serverVersion = typeof msg.serverVersion === "string" ? msg.serverVersion : "";
           // tool/args are kept so the request can be resent after a reconnect
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, resent: false });
+          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, serverVersion, resent: false });
 
           if (!extensionConnected()) {
             // Send error back to client
             socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
             clientRequestMap.delete(prefixedId);
           } else {
-            extensionConn.send({ ...msg, id: prefixedId });
+            extensionConn.send({ ...msg, id: prefixedId, serverVersion });
           }
         }
       } catch {}

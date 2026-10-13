@@ -13,10 +13,11 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ADDON_ID = "open-claude-in-fayarkitsune@anthropic";
 const RELEASES = "https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/download";
-const MANIFEST = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "updates.json");
+const MANIFEST = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "updates.json");
 
 const xpi = process.argv[2];
 if (!xpi) {

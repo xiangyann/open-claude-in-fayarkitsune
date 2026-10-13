@@ -40,7 +40,7 @@ for (const { id, request } of PERMISSIONS) {
 async function renderConnection() {
   let status = {};
   try {
-    status = await chrome.runtime.sendMessage({ type: "getConnectionStatus" });
+    status = (await chrome.runtime.sendMessage({ type: "getConnectionStatus" })) || {};
   } catch {}
   const el = document.getElementById("connection");
   el.textContent = status.connected
@@ -54,7 +54,18 @@ async function renderConnection() {
   // Firefox updates the extension by itself, Claude Desktop's .mcpb doesn't.
   const warning = document.getElementById("version-warning");
   warning.hidden = !status.mismatch;
-  if (status.mismatch) warning.querySelector("span").textContent = status.mismatch;
+  if (status.mismatch) {
+    // The message ends with where to get the .mcpb: make that a link.
+    const [before, url, after = ""] = status.mismatch.split(/(https:\/\/[^\s)]+)/);
+    const parts = [before];
+    if (url) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.textContent = url;
+      parts.push(link, after);
+    }
+    warning.replaceChildren(...parts);
+  }
 }
 
 chrome.permissions.onAdded.addListener(renderPermissions);
