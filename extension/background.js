@@ -139,7 +139,7 @@ function textResult(text) {
 // blocks run together, so it goes on its own lines of the last one.
 function addNote(result, note) {
   const last = result.content[result.content.length - 1];
-  if (last?.type === "text") last.text += `\n\n${note}`;
+  if (last?.type === "text") last.text = `${last.text.replace(/\n+$/, "")}\n\n${note}`;
   else result.content.push({ type: "text", text: note });
 }
 
@@ -1794,6 +1794,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       extensionVersion: EXTENSION_VERSION,
       serverVersion: server.settled ? server.version : undefined,
       mismatch: versionMismatch(),
+      releasesUrl: RELEASES_URL,
     });
   }
 });

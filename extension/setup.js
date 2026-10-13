@@ -54,17 +54,24 @@ async function renderConnection() {
   // Firefox updates the extension by itself, Claude Desktop's .mcpb doesn't.
   const warning = document.getElementById("version-warning");
   warning.hidden = !status.mismatch;
-  if (status.mismatch) {
-    // The message ends with where to get the .mcpb: make that a link.
-    const [before, url, after = ""] = status.mismatch.split(/(https:\/\/[^\s)]+)/);
-    const parts = [before];
-    if (url) {
+  // Rebuilt only when the message changes, so a refresh doesn't swallow a
+  // click on the link.
+  if (status.mismatch && warning.dataset.message !== status.mismatch) {
+    warning.dataset.message = status.mismatch;
+    // The message says where to get the .mcpb: make that a link.
+    const at = status.releasesUrl ? status.mismatch.lastIndexOf(status.releasesUrl) : -1;
+    if (at < 0) {
+      warning.textContent = status.mismatch;
+    } else {
       const link = document.createElement("a");
-      link.href = url;
-      link.textContent = url;
-      parts.push(link, after);
+      link.href = status.releasesUrl;
+      link.textContent = status.releasesUrl;
+      warning.replaceChildren(
+        status.mismatch.slice(0, at),
+        link,
+        status.mismatch.slice(at + status.releasesUrl.length)
+      );
     }
-    warning.replaceChildren(...parts);
   }
 }
 
