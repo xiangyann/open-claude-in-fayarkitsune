@@ -6,23 +6,11 @@ const PERMISSIONS = [
   { id: "user-scripts", request: { permissions: ["userScripts"] } },
 ];
 
-// userScripts.execute, which javascript_tool relies on, arrived in Firefox 153.
-const userScriptsSupported = browser.runtime
-  .getBrowserInfo()
-  .then(({ version }) => parseInt(version, 10) >= 153)
-  .catch(() => true);
-
 async function renderPermissions() {
   for (const { id, request } of PERMISSIONS) {
     const row = document.getElementById(id);
     const status = row.querySelector(".status");
     const button = row.querySelector("button");
-    if (id === "user-scripts" && !(await userScriptsSupported)) {
-      status.textContent = "Needs Firefox 153+";
-      status.className = "status warn";
-      button.hidden = true;
-      continue;
-    }
     const granted = await chrome.permissions.contains(request);
     status.textContent = granted ? "Allowed" : "Not allowed";
     status.className = `status ${granted ? "ok" : "warn"}`;
