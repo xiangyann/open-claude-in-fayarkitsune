@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "open-claude-in-fayarkitsune",
   "display_name": "Claude MCP in Fayar kitsune",
-  "version": "2.0.0-rc.1",
+  "version": "2.0.0-rc.2",
   "description": "Browser automation in Firefox through the Claude MCP in Fayar kitsune extension.",
   "long_description": "MCP server for the Claude MCP in Fayar kitsune Firefox extension. Install the extension in Firefox; it connects to this server over a WebSocket on 127.0.0.1:18765. Nothing else to set up: no native messaging host, no Node.js install, no registry keys.",
   "author": {
