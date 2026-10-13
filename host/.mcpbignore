@@ -1,4 +1,5 @@
-# Legacy native messaging host (extension 1.0.0) - not needed in the bundle
+# Leftovers of the 1.0.0 extension's native messaging host, which a local
+# setup may still have: never bundle them.
 native-host.js
 native-host-wrapper.*
 com.anthropic.open_claude_in_firefox.json

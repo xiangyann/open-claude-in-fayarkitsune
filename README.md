@@ -81,11 +81,13 @@ There are two parts to install: the **Firefox extension** and the **MCP server**
 
 ### 1. From Releases
 
-Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page. There are no automatic updates, so check there for new versions.
+Signed builds are on the [Releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases) page.
 
 #### Firefox extension (`.xpi`)
 
 Download the `.xpi` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest). GitHub only downloads the file, so install it yourself: drag it onto a Firefox window, or `about:addons` → gear icon → **Install Add-on From File...**
+
+From 2.0.0 on, Firefox keeps the extension up to date by itself: it checks this repository's [`updates.json`](updates.json) and installs new signed releases, like any add-on update. The `.mcpb` for Claude Desktop isn't updated that way. When the two versions differ, the toolbar button shows an amber **!**, and the setup page says which `.mcpb` to get.
 
 #### Claude Desktop (`.mcpb`)
 
@@ -118,7 +120,7 @@ Pick one of these.
 
 Release Firefox only installs add-ons signed by Mozilla. Signing as **unlisted** is free, automated, and doesn't publish anything on addons.mozilla.org:
 
-1. Change `browser_specific_settings.gecko.id` in `extension/manifest.json` to an ID of your own, e.g. `claude-mcp@yourname`. Add-on IDs are unique on AMO, and the current one belongs to the maintainer's account.
+1. In `extension/manifest.json`, change `browser_specific_settings.gecko.id` to an ID of your own, e.g. `claude-mcp@yourname`. Add-on IDs are unique on AMO, and the current one belongs to the maintainer's account. Also remove `update_url` there, or point it at an update manifest of your own; it points at this repository's releases.
 2. Create API credentials at [addons.mozilla.org/developers/addon/api/key](https://addons.mozilla.org/developers/addon/api/key/).
 3. Sign:
    ```bash
@@ -167,11 +169,17 @@ The install prompt doesn't list two other permissions, because they don't come w
 
 That's it. The extension connects to the server on its own whenever Claude is running.
 
-### Upgrading from extension 1.0.0
+### Upgrading to 2.0.0
 
-1.1.0 has a different add-on ID (`open-claude-in-fayarkitsune@anthropic`) from the original 1.0.0 (`open-claude-in-firefox@anthropic`), so Firefox installs it alongside 1.0.0 instead of updating it. **Remove 1.0.0 in `about:addons` before starting 1.1.0.** The server takes one browser at a time, so if both are enabled, whichever connects first wins and the other is refused.
+- **From 1.x:** install the 2.0.0 `.xpi` over it, and the 2.0.0 `.mcpb` in Claude Desktop: remove the old one under **Extensions** first if it doesn't offer to update. From now on the extension updates itself; see [From Releases](#1-from-releases).
+- **Custom port:** the config file moved from `~/.config/open-claude-in-firefox/config.json` to `~/.config/open-claude-in-fayarkitsune/config.json`. Move yours if you changed the port.
+- **The original open-claude-in-firefox 1.0.0 extension isn't supported anymore.** Its native messaging host was the last way 1.0.0 could reach the server, and 2.0.0 refuses it. If you need it, stay on the [1.2.x releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/tag/v1.2.0) (branch `release/1.x`). The section below covers switching away from it.
 
-Extension 1.0.0 reached the server through a native messaging host (`host/native-host.js`, registered by `install.sh` or the registry). 1.1.0 connects directly, so the host is no longer used. Once you've removed 1.0.0, also remove the old host registration:
+### Upgrading from the original extension 1.0.0
+
+This extension has a different add-on ID (`open-claude-in-fayarkitsune@anthropic`) from the original 1.0.0 (`open-claude-in-firefox@anthropic`), so Firefox installs it alongside 1.0.0 instead of updating it. **Remove 1.0.0 in `about:addons`.**
+
+Extension 1.0.0 reached the server through a native messaging host (`native-host.js`, registered by the old `install.sh` or the registry). This extension connects directly, and 2.0.0 removed the host. Once you've removed 1.0.0, also remove the old host registration:
 
 - **Windows**: `reg delete HKCU\Software\Mozilla\NativeMessagingHosts\com.anthropic.open_claude_in_firefox /f`
 - **macOS**: `rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/com.anthropic.open_claude_in_firefox.json`
@@ -292,7 +300,20 @@ No build step. All files are plain JavaScript. After pulling or editing:
 |---|---|
 | Anything in `extension/` | Reload: `about:debugging` → click the reload icon next to the extension |
 | `host/mcp-server.js` (Claude Code) | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
-| `host/mcp-server.js` (Claude Desktop) | Rebuild the `.mcpb` (bump `version` in `host/manifest.json`) and install it again |
+| `host/mcp-server.js` (Claude Desktop) | Rebuild the `.mcpb` with a new version (see [Releasing](#releasing)) and install it again |
+
+### Releasing
+
+Versions are set in one go with `node scripts/set-version.mjs <version>`. It updates the server's `package.json` and lockfile, the `.mcpb` manifest, the extension manifest, and `extension/lib/version.js`.
+
+- **Development builds** are `X.Y.Z-dev.N` (`2.0.0-dev.1`, `2.0.0-dev.2`, …), published as GitHub **pre-releases** (tag `vX.Y.Z-dev.N`). Each carries the unsigned extension zip and the `.mcpb`.
+  - A new version each time lets Claude Desktop update the `.mcpb` in place, instead of treating it as already installed.
+  - The zip loads as a temporary add-on, or installs on Firefox Developer Edition, Nightly or ESR with signature checks off.
+- **Releases** are `X.Y.Z`: the extension is signed on AMO (unlisted), and the release carries the signed `.xpi` (named `claude-mcp-in-fayar-kitsune-X.Y.Z.xpi`) and the `.mcpb`.
+  - Then run `node scripts/add-update.mjs path/to/signed.xpi` and commit the updated `updates.json` to `main`. That's what makes installed copies update.
+- **How Firefox numbers dev builds:** Firefox only allows plain numbers as an add-on's version, so a dev build's manifest says `2.0.0`. The full `2.0.0-dev.3` is in `extension/lib/version.js`, which the extension shows and compares with the server's version. Dev builds only run as temporary add-ons, where Firefox doesn't compare versions.
+- **Linting:** use `npx web-ext lint -s extension --self-hosted`. Without `--self-hosted`, the linter flags `update_url`, which only add-ons listed on addons.mozilla.org can't have.
+- **1.x:** fixes for the 1.x line go to the `release/1.x` branch as `1.2.0-hotfixN` (the extension's manifest says `1.2.0.N`). They aren't signed or released: 1.2.0 is the last signed 1.x build, and anyone staying on 1.x builds and signs their own copy.
 
 ### Quick reset
 
@@ -348,7 +369,7 @@ Then `/mcp` in Claude Code to reconnect.
 ### Port conflict
 
 Default port is 18765. To change:
-1. Create `~/.config/open-claude-in-firefox/config.json`:
+1. Create `~/.config/open-claude-in-fayarkitsune/config.json` (before 2.0.0: `~/.config/open-claude-in-firefox/config.json`):
    ```json
    { "port": 19000 }
    ```

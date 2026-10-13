@@ -76,6 +76,10 @@
     button[hidden] { display: none; }
     code { font-size: 13px; }
     .footnote { color: var(--muted); font-size: 13px; margin-top: 20px; }
+    .versions { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .version-warning { display: block; white-space: normal; border-radius: 8px; padding: 8px 12px; margin-top: 10px; font-weight: 500; }
+    .version-warning[hidden] { display: none; }
+    .version-warning a { margin-left: 4px; }
     a { color: var(--accent); }
     @media (max-width: 520px) {
       .perm { flex-direction: column; align-items: stretch; }
@@ -123,6 +127,11 @@
     <section class="card">
       <h2>Connection to Claude</h2>
       <p id="connection"></p>
+      <p class="versions" id="versions"></p>
+      <p class="status warn version-warning" id="version-warning" hidden>
+        <span></span>
+        <a href="https://github.com/xiangyann/open-claude-in-fayarkitsune/releases">Releases</a>
+      </p>
     </section>
 
     <section class="card">
@@ -141,6 +150,7 @@
       <a href="https://github.com/xiangyann/open-claude-in-fayarkitsune">Source and setup guide</a>
     </p>
   </main>
+  <script src="lib/version.js"></script>
   <script src="setup.js"></script>
 </body>
 </html>

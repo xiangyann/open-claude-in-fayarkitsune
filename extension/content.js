@@ -97,7 +97,13 @@
   }
 
   // --- Accessible name ---
+  // On one line: text from the page keeps its source's newlines and
+  // indentation.
   function getAccessibleName(el) {
+    return nameFromPage(el).replace(/\s+/g, " ").trim();
+  }
+
+  function nameFromPage(el) {
     // Priority: aria-label > aria-labelledby > placeholder > title > alt > label > text
     const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel) return ariaLabel.trim();
@@ -273,10 +279,17 @@
       ".content",
       "#content",
     ];
+    // A selector can match several elements. When the others are all inside
+    // the first one (comments in a post, say), that's the content; when
+    // they're side by side (a feed of <article>s), none of them is, and the
+    // next selector is tried.
     let source = null;
     for (const sel of selectors) {
-      source = document.querySelector(sel);
-      if (source) break;
+      const [first, ...rest] = document.querySelectorAll(sel);
+      if (first && rest.every((el) => first.contains(el))) {
+        source = first;
+        break;
+      }
     }
     if (!source) source = document.body;
 

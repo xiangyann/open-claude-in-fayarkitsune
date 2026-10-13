@@ -38,14 +38,23 @@ for (const { id, request } of PERMISSIONS) {
 }
 
 async function renderConnection() {
-  let connected = false;
+  let status = {};
   try {
-    ({ connected } = await chrome.runtime.sendMessage({ type: "getConnectionStatus" }));
+    status = await chrome.runtime.sendMessage({ type: "getConnectionStatus" });
   } catch {}
   const el = document.getElementById("connection");
-  el.textContent = connected
+  el.textContent = status.connected
     ? "Connected. Claude can use this browser."
     : "Not connected yet. Start Claude Desktop with the Claude MCP in Fayar kitsune extension installed, or a Claude Code session with the MCP server added. This page updates by itself.";
+
+  const versions = document.getElementById("versions");
+  const server = status.serverVersion === undefined ? "" : ` · server ${status.serverVersion || "older than 2.0.0"}`;
+  versions.textContent = `Extension ${EXTENSION_VERSION}${status.connected ? server : ""}`;
+
+  // Firefox updates the extension by itself, Claude Desktop's .mcpb doesn't.
+  const warning = document.getElementById("version-warning");
+  warning.hidden = !status.mismatch;
+  if (status.mismatch) warning.querySelector("span").textContent = status.mismatch;
 }
 
 chrome.permissions.onAdded.addListener(renderPermissions);
