@@ -129,6 +129,14 @@ function textResult(text) {
   return { content: [{ type: "text", text }] };
 }
 
+// Adds a note after a tool's result. Claude's apps show a result's text
+// blocks run together, so it goes on its own lines of the last one.
+function addNote(result, note) {
+  const last = result.content[result.content.length - 1];
+  if (last?.type === "text") last.text += `\n\n${note}`;
+  else result.content.push({ type: "text", text: note });
+}
+
 // --- Claude's tabs ---
 // Claude works in tabs of its own, kept in a tab group named "Claude" (in a
 // window of its own, unless the user moves the group), and in tabs the user
@@ -560,7 +568,7 @@ async function startPageWork(tabId, kind) {
       [...(before?.dialogs || []), ...(after?.dialogs || [])],
       (before?.dropped || 0) + (after?.dropped || 0)
     );
-    if (note && result?.content) result.content.push({ type: "text", text: note });
+    if (note && result?.content) addNote(result, note);
     return result;
   };
 }
@@ -670,7 +678,7 @@ const toolHandlers = {
     // Tools may not match when the server and extension versions differ;
     // tell the user, who can fix it.
     const mismatch = versionMismatch();
-    if (mismatch) result.content.push({ type: "text", text: `Note for the user: ${mismatch}` });
+    if (mismatch) addNote(result, `Note for the user: ${mismatch}`);
     return result;
   },
 
