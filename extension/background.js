@@ -1312,14 +1312,12 @@ async function runJavascript(tabId, code, deadline) {
   if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, code);
   if (!outcome.csp) return outcome;
 
-  // The page's Content Security Policy blocks eval().
+  // The page's Content Security Policy blocks eval(). The userScripts
+  // namespace only exists once its optional permission is granted.
   if (chrome.userScripts?.execute) return runAsUserScript(tabId, code, deadline);
-  // The namespace only exists once the permission is granted;
-  // userScripts.execute itself needs Firefox 153+.
-  const fix = chrome.userScripts
-    ? "Running scripts on sites like this needs Firefox 153 or later."
-    : `To run scripts on sites like this, click the ${EXTENSION_NAME} toolbar button and allow "User scripts".`;
-  return { thrown: `${outcome.csp}. This site's security policy blocks eval(). ${fix}` };
+  return {
+    thrown: `${outcome.csp}. This site's security policy blocks eval(). To run scripts on sites like this, click the ${EXTENSION_NAME} toolbar button and allow "User scripts".`,
+  };
 }
 
 // eval() in the page's own world (indirect, so it runs at global scope like a

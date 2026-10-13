@@ -73,7 +73,7 @@ No native messaging host, registry keys or install script: the extension finds t
 
 ### Prerequisites
 
-- **Firefox** 142+
+- **Firefox** 153+
 - **Claude Desktop** and/or **Claude Code** v2.0.73+
 - **Node.js** v18+, only for installing from source or using Claude Code (Claude Desktop runs the `.mcpb` with its own built-in Node.js)
 
@@ -163,7 +163,7 @@ On Windows PowerShell, use `"$PWD\mcp-server.js"` for the path.
 However you installed the extension, a setup page opens with its permissions. You can reopen it any time from the toolbar button, which shows a red **!** while website access is missing:
 
 - **Access to all websites** (required): read pages, take screenshots, click and type. It's in Firefox's install prompt, but you can revoke it later.
-- **User scripts** (optional, Firefox 153+): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
+- **User scripts** (optional): lets `javascript_tool` run on sites whose Content Security Policy blocks `eval()`, such as reddit.com. Firefox only allows this permission to be granted from a click, so it can't be part of the install prompt.
 
 The install prompt doesn't list two other permissions, because they don't come with a warning: **tab groups** (Claude's tabs live in a group named "Claude") and **menus** (the Claude items when you right-click a tab).
 
