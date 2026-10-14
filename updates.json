@@ -1,7 +1,18 @@
 {
   "addons": {
     "open-claude-in-fayarkitsune@anthropic": {
-      "updates": []
+      "updates": [
+        {
+          "version": "2.0.0",
+          "update_link": "https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/download/v2.0.0/claude-mcp-in-fayar-kitsune-2.0.0.xpi",
+          "update_hash": "sha256:cdf046692bd8d9efc293a24860902c05de73a429cc6124759b77a0f4c2e0f89f",
+          "applications": {
+            "gecko": {
+              "strict_min_version": "153.0"
+            }
+          }
+        }
+      ]
     }
   }
 }
