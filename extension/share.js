@@ -59,8 +59,19 @@ function render({ reason, query, tabs }) {
 }
 
 async function decide(tabIds) {
-  await chrome.runtime.sendMessage({ type: "shareDecision", requestId, tabIds });
-  window.close();
+  let answer = null;
+  try {
+    answer = await chrome.runtime.sendMessage({ type: "shareDecision", requestId, tabIds });
+  } catch {}
+  if (answer?.ok || !tabIds.length) {
+    window.close();
+    return;
+  }
+  // The request is gone (the extension restarted, say): say so rather than
+  // closing as if the tabs were shared.
+  document.querySelector("header p").textContent =
+    "This request has expired, so nothing was shared. To share a tab, right-click it and choose Share Tab with Claude.";
+  shareButton.hidden = true;
 }
 
 shareButton.addEventListener("click", () => {

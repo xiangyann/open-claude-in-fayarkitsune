@@ -19,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import net from "node:net";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -54,6 +55,15 @@ let mode = "primary"; // or "client"
 let extensionConn = null;
 const pendingRequests = new Map(); // id -> { resolve, reject, timer, tool, args, resent }
 let requestIdCounter = 0;
+// Request ids are unique across servers and restarts: the extension
+// remembers which ones it ran (so a resent request isn't run twice), and a
+// late answer meant for a server that's gone mustn't match another's.
+const REQUEST_ID_PREFIX = randomUUID().slice(0, 8);
+
+// When a call's outcome is unknown, Claude has to find out whether it
+// happened before repeating it.
+const UNKNOWN_OUTCOME =
+  "It may or may not have been done. Before repeating it, check whether it took effect (a screenshot, read_page or get_page_text); if it did, don't repeat it. If you still can't tell, ask the user.";
 
 // Primary mode: track client MCP server connections
 const clientSockets = new Map(); // clientId -> socket
@@ -69,10 +79,10 @@ let clientBuffer = Buffer.alloc(0);
 
 function sendToExtension(tool, args) {
   return new Promise((resolve, reject) => {
-    const id = String(++requestIdCounter);
+    const id = `${REQUEST_ID_PREFIX}-${++requestIdCounter}`;
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
+      reject(new Error(`Tool request timed out after 60s. ${UNKNOWN_OUTCOME}`));
     }, 60000);
     pendingRequests.set(id, { resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, resent: false });
 
@@ -195,17 +205,20 @@ function detachExtension(conn) {
   const forwarded = [...clientRequestMap.keys()];
   if (inFlight.length === 0 && forwarded.length === 0) return;
   // Give the extension a few seconds to reconnect, then resend each once.
+  // The extension may have run it already: it remembers the ids of what it
+  // ran, and doesn't run an action twice (see handleToolRequest there).
+  const disconnected = `Browser extension disconnected. ${UNKNOWN_OUTCOME}`;
   setTimeout(() => {
     for (const id of inFlight) {
       const entry = pendingRequests.get(id);
       if (!entry) continue; // answered or timed out meanwhile
       if (extensionConnected() && !entry.resent) {
         entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion });
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
       } else {
         clearTimeout(entry.timer);
         pendingRequests.delete(id);
-        entry.reject(new Error("Browser extension disconnected"));
+        entry.reject(new Error(disconnected));
       }
     }
     for (const id of forwarded) {
@@ -213,12 +226,12 @@ function detachExtension(conn) {
       if (!entry) continue; // answered, or the client left
       if (extensionConnected() && !entry.resent) {
         entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion });
+        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
       } else {
         clientRequestMap.delete(id);
         const clientSocket = clientSockets.get(entry.clientId);
         if (clientSocket && !clientSocket.destroyed) {
-          clientSocket.write(JSON.stringify({ id: entry.originalId, type: "tool_error", error: "Browser extension disconnected" }) + "\n");
+          clientSocket.write(JSON.stringify({ id: entry.originalId, type: "tool_error", error: disconnected }) + "\n");
         }
       }
     }
@@ -312,6 +325,9 @@ const tcpServer = net.createServer((socket) => {
       socket.resume();
       return;
     }
+
+    // The start of "GET ", cut short by TCP: wait for the rest.
+    if (earlyBuffer.length < 4 && "GET ".startsWith(earlyBuffer.toString("latin1"))) return;
 
     // Only a client_hello line can follow; anything not starting like JSON
     // is refused right away.
@@ -410,11 +426,13 @@ function startClientMode() {
   process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
 
   function connect() {
+    clientBuffer = Buffer.alloc(0); // a line cut off when the last connection ended
     primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
       process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-      // Send handshake
-      primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
     });
+    // The handshake goes first: a tool request may be written while the
+    // socket is still connecting, and writes go out in order.
+    primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
 
     primarySocket.on("data", (chunk) => {
       clientBuffer = Buffer.concat([clientBuffer, chunk]);
@@ -454,7 +472,7 @@ function startClientMode() {
       // Primary died, reject pending requests
       for (const [, { reject, timer }] of pendingRequests) {
         clearTimeout(timer);
-        reject(new Error("Primary MCP server disconnected"));
+        reject(new Error(`Primary MCP server disconnected. ${UNKNOWN_OUTCOME}`));
       }
       pendingRequests.clear();
       // Nobody else will open the port if the primary is gone for good, so
@@ -485,6 +503,11 @@ function listenAsPrimary() {
     };
     const onListening = () => {
       tcpServer.removeListener("error", onError);
+      // From now on an error (e.g. too many open files on accept) is logged
+      // instead of crashing the server every session goes through.
+      if (!tcpServer.listenerCount("error")) {
+        tcpServer.on("error", (err) => process.stderr.write(`Port ${TCP_PORT}: ${err.message}\n`));
+      }
       mode = "primary";
       writePidfile();
       process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
@@ -575,7 +598,10 @@ async function requestHandover({ tabIds, reason, confirmed }) {
   let described = ids.map((id) => `tab ${id}`);
   try {
     const context = await sendToExtension("tabs_context_mcp", {});
-    const { availableTabs = [] } = JSON.parse(context.content[0].text.split("\n")[0]);
+    // The first line is JSON, unless there are no tabs at all (no group,
+    // nothing shared): then nothing is shared either.
+    const firstLine = context.content[0].text.split("\n")[0];
+    const { availableTabs = [] } = firstLine.startsWith("{") ? JSON.parse(firstLine) : {};
     const shared = availableTabs.filter((t) => t.sharedByUser);
     const notShared = ids.filter((id) => !shared.some((t) => t.tabId === id));
     if (notShared.length) {

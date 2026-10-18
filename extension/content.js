@@ -743,6 +743,12 @@
 
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // Arrived after the background stopped waiting (the page was busy): the
+    // tool already reported it as not done, so it mustn't happen now.
+    if (typeof msg.deadline === "number" && Date.now() > msg.deadline) {
+      sendResponse({ error: "expired" });
+      return;
+    }
     if (msg.type === "glow") {
       if (msg.mode === "show") showGlow();
       else if (msg.mode === "remove") removeGlow();
