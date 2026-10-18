@@ -8,6 +8,10 @@
 //   Claude chose an answer with handle_dialog) and reported in the next tool
 //   result. Outside that window the page gets the normal dialog.
 //
+// While Claude doesn't control the tab (released, or shared and then taken
+// back), nothing is recorded: what happens then is the user's alone, and
+// isn't shown to Claude if the tab is shared again.
+//
 // installPageHooks is injected with scripting.executeScript, so it must be
 // self-contained. Calling it again updates the settings and returns the
 // dialogs recorded since the last call.
@@ -17,7 +21,7 @@ function installPageHooks(settings) {
   let hooks = window[STATE];
 
   if (!hooks) {
-    hooks = { logs: [], dialogs: [], droppedDialogs: 0, answerUntil: 0, nextAnswer: null };
+    hooks = { logs: [], dialogs: [], droppedDialogs: 0, answerUntil: 0, nextAnswer: null, recording: true };
     Object.defineProperty(window, STATE, { value: hooks });
 
     const MAX_LOGS = 1000;
@@ -39,6 +43,7 @@ function installPageHooks(settings) {
       return shown.join("\n");
     };
     const record = (level, text) => {
+      if (!hooks.recording) return;
       hooks.logs.push({ level, text: cut(text, MAX_TEXT), url: location.href, timestamp: Date.now() });
       if (hooks.logs.length > MAX_LOGS) hooks.logs.splice(0, hooks.logs.length - MAX_LOGS);
     };
@@ -74,6 +79,7 @@ function installPageHooks(settings) {
 
     const native = { alert: window.alert, confirm: window.confirm, prompt: window.prompt };
     const handle = (type, message, defaultText) => {
+      if (!hooks.recording) return { native: true };
       const note = { type, message: String(message ?? "").slice(0, 500) };
       if (hooks.dialogs.length < MAX_DIALOGS) hooks.dialogs.push(note);
       else hooks.droppedDialogs++;
@@ -114,6 +120,12 @@ function installPageHooks(settings) {
   if (settings) {
     if (typeof settings.answerUntil === "number") hooks.answerUntil = settings.answerUntil;
     if ("nextAnswer" in settings) hooks.nextAnswer = settings.nextAnswer;
+    if (typeof settings.recording === "boolean") hooks.recording = settings.recording;
+    if (settings.forget) {
+      hooks.logs.length = 0;
+      hooks.dialogs.length = 0;
+      hooks.droppedDialogs = 0;
+    }
   }
   const action = settings && settings.read;
   if (action === "logs") {

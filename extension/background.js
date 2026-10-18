@@ -39,14 +39,16 @@ function connectToServer() {
   serverSocket = ws;
 
   ws.onopen = () => {
-    reconnectDelay = 1000;
     // Servers from 2.0.0 on say their version right away; one that hasn't
-    // within a moment is older.
+    // within a moment is older. The retry delay starts over only then: a
+    // server that refuses this browser (another one is connected) closes the
+    // connection at once, and is retried less and less often.
     server.version = null;
     server.settled = false;
     clearTimeout(server.timer);
     server.timer = setTimeout(() => {
       server.settled = true;
+      reconnectDelay = 1000;
       updateBadge();
     }, 2000);
   };
@@ -59,10 +61,11 @@ function connectToServer() {
       return;
     }
     if (msg.type === "tool_request" && msg.id) {
-      handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion);
+      handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion, msg.resent === true);
     } else if (msg.type === "server_hello") {
       server.version = String(msg.version || "");
       server.settled = true;
+      reconnectDelay = 1000;
       clearTimeout(server.timer);
       updateBadge();
     }
@@ -188,6 +191,7 @@ function isControlledNow(tabId) {
 // its dialogs back to the user (see releasePage).
 function forgetTab(tabId) {
   networkRequests.delete(tabId);
+  pageOrigins.delete(tabId);
   releasePage(tabId);
 }
 
@@ -371,6 +375,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 // Clean up when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   networkRequests.delete(tabId);
+  pageOrigins.delete(tabId);
   lastWorkAt.delete(tabId);
   hookedTabs.delete(tabId);
   ownTabs.delete(tabId);
@@ -382,10 +387,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Only tabs Claude can use are recorded, from the moment it can: a tab the
 // user shares later starts with an empty history, not with what it loaded
 // while it was private.
+// A page loading from another site starts the list over (the tool's
+// description promises that); within a site, earlier pages' requests stay.
+const pageOrigins = new Map(); // tabId -> origin of the last page loaded
+
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0 || !isControlledNow(details.tabId)) return;
-    const reqs = networkRequests.get(details.tabId) || [];
+    let reqs = networkRequests.get(details.tabId) || [];
+    if (details.type === "main_frame") {
+      const origin = URL.canParse(details.url) ? new URL(details.url).origin : null;
+      if (pageOrigins.has(details.tabId) && pageOrigins.get(details.tabId) !== origin) reqs = [];
+      pageOrigins.set(details.tabId, origin);
+    }
     reqs.push({
       url: details.url,
       method: details.method,
@@ -402,8 +416,9 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.tabId < 0) return;
-    const reqs = networkRequests.get(details.tabId) || [];
+    // Only requests already recorded: not for tabs Claude can't use.
+    const reqs = networkRequests.get(details.tabId);
+    if (!reqs) return;
     for (let i = reqs.length - 1; i >= 0; i--) {
       if (reqs[i].requestId === details.requestId) {
         reqs[i].status = details.statusCode;
@@ -414,7 +429,6 @@ chrome.webRequest.onCompleted.addListener(
         break;
       }
     }
-    networkRequests.set(details.tabId, reqs);
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -422,8 +436,9 @@ chrome.webRequest.onCompleted.addListener(
 
 chrome.webRequest.onErrorOccurred.addListener(
   (details) => {
-    if (details.tabId < 0) return;
-    const reqs = networkRequests.get(details.tabId) || [];
+    // Only requests already recorded: not for tabs Claude can't use.
+    const reqs = networkRequests.get(details.tabId);
+    if (!reqs) return;
     for (let i = reqs.length - 1; i >= 0; i--) {
       if (reqs[i].requestId === details.requestId) {
         reqs[i].status = -1;
@@ -431,23 +446,42 @@ chrome.webRequest.onErrorOccurred.addListener(
         break;
       }
     }
-    networkRequests.set(details.tabId, reqs);
   },
   { urls: ["<all_urls>"] }
 );
 
 // --- Content script communication ---
-async function sendContentMessage(tabId, message) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, message);
-    return response;
-  } catch {
-    // Content script might not be injected yet, try injecting
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
+// A page busy with a script (one javascript_tool gave up on, say) can't
+// answer. Each message carries a deadline: the tool reports the page as busy
+// when it passes, and the content script drops a message it only gets after
+// it, so a click or a key doesn't happen late, after Claude was told it
+// failed.
+const CONTENT_TIMEOUT_MS = 20000;
+
+async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  const send = async () => {
+    let timer;
+    const late = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(
+        `The page didn't respond within ${Math.round(timeoutMs / 1000)} s: it may be busy, e.g. with a script that's still running. It won't act on this later.`
+      )), Math.max(0, deadline - Date.now()));
     });
-    return chrome.tabs.sendMessage(tabId, message);
+    try {
+      return await Promise.race([chrome.tabs.sendMessage(tabId, { ...message, deadline }), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    return await send();
+  } catch (err) {
+    // Only when there's no content script (a page loaded before the
+    // extension was): inject it and send again. Any other failure, e.g. the
+    // page navigating away mid-message, may come after the action happened.
+    if (!/Receiving end does not exist|Could not establish connection/i.test(err?.message || "")) throw err;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return send();
   }
 }
 
@@ -486,19 +520,37 @@ function dialogDeadline(tabId, kind) {
 // tool result mustn't wait for it.
 const PAGE_HOOKS_TIMEOUT_MS = 3000;
 
-async function callPageHooks(tabId, settings, frameId = 0) {
-  const call = (async () => {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [frameId] },
-      world: "MAIN",
-      injectImmediately: true,
-      func: installPageHooks,
-      args: [settings],
-    });
-    if (settings?.answerUntil > 0) hookedTabs.add(tabId);
-    return res?.result ?? null;
-  })().catch(() => null);
-  return Promise.race([call, sleep(PAGE_HOOKS_TIMEOUT_MS).then(() => null)]);
+// The page's frames are hooked too: a frame's alert() would freeze the tab
+// just the same. Their records are merged with the page's. A frame stuck in
+// a script doesn't hold up the page's: then the page alone is asked again.
+// Every caller but releasePage acts on a tab Claude controls, so recording
+// is on unless the settings say otherwise.
+async function callPageHooks(tabId, settings, frameId) {
+  const run = (target, timeoutMs) => {
+    const call = chrome.scripting
+      .executeScript({
+        target,
+        world: "MAIN",
+        injectImmediately: true,
+        func: installPageHooks,
+        args: [{ recording: true, ...settings }],
+      })
+      .catch(() => null);
+    return Promise.race([call, sleep(timeoutMs).then(() => null)]);
+  };
+  let results = frameId === undefined ? await run({ tabId, allFrames: true }, PAGE_HOOKS_TIMEOUT_MS) : null;
+  results ??= await run({ tabId, frameIds: [frameId ?? 0] }, frameId === undefined ? 1000 : PAGE_HOOKS_TIMEOUT_MS);
+  if (!results) return null;
+  if (settings?.answerUntil > 0) hookedTabs.add(tabId);
+  const records = results.map((res) => res?.result).filter(Boolean);
+  if (!records.length) return null;
+  if (settings?.read === "logs") {
+    return { logs: records.flatMap((r) => r.logs || []).sort((a, b) => a.timestamp - b.timestamp) };
+  }
+  return {
+    dialogs: records.flatMap((r) => r.dialogs || []),
+    dropped: records.reduce((sum, r) => sum + (r.dropped || 0), 0),
+  };
 }
 
 // A tab Claude no longer controls (released, or dragged out of Claude's
@@ -507,10 +559,12 @@ async function callPageHooks(tabId, settings, frameId = 0) {
 // Callers only release tabs Claude could use until now (hooked or
 // controlled), so the user's other tabs aren't touched. Not just hookedTabs:
 // that's in memory, and a page keeps its hooks across an extension reload.
+// The page also stops recording, and forgets what it recorded: if the tab
+// is shared again, Claude sees only what happens from then on.
 function releasePage(tabId) {
   hookedTabs.delete(tabId);
   setGlow(tabId, "remove");
-  callPageHooks(tabId, { answerUntil: 0, nextAnswer: null });
+  callPageHooks(tabId, { answerUntil: 0, nextAnswer: null, recording: false, forget: true });
 }
 
 // A tab joined or left a group (dragged by the user, or moved by the
@@ -539,7 +593,7 @@ chrome.tabs.onMoved.addListener((tabId) => reconsiderTab(tabId));
 function describeDialogs(dialogs, dropped = 0) {
   if (!dialogs.length && !dropped) return null;
   const lines = dialogs.map((d) => {
-    const msg = d.message ? ` "${d.message}"` : "";
+    const msg = d.message ? ` "${redactString(d.message)}"` : "";
     return d.answer === "left open for the user"
       ? `- ${d.type}${msg}: shown to the user (it opened while you weren't working in this tab); the page is paused until they answer it`
       : `- ${d.type}${msg}: answered ${d.answer} automatically`;
@@ -595,7 +649,25 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 // scale 1 keeps image pixels equal to CSS pixels, so coordinates read off a
 // screenshot match the ones clicks use, even on HiDPI screens.
 // rect (optional) is a region in page coordinates, i.e. including scroll offset.
-async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
+// Screenshots of a window take turns: another session could otherwise make
+// its own tab the active one between this one's activating and capturing.
+const windowQueues = new Map(); // windowId -> the last screenshot queued there
+
+function inWindowQueue(windowId, task) {
+  const run = (windowQueues.get(windowId) || Promise.resolve()).catch(() => {}).then(task);
+  windowQueues.set(windowId, run);
+  run.finally(() => {
+    if (windowQueues.get(windowId) === run) windowQueues.delete(windowId);
+  }).catch(() => {});
+  return run;
+}
+
+async function takeScreenshot(tabId, options = {}) {
+  const { windowId } = await chrome.tabs.get(tabId);
+  return inWindowQueue(windowId, () => takeScreenshotNow(tabId, options));
+}
+
+async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
   const tab = await chrome.tabs.get(tabId);
 
   // Activate the tab so captureVisibleTab captures the right content
@@ -605,6 +677,15 @@ async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
   }
 
   const capture = async (quality) => {
+    // Still this tab? The user can switch tabs too: then make it active again,
+    // once.
+    if (!(await chrome.tabs.get(tabId)).active) {
+      await chrome.tabs.update(tabId, { active: true });
+      await sleep(100);
+      if (!(await chrome.tabs.get(tabId)).active) {
+        throw new Error("another tab kept becoming the active one in this window; try again");
+      }
+    }
     const options = { format: "jpeg", quality, scale };
     if (rect) options.rect = rect;
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, options);
@@ -612,11 +693,12 @@ async function takeScreenshot(tabId, { rect, scale = 1 } = {}) {
   };
 
   // Keep the glow out of the picture, until the last of any overlapping
-  // screenshots of this tab is done.
+  // screenshots of this tab is done. A busy page can't answer; it's not
+  // waited for long.
   capturing.set(tabId, (capturing.get(tabId) || 0) + 1);
   let base64;
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }).catch(() => {});
+    await Promise.race([chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }).catch(() => {}), sleep(1000)]);
     base64 = await capture(55);
     if (base64.length > 500000) base64 = await capture(30);
   } finally {
@@ -820,7 +902,7 @@ const toolHandlers = {
     return textResult(text);
   },
 
-  async computer(args, { kind }) {
+  async computer(args, { kind }, request) {
     const { action, tabId } = args;
 
     // A ref is turned into a point on screen. The element is scrolled into
@@ -846,12 +928,16 @@ const toolHandlers = {
         const { base64, imageId } = await takeScreenshot(tabId);
         let dims = "";
         try {
-          const vpResult = await chrome.scripting.executeScript({
-            target: { tabId },
-            world: "MAIN",
-            func: () => window.innerWidth + "x" + window.innerHeight,
-          });
-          if (vpResult[0]?.result) dims = vpResult[0].result;
+          // A busy page can't answer; the size is only a detail.
+          const vpResult = await Promise.race([
+            chrome.scripting.executeScript({
+              target: { tabId },
+              world: "MAIN",
+              func: () => window.innerWidth + "x" + window.innerHeight,
+            }),
+            sleep(1000).then(() => null),
+          ]);
+          if (vpResult?.[0]?.result) dims = vpResult[0].result;
         } catch {}
         return {
           content: [
@@ -897,10 +983,19 @@ const toolHandlers = {
           return textResult("text is required for type action");
         let inserted = 0;
         let typed = 0;
-        for (const char of args.text) {
+        const chars = [...args.text];
+        for (const char of chars) {
           // The user can take the tab back mid-way; stop typing into it then.
           if (!isControlledNow(tabId)) {
             return textResult(`Stopped after ${typed} characters: the user took this tab back.`);
+          }
+          // Typing goes key by key; a long text would outlast the tool call.
+          if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
+            await sendContentMessage(tabId, { type: "endTyping" });
+            const rest = chars.slice(typed).join("");
+            return textResult(
+              `Typed the first ${typed} of ${chars.length} characters; stopped there, since typing all of it would take longer than a tool call may. Type the rest with another call: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
+            );
           }
           const resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) });
           typed++;
@@ -924,9 +1019,16 @@ const toolHandlers = {
           return textResult("text is required for key action");
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
+        let pressed = 0;
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
             if (!isControlledNow(tabId)) return textResult("Stopped: the user took this tab back.");
+            if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
+              return textResult(
+                `Pressed ${pressed} of ${repeat * keys.length} keys; stopped there, since all of them would take longer than a tool call may.`
+              );
+            }
+            pressed++;
             const { key, code, keyCode, modifiers: keyMod } = parseKeyCombo(keyStr);
             await sendContentMessage(tabId, {
               type: "dispatchKeyEvent", eventType: "keyDown",
@@ -1154,7 +1256,8 @@ const toolHandlers = {
     }
 
     const text = msgs
-      .map((m) => `[${m.level}] ${m.text}${m.url ? ` (${m.url})` : ""}`)
+      // Credentials are hidden as in javascript_tool's results.
+      .map((m) => `[${m.level}] ${redactString(m.text)}${m.url ? ` (${redactTokens(m.url)})` : ""}`)
       .join("\n");
 
     return textResult(`Console messages (${msgs.length}):\n${text}`);
@@ -1182,7 +1285,7 @@ const toolHandlers = {
     const text = reqs
       .map(
         (r) =>
-          `${r.method} ${r.url} ${r.status ? `→ ${r.status}` : "(pending)"}${r.mimeType ? ` [${r.mimeType}]` : ""}`
+          `${r.method} ${redactTokens(r.url)} ${r.status ? `→ ${r.status}` : "(pending)"}${r.mimeType ? ` [${r.mimeType}]` : ""}`
       )
       .join("\n");
 
@@ -1254,44 +1357,169 @@ const PAGE_TOOLS = new Set([
 ]);
 
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args, serverVersion) {
+// The MCP server gives up on a call after 60 s. A tool here stops a little
+// before, so that its answer, and the cleanup after it, still arrive.
+const TOOL_DEADLINE_MS = 55000;
+const TYPING_MARGIN_MS = 3000; // type and key stop this long before the deadline
+
+async function handleToolRequest(id, tool, args, serverVersion, resent) {
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
     return;
   }
+  await stateReady;
 
+  // A request the server sent again after the connection dropped (see
+  // "Not running a request twice"). Only those are looked up: servers
+  // before 2.0.1 start their ids over when they restart.
+  const journaled = !isRepeatable(tool, args);
+  if (journaled) {
+    if (resent && runningRequests.has(id)) return; // still running here: that run answers
+    const seen = resent ? journal.get(id) : undefined;
+    if (seen) {
+      answerFromJournal(id, tool, args, seen);
+      return;
+    }
+    journal.set(id, { tool, state: "started", at: Date.now() });
+    await saveJournal();
+  }
+
+  runningRequests.add(id);
+  toolCallsRunning++;
+  let outcome;
+  try {
+    outcome = { result: await runTool(tool, handler, args, serverVersion) };
+  } catch (err) {
+    outcome = { error: `${tool} failed: ${withPermissionHelp(err.message)}` };
+  } finally {
+    runningRequests.delete(id);
+    toolCallsRunning--;
+  }
+  if (journaled) {
+    const kept = JSON.stringify(outcome).length <= JOURNAL_RESULT_MAX ? outcome : {};
+    journal.set(id, { tool, state: "done", at: Date.now(), ...kept });
+    await saveJournal();
+  }
+  if (outcome.error) sendError(id, outcome.error);
+  else sendResponse(id, outcome.result);
+  reloadIfIdle();
+}
+
+async function runTool(tool, handler, args, serverVersion) {
+  const request = { serverVersion, deadline: Date.now() + TOOL_DEADLINE_MS };
   let finish = null;
   try {
-    await stateReady;
     let control = null;
     if (TAB_TOOLS.has(tool)) {
       control = await tabControl(args.tabId);
       if (!control.tab) {
-        sendResponse(id, textResult(`Tab ${args.tabId} doesn't exist anymore. Use tabs_context_mcp to see the tabs you can use.`));
-        return;
+        return textResult(`Tab ${args.tabId} doesn't exist anymore. Use tabs_context_mcp to see the tabs you can use.`);
       }
       if (!control.kind) {
-        sendResponse(id, textResult(
+        return textResult(
           `Tab ${args.tabId} isn't in Claude's tab group and the user hasn't shared it. Use tabs_context_mcp to see the tabs you can use, or tabs_request_access to ask the user to share one of theirs.`
-        ));
-        return;
+        );
       }
       // A tab can still show an extension page (dragged into the group, or
       // opened by the user): only navigating away is allowed there.
       if (PAGE_TOOLS.has(tool) && tool !== "navigate" && /^moz-extension:/i.test(control.tab.url || "")) {
-        sendResponse(id, textResult(`Tab ${args.tabId} shows an extension page, which Claude can't use. Navigate it to a web page first.`));
-        return;
+        return textResult(`Tab ${args.tabId} shows an extension page, which Claude can't use. Navigate it to a web page first.`);
       }
       if (PAGE_TOOLS.has(tool)) finish = await startPageWork(args.tabId, control.kind);
     }
-    let result = await handler(args, control, { serverVersion });
-    if (finish) result = await finish(result);
-    sendResponse(id, result);
-  } catch (err) {
+    // A tool that's still going at the deadline is answered for anyway; its
+    // messages to the page expire with it (see sendContentMessage).
+    let timer;
+    const overtime = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(
+        `it was still running after ${TOOL_DEADLINE_MS / 1000} s. It may have been done partly or fully: check whether it took effect before repeating it, and ask the user if you can't tell.`
+      )), Math.max(0, request.deadline - Date.now()));
+    });
+    let result;
+    try {
+      result = await Promise.race([handler(args, control, request), overtime]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (finish) {
+      const done = finish;
+      finish = null;
+      result = await done(result);
+    }
+    return result;
+  } finally {
     if (finish) await finish(null).catch(() => {});
-    sendError(id, `${tool} failed: ${withPermissionHelp(err.message)}`);
   }
+}
+
+// --- Not running a request twice ---
+// When the connection to the MCP server drops mid-call (Firefox restarting
+// the extension, say), the server sends the call again once the extension is
+// back. Tools that only read, or that end in the same state however often
+// they run, simply run again. Any other is recorded in storage.local when it
+// starts and when it's done, so a resent one isn't repeated: one that
+// finished gets its result again, one still running here answers once, and
+// one an extension restart cut short is reported as unknown, for Claude to
+// check whether it happened, and to ask the user if it can't tell.
+const REPEATABLE_TOOLS = new Set([
+  "tabs_context_mcp", "read_page", "get_page_text", "find", "read_console_messages",
+  "read_network_requests", "resize_window", "handle_dialog", "update_plan",
+  "upload_image", "gif_creator", "shortcuts_list", "shortcuts_execute", "switch_browser",
+]);
+const REPEATABLE_ACTIONS = new Set(["screenshot", "zoom", "wait", "hover", "scroll_to"]);
+const JOURNAL_STORAGE_KEY = "requestJournal";
+const JOURNAL_KEEP_MS = 10 * 60 * 1000; // a resent request comes within seconds
+const JOURNAL_RESULT_MAX = 50000; // characters; a larger result isn't kept
+const journal = new Map(); // request id -> { tool, state: "started" | "done", at, result?, error? }
+const runningRequests = new Set();
+
+function isRepeatable(tool, args) {
+  return REPEATABLE_TOOLS.has(tool) || (tool === "computer" && REPEATABLE_ACTIONS.has(args.action));
+}
+
+async function saveJournal() {
+  const now = Date.now();
+  for (const [id, entry] of journal) if (now - entry.at > JOURNAL_KEEP_MS) journal.delete(id);
+  try {
+    await chrome.storage.local.set({ [JOURNAL_STORAGE_KEY]: [...journal] });
+  } catch {}
+}
+
+function answerFromJournal(id, tool, args, seen) {
+  const what = tool === "computer" && args.action ? `${tool} ${args.action}` : tool;
+  if (seen.state === "started") {
+    sendError(
+      id,
+      `The browser extension restarted while this ${what} was running, so it may have been done fully, partly or not at all. Before repeating it, check whether it took effect (a screenshot, read_page or get_page_text): if it did, don't repeat it; if it didn't, run it again. If you still can't tell, ask the user.`
+    );
+  } else if (seen.error) {
+    sendError(id, seen.error);
+  } else if (seen.result) {
+    sendResponse(id, seen.result);
+  } else {
+    sendResponse(id, textResult(`This ${what} already ran before the connection to Claude dropped, so it wasn't run again. Its result was too large to keep; check the page for it.`));
+  }
+}
+
+// --- Updates ---
+// Firefox would reload the extension as soon as an update is downloaded,
+// even in the middle of a tool call. With this listener it waits, and the
+// update is applied when no tool call is running.
+let updateWaiting = false;
+let toolCallsRunning = 0;
+
+chrome.runtime.onUpdateAvailable.addListener(() => {
+  updateWaiting = true;
+  reloadIfIdle();
+});
+
+function reloadIfIdle() {
+  if (!updateWaiting || toolCallsRunning > 0) return;
+  // A moment later, in case Claude goes on with its next call right away.
+  setTimeout(() => {
+    if (toolCallsRunning === 0) chrome.runtime.reload();
+  }, 3000);
 }
 
 // --- javascript_tool ---
@@ -1479,6 +1707,15 @@ function formatJavascriptOutcome(outcome) {
 const SHARE_PAGE = "share.html";
 const SHARE_WAIT_MS = 50000; // the tool call itself times out at 60s
 const shareRequests = new Map(); // requestId -> { reason, query, windowId, settle }
+// Open requests are also kept in storage.session, so the user's answer still
+// counts if Firefox suspends this background script while they decide (the
+// tool call has been answered with "pending" by then).
+const SHARE_REQUESTS_STORAGE_KEY = "shareRequests";
+
+function saveShareRequests() {
+  const open = [...shareRequests].map(([id, { reason, query, windowId }]) => [id, { reason, query, windowId }]);
+  return chrome.storage.session.set({ [SHARE_REQUESTS_STORAGE_KEY]: open }).catch(() => {});
+}
 
 // Moves tabs into Claude's group, in its window; with no group yet, the
 // first tab starts a new Claude window. They're Claude's own tabs afterwards.
@@ -1488,27 +1725,38 @@ function moveTabsToClaude(tabIds) {
 }
 
 async function moveTabsToClaudeNow(tabIds) {
-  for (const id of tabIds) {
-    const tab = await chrome.tabs.get(id);
-    if (tab.pinned) await chrome.tabs.update(id, { pinned: false }); // pinned tabs can't be grouped
-  }
   let group = await findClaudeGroup();
   // Remember where each tab was, for "Move Tab Out of Claude's Group"; that
-  // can be Claude's own window, outside the group.
+  // can be Claude's own window, outside the group. A pinned tab is pinned
+  // again when it goes back.
+  const pinned = [];
   for (const id of tabIds) {
     const tab = await chrome.tabs.get(id);
-    tabOrigins.set(id, { windowId: tab.windowId, index: tab.index });
+    tabOrigins.set(id, { windowId: tab.windowId, index: tab.index, pinned: tab.pinned });
+    if (tab.pinned) pinned.push(id);
   }
   await saveTabOrigins();
-  if (group) {
-    await chrome.tabs.move(tabIds, { windowId: group.windowId, index: -1 });
-    await chrome.tabs.group({ groupId: group.id, tabIds });
-  } else {
-    const win = await chrome.windows.create({ tabId: tabIds[0] });
-    if (tabIds.length > 1) await chrome.tabs.move(tabIds.slice(1), { windowId: win.id, index: -1 });
-    const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: win.id } });
-    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
-    await rememberGroup(groupId);
+  try {
+    for (const id of pinned) await chrome.tabs.update(id, { pinned: false }); // pinned tabs can't be grouped
+    if (group) {
+      await chrome.tabs.move(tabIds, { windowId: group.windowId, index: -1 });
+      await chrome.tabs.group({ groupId: group.id, tabIds });
+    } else {
+      const win = await chrome.windows.create({ tabId: tabIds[0] });
+      if (tabIds.length > 1) await chrome.tabs.move(tabIds.slice(1), { windowId: win.id, index: -1 });
+      const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: win.id } });
+      await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
+      await rememberGroup(groupId);
+    }
+  } catch (err) {
+    // E.g. a private window's tab and Claude's group in a normal window:
+    // leave the tabs as they were.
+    for (const id of tabIds) {
+      tabOrigins.delete(id);
+      if (pinned.includes(id)) await chrome.tabs.update(id, { pinned: true }).catch(() => {});
+    }
+    await saveTabOrigins();
+    throw err;
   }
   for (const id of tabIds) sharedTabs.delete(id);
   await saveSharedTabs();
@@ -1600,6 +1848,12 @@ async function moveTabsToUser(tabIds) {
     // Dropped between two tabs of a group, a tab joins that group; it's
     // meant to be on its own.
     if ((await chrome.tabs.get(id)).groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) await chrome.tabs.ungroup([id]);
+    // Pinned again if it was, back at its place among the pinned tabs when
+    // it's home (pinning puts it after them).
+    if (origin?.pinned) {
+      await chrome.tabs.update(id, { pinned: true });
+      if (origin.windowId === windowId) await chrome.tabs.move(id, { index: origin.index }).catch(() => {});
+    }
     tabOrigins.delete(id);
     focusWindowId ??= windowId;
   }
@@ -1623,15 +1877,22 @@ async function requestTabAccess({ reason, query }) {
   let settle;
   const decided = new Promise((resolve) => (settle = resolve));
   shareRequests.set(requestId, { reason: reason || "", query: query || "", windowId: null, settle });
-  const win = await chrome.windows.create({
-    url: chrome.runtime.getURL(`${SHARE_PAGE}#${requestId}`),
-    type: "popup",
-    width: 560,
-    height: 640,
-    focused: true,
-  });
+  let win;
+  try {
+    win = await chrome.windows.create({
+      url: chrome.runtime.getURL(`${SHARE_PAGE}#${requestId}`),
+      type: "popup",
+      width: 560,
+      height: 640,
+      focused: true,
+    });
+  } catch (err) {
+    shareRequests.delete(requestId);
+    throw err;
+  }
   const open = shareRequests.get(requestId);
   if (open) open.windowId = win.id;
+  await saveShareRequests();
   // The window stays open after this times out, and an answer given later
   // still shares the tabs.
   return Promise.race([decided, sleep(SHARE_WAIT_MS).then(() => ({ pending: true }))]);
@@ -1641,11 +1902,13 @@ function finishShareRequest(requestId, outcome) {
   const request = shareRequests.get(requestId);
   if (!request) return;
   shareRequests.delete(requestId);
+  saveShareRequests();
   request.settle(outcome);
   if (request.windowId !== null) chrome.windows.remove(request.windowId).catch(() => {});
 }
 
-chrome.windows.onRemoved.addListener((windowId) => {
+chrome.windows.onRemoved.addListener(async (windowId) => {
+  await stateReady;
   for (const [requestId, request] of shareRequests) {
     if (request.windowId === windowId) finishShareRequest(requestId, { declined: true });
   }
@@ -1690,18 +1953,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // "Stop Sharing" on one of Claude's own tabs takes it straight back.
 // Items apply to all selected tabs when the clicked one is part of a
 // selection, to those tabs the item fits.
-function createMenus() {
-  chrome.menus.removeAll().then(() => {
-    chrome.menus.create({ id: "share-tab", title: "Share Tab with Claude", contexts: ["tab"] });
-    chrome.menus.create({ id: "unshare-tab", title: "Stop Sharing Tab with Claude", contexts: ["tab"], visible: false });
-    chrome.menus.create({ id: "handover-tab", title: "Move Tab to Claude's Window", contexts: ["tab"] });
-    chrome.menus.create({ id: "return-tab", title: "Move Tab Out of Claude's Group", contexts: ["tab"], visible: false });
-  });
+// The items are made again each time this background script starts, which
+// can be the right-click that onShown answers: it waits for them.
+async function createMenus() {
+  await chrome.menus.removeAll();
+  chrome.menus.create({ id: "share-tab", title: "Share Tab with Claude", contexts: ["tab"] });
+  chrome.menus.create({ id: "unshare-tab", title: "Stop Sharing Tab with Claude", contexts: ["tab"], visible: false });
+  chrome.menus.create({ id: "handover-tab", title: "Move Tab to Claude's Window", contexts: ["tab"] });
+  chrome.menus.create({ id: "return-tab", title: "Move Tab Out of Claude's Group", contexts: ["tab"], visible: false });
 }
-createMenus();
+const menusReady = createMenus().catch(() => {});
 
 chrome.menus.onShown.addListener(async (info, tab) => {
   if (!info.contexts.includes("tab") || !tab) return;
+  await menusReady;
   await stateReady;
   const { kind } = await tabControl(tab.id);
   const shareable = isShareableUrl(tab.url);
@@ -1800,8 +2065,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // --- Init ---
 
 // The format of what's kept in storage.local: claudeGroupId (number),
-// tabOrigins ([tabId, { windowId, index }] pairs) and lastUserWindowId
-// (number). Bump it when that changes. Data in any other format is
+// tabOrigins ([tabId, { windowId, index, pinned? }] pairs), lastUserWindowId
+// (number) and requestJournal ([requestId, { tool, state, at, result?,
+// error? }] pairs). Bump it when that changes. Data in any other format is
 // discarded rather than migrated: all of it rebuilds itself (the group is
 // found by name, a tab without a home goes to the last-used window). That
 // includes 1.1.x's mcpWindowId: its window isn't adopted, because after a
@@ -1832,6 +2098,12 @@ async function restoreState() {
     for (const id of shared) sharedTabs.add(id);
   } catch {}
   try {
+    // Share requests still open: the tool call that asked was answered
+    // before this background script was suspended.
+    const { [SHARE_REQUESTS_STORAGE_KEY]: open = [] } = await chrome.storage.session.get(SHARE_REQUESTS_STORAGE_KEY);
+    for (const [id, request] of open) shareRequests.set(id, { ...request, settle: () => {} });
+  } catch {}
+  try {
     const stored = await chrome.storage.local.get([ORIGINS_STORAGE_KEY, LAST_WINDOW_STORAGE_KEY]);
     for (const [id, origin] of stored[ORIGINS_STORAGE_KEY] || []) tabOrigins.set(id, origin);
     if (typeof stored[LAST_WINDOW_STORAGE_KEY] === "number") lastUserWindowId ??= stored[LAST_WINDOW_STORAGE_KEY];
@@ -1839,6 +2111,10 @@ async function restoreState() {
   try {
     const stored = await chrome.storage.local.get(GROUP_STORAGE_KEY);
     if (typeof stored[GROUP_STORAGE_KEY] === "number") claudeGroupId = stored[GROUP_STORAGE_KEY];
+  } catch {}
+  try {
+    const { [JOURNAL_STORAGE_KEY]: entries = [] } = await chrome.storage.local.get(JOURNAL_STORAGE_KEY);
+    for (const [id, entry] of entries) journal.set(id, entry);
   } catch {}
   try {
     // Check the remembered group is still Claude's, and learn its tabs.

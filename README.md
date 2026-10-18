@@ -259,13 +259,13 @@ Dragging a tab out of the group also takes it back.
 
 ### Page dialogs
 
-A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it applies while a tool is working there and for 15 seconds after; otherwise dialogs show up for you as usual. When Claude loses a tab (you stop sharing it, drag it out of the group, or rename the group), its dialogs go back to you right away. Dialogs opened by frames inside a page aren't handled.
+A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it applies while a tool is working there and for 15 seconds after; otherwise dialogs show up for you as usual. When Claude loses a tab (you stop sharing it, drag it out of the group, or rename the group), its dialogs go back to you right away. Frames inside the page are covered too, from Claude's next action after they load. A dialog still shows up as usual when it comes from a frame added since then, or from a page script that kept the browser's own `alert()` before the extension's hooks were in place.
 
 ### javascript_tool
 
 Code runs like in the browser console: the value of the last expression comes back. Top-level `await` and `return` also work.
 
-Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and string values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude, in returned values and in thrown errors alike. `read_page` likewise shows `[hidden]` for the value of password fields. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
+Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude, in returned values and in thrown errors alike. That includes name/value pairs, such as `Object.entries(localStorage)`, a `Map`, form data or `cookieStore.getAll()`, and URL parameters like `access_token=`. Console messages, dialog texts and the URLs from `read_network_requests` go through the same checks. `read_page` likewise shows `[hidden]` for the value of password fields. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
 
 A script is given 30 seconds (up to 50 with `timeout`). Firefox can't stop a script that's still running after that; the tool reports the timeout, and reloading the tab stops it.
 
@@ -290,7 +290,13 @@ The manifest sets the `extension_pages` CSP to `script-src 'self'`. This drops F
 
 ### Console monitoring
 
-Console messages, uncaught errors and unhandled promise rejections are captured by hooks in the page's own JavaScript world. The hooks go into every page loaded in a tab Claude can use, as soon as the page starts loading, so `read_console_messages` sees what the page logged from early on. A few messages from scripts that run before the hooks are in place can still be missed.
+Console messages, uncaught errors and unhandled promise rejections are captured by hooks in the page's own JavaScript world. The hooks go into every page loaded in a tab Claude can use, as soon as the page starts loading, so `read_console_messages` sees what the page logged from early on. A few messages from scripts that run before the hooks are in place can still be missed. When Claude loses the tab (you stop sharing it, say), the page stops recording and forgets what it recorded, so if you share it again, Claude only sees what happens from then on.
+
+### Interrupted calls
+
+If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again once the extension is back. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
+
+The extension updates itself, but waits until no tool is running, so an update doesn't cut an action short. A tool that runs into the 60-second limit (a page busy with a script, a very long text to type) stops a little before, says how far it got, and doesn't act on the page afterwards.
 
 ## Updating After Code Changes
 

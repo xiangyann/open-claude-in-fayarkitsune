@@ -5,28 +5,49 @@
 // boundary, since a script can still send them wherever the page can.
 
 const SECRET_NAME_WORDS = new Set([
-  "password", "passwd", "passphrase", "pwd", "secret", "token", "cookie", "cookies",
-  "credential", "credentials", "auth", "authorization", "bearer", "jwt", "csrf", "xsrf",
-  "session", "sessionid", "sid", "apikey", "otp",
+  "password", "passwords", "passwd", "passphrase", "pwd", "secret", "secrets",
+  "token", "tokens", "cookie", "cookies", "credential", "credentials", "auth",
+  "authorization", "bearer", "jwt", "csrf", "xsrf", "session", "sessionid", "sid",
+  "apikey", "apikeys", "otp",
   // Common session and anti-forgery cookie names, written as one word.
   "sessid", "phpsessid", "jsessionid", "csrftoken", "xsrftoken",
 ]);
 const SECRET_NAME_PAIRS = [
   ["api", "key"], ["private", "key"], ["access", "key"], ["secret", "key"],
+  ["api", "keys"], ["private", "keys"], ["access", "keys"], ["secret", "keys"],
   ["client", "secret"], ["refresh", "token"],
 ];
+// A number under a secret name is only hidden when it isn't about the
+// secret: tokenCount or sessionTimeout are not secrets, sessionId or otp are.
+const COUNTING_WORDS = new Set([
+  "count", "length", "size", "total", "index", "max", "min", "limit", "ttl", "age",
+  "timeout", "expires", "expiry", "at", "time", "version",
+]);
+
+function nameWords(name) {
+  return String(name)
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
 
 // Whether a property name says its value is a secret. Names are compared
 // word by word ("sessionToken" -> session, token), so "author" or
 // "tokenizer" don't count.
 function isSecretName(name) {
-  const words = String(name)
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
+  const words = nameWords(name);
   if (words.some((w) => SECRET_NAME_WORDS.has(w))) return true;
   return SECRET_NAME_PAIRS.some(([a, b]) => words.some((w, i) => w === a && words[i + 1] === b));
+}
+
+// Whether the value stored under `name` is to be hidden: a non-empty string,
+// or a number that isn't a count or a time.
+function isSecretValue(name, value) {
+  if (!isSecretName(name)) return false;
+  if (typeof value === "string") return value !== "";
+  if (typeof value !== "number") return false;
+  return !COUNTING_WORDS.has(nameWords(name).pop());
 }
 
 // A cookie name is an HTTP token; a value has no spaces, quotes, commas,
@@ -40,14 +61,19 @@ const BEARER_ANYWHERE = /\b(Bearer)\s+[A-Za-z0-9\-._~+/]{12,}=*/gi;
 const LOOSE_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[^;]*$/;
 
 // The whole string is a Cookie header / document.cookie: "a=1; b=2". With
-// two or more pairs, values may be anything; a single pair has to look like
+// two or more pairs, values may be anything. A single pair has to look like
 // a real cookie value, so text like "width=device-width, initial-scale=1"
-// isn't taken for one.
+// isn't taken for one, and like a secret one: a session-like name or a
+// token-length value, so "q=foo" or "#tab=settings" stay readable.
 function looksLikeCookieString(s) {
   const parts = s.split(";").map((p) => p.trim());
   if (parts[parts.length - 1] === "") parts.pop();
   if (parts.length === 0) return false;
-  if (parts.length === 1) return COOKIE_PAIR.test(parts[0]);
+  if (parts.length === 1) {
+    if (!COOKIE_PAIR.test(parts[0])) return false;
+    const [name, value] = [parts[0].slice(0, parts[0].indexOf("=")), parts[0].slice(parts[0].indexOf("=") + 1)];
+    return isSecretName(name) || value.length >= 16;
+  }
   return parts.every((p) => LOOSE_COOKIE_PAIR.test(p));
 }
 
@@ -72,24 +98,51 @@ function redactErrorText(text) {
   return named ? `${named[1]}: ${redactString(named[2])}` : redactString(String(text));
 }
 
-// Tokens embedded in longer text, e.g. a page's HTML.
+// "name": "value" and "name": 123 in JSON that didn't parse (cut short, or
+// inside other text): the value may run to the end of the text.
+const JSON_STRING_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)"((?:[^"\\]|\\.)*)(?:"|$)/g;
+const JSON_NUMBER_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)(-?\d+(?:\.\d+)?)(?![\d.])/g;
+// name=value in a URL's query or fragment.
+const URL_PARAM = /([?&#])([^=&#\s"'<>]{1,200})=([^&#\s"'<>]+)/g;
+
+// Secrets embedded in longer text, e.g. a page's HTML, a console message, a
+// URL, or JSON too long to have reached here whole.
 function redactTokens(s) {
   return String(s)
     .replace(JWT_ANYWHERE, "[hidden: token]")
-    .replace(BEARER_ANYWHERE, "$1 [hidden: token]");
+    .replace(BEARER_ANYWHERE, "$1 [hidden: token]")
+    .replace(JSON_STRING_PAIR, (pair, name, colon, value) =>
+      isSecretValue(name, value) ? `"${name}"${colon}"[hidden: value of ${name}]"` : pair
+    )
+    .replace(JSON_NUMBER_PAIR, (pair, name, colon, number) =>
+      isSecretValue(name, Number(number)) ? `"${name}"${colon}"[hidden: value of ${name}]"` : pair
+    )
+    .replace(URL_PARAM, (pair, sep, name) => (isSecretName(name) ? `${sep}${name}=[hidden]` : pair));
+}
+
+function hidden(name) {
+  return `[hidden: value of "${name}"]`;
 }
 
 function redactValue(value, depth = 0) {
   if (typeof value === "string") return redactString(value);
   if (!value || typeof value !== "object" || depth > 32) return value;
-  if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1));
+  if (Array.isArray(value)) {
+    // A [name, value] pair, as from Object.entries(localStorage), a Map,
+    // FormData or a split cookie string.
+    if (value.length === 2 && typeof value[0] === "string" && isSecretValue(value[0], value[1])) {
+      return [value[0], hidden(value[0])];
+    }
+    return value.map((item) => redactValue(item, depth + 1));
+  }
+  // { name: "sessionid", value: "…" }, as from cookieStore.getAll().
+  const label = typeof value.name === "string" ? value.name : typeof value.key === "string" ? value.key : null;
   const out = {};
   for (const [name, item] of Object.entries(value)) {
     // Hide the secret itself; objects under such names are searched instead,
     // so { session: { user, token } } still shows the user.
-    const secret = isSecretName(name) &&
-      ((typeof item === "string" && item !== "") || typeof item === "number");
-    out[name] = secret ? `[hidden: value of "${name}"]` : redactValue(item, depth + 1);
+    const secret = isSecretValue(name, item) || (name === "value" && label !== null && isSecretValue(label, item));
+    out[name] = secret ? hidden(name === "value" ? label : name) : redactValue(item, depth + 1);
   }
   return out;
 }
