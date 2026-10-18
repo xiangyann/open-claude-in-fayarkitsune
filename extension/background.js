@@ -15,6 +15,10 @@ const SERVER_URL = "ws://127.0.0.1:18765";
 let serverSocket = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
+// Tells this browser (Firefox profile) apart from others connecting to the
+// server; random, kept in storage.local.
+let browserId = null;
+const BROWSER_ID_STORAGE_KEY = "browserId";
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp, requestId}]
 const screenshotStore = new Map(); // imageId -> base64
 
@@ -23,6 +27,10 @@ chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
     if (!serverSocket) connectToServer();
+    // The request journal doesn't keep what a call did longer than needed.
+    stateReady.then(() => {
+      if (pruneJournal()) saveJournal();
+    });
   }
 });
 
@@ -39,6 +47,13 @@ function connectToServer() {
   serverSocket = ws;
 
   ws.onopen = () => {
+    // Says which browser (Firefox profile) this is: the server only resends
+    // a request to the browser it first went to.
+    stateReady.then(() => {
+      if (serverSocket === ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "extension_hello", browserId, version: EXTENSION_VERSION }));
+      }
+    });
     // Servers from 2.0.0 on say their version right away; one that hasn't
     // within a moment is older. The retry delay starts over only then: a
     // server that refuses this browser (another one is connected) closes the
@@ -62,6 +77,8 @@ function connectToServer() {
     }
     if (msg.type === "tool_request" && msg.id) {
       handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion, msg.resent === true);
+    } else if (msg.type === "tool_cancel" && msg.id) {
+      cancelRequest(msg.id);
     } else if (msg.type === "server_hello") {
       server.version = String(msg.version || "");
       server.settled = true;
@@ -126,12 +143,24 @@ function postToServer(msg) {
   }
 }
 
+// Every answer goes through the checks for secrets in text (lib/redact.js):
+// tokens in the URLs tabs_context_mcp, navigate, read_page or get_page_text
+// show, a dialog's default text, … javascript_tool's results get more (see
+// formatJavascriptOutcome).
 function sendResponse(id, result) {
-  postToServer({ id, type: "tool_response", result });
+  postToServer({ id, type: "tool_response", result: redactResult(result) });
+}
+
+function redactResult(result) {
+  if (!Array.isArray(result?.content)) return result;
+  return {
+    ...result,
+    content: result.content.map((item) => (item?.type === "text" ? { ...item, text: redactTokens(item.text) } : item)),
+  };
 }
 
 function sendError(id, error) {
-  postToServer({ id, type: "tool_error", error: String(error) });
+  postToServer({ id, type: "tool_error", error: redactTokens(String(error)) });
 }
 
 function textResult(text) {
@@ -375,6 +404,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 // Clean up when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   networkRequests.delete(tabId);
+  if (startedTabs.delete(tabId)) saveStartedTabs();
   pageOrigins.delete(tabId);
   lastWorkAt.delete(tabId);
   hookedTabs.delete(tabId);
@@ -461,6 +491,11 @@ chrome.webRequest.onErrorOccurred.addListener(
 // failed.
 const CONTENT_TIMEOUT_MS = 20000;
 
+// One step of a tool (a key, say) gets no more time than its call has left.
+function stepTimeout(request) {
+  return Math.max(3000, Math.min(CONTENT_TIMEOUT_MS, request.deadline - Date.now()));
+}
+
 async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   const send = async () => {
@@ -528,7 +563,30 @@ const PAGE_HOOKS_TIMEOUT_MS = 3000;
 // a script doesn't hold up the page's: then the page alone is asked again.
 // Every caller but releasePage acts on a tab Claude controls, so recording
 // is on unless the settings say otherwise.
+// The first call for a tab since Claude started using it also makes the page
+// forget what it recorded before: while it wasn't shared, or before an
+// extension update or reload ended the sharing without telling the page.
+// Those tabs are kept in storage.session, which lasts as long as sharing does.
+const STARTED_STORAGE_KEY = "startedTabIds";
+const startedTabs = new Set();
+
+function saveStartedTabs() {
+  chrome.storage.session.set({ [STARTED_STORAGE_KEY]: [...startedTabs] }).catch(() => {});
+}
+
 async function callPageHooks(tabId, settings, frameId) {
+  const releasing = settings?.recording === false;
+  // Taken back meanwhile (a tool's last call can come after that): the page
+  // must not start recording again.
+  if (!releasing && !isControlledNow(tabId)) return null;
+  const starting = !releasing && !startedTabs.has(tabId);
+  if (starting) {
+    startedTabs.add(tabId);
+    saveStartedTabs();
+  } else if (releasing && startedTabs.delete(tabId)) {
+    saveStartedTabs();
+  }
+  const sent = { recording: true, ...settings, ...(starting ? { forget: true } : {}) };
   const run = (target, timeoutMs) => {
     const call = chrome.scripting
       .executeScript({
@@ -536,7 +594,7 @@ async function callPageHooks(tabId, settings, frameId) {
         world: "MAIN",
         injectImmediately: true,
         func: installPageHooks,
-        args: [{ recording: true, ...settings }],
+        args: [sent],
       })
       .catch(() => null);
     return Promise.race([call, sleep(timeoutMs).then(() => null)]);
@@ -583,8 +641,8 @@ async function reconsiderTab(tabId) {
   const { kind } = await tabControl(tabId);
   if (!kind) {
     if (couldUse) forgetTab(tabId);
-  } else if (couldUse) {
-    callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
+  } else {
+    callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind), report: false });
   }
 }
 chrome.tabs.onUpdated.addListener((tabId, info) => {
@@ -622,9 +680,14 @@ async function startPageWork(tabId, kind) {
     else workingTabs.delete(tabId);
     lastWorkAt.set(tabId, Date.now());
     // The user may have taken the tab back while the tool ran: then it stays
-    // released, and its dialogs aren't Claude's to report.
+    // released, and neither its dialogs nor what the tool found there are
+    // Claude's to see anymore.
     const now = await tabControl(tabId);
-    if (!now.kind) return result;
+    if (!now.kind) {
+      return result && textResult(
+        `The user took tab ${tabId} back while this was running, so what it found there isn't shown. Use tabs_context_mcp to see the tabs you can use.`
+      );
+    }
     setGlow(tabId, "show"); // it fades out a few seconds after the last refresh
     const after = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, now.kind) });
     const note = describeDialogs(
@@ -654,10 +717,20 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 // rect (optional) is a region in page coordinates, i.e. including scroll offset.
 // Screenshots of a window take turns: another session could otherwise make
 // its own tab the active one between this one's activating and capturing.
+// One that hangs (a page stuck in a script may not render) is given up on,
+// so the next ones still get their turn.
 const windowQueues = new Map(); // windowId -> the last screenshot queued there
+const SCREENSHOT_TIMEOUT_MS = 10000;
 
 function inWindowQueue(windowId, task) {
-  const run = (windowQueues.get(windowId) || Promise.resolve()).catch(() => {}).then(task);
+  const timed = () => {
+    let timer;
+    const late = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("the screenshot took too long: the page may be busy")), SCREENSHOT_TIMEOUT_MS);
+    });
+    return Promise.race([task(), late]).finally(() => clearTimeout(timer));
+  };
+  const run = (windowQueues.get(windowId) || Promise.resolve()).catch(() => {}).then(timed);
   windowQueues.set(windowId, run);
   run.finally(() => {
     if (windowQueues.get(windowId) === run) windowQueues.delete(windowId);
@@ -671,6 +744,11 @@ async function takeScreenshot(tabId, options = {}) {
 }
 
 async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
+  // It may have waited its turn: is the tab still Claude's to show?
+  const stillClaudes = () => {
+    if (!isControlledNow(tabId)) throw new Error("the user took this tab back");
+  };
+  stillClaudes();
   const tab = await chrome.tabs.get(tabId);
 
   // Activate the tab so captureVisibleTab captures the right content
@@ -689,6 +767,7 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
         throw new Error("another tab kept becoming the active one in this window; try again");
       }
     }
+    stillClaudes();
     const options = { format: "jpeg", quality, scale };
     if (rect) options.rect = rect;
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, options);
@@ -987,28 +1066,37 @@ const toolHandlers = {
         let inserted = 0;
         let typed = 0;
         const chars = [...args.text];
+        // Stops early, saying how far it got: the user took the tab back or
+        // cancelled the call, typing all of it would outlast the tool call,
+        // or the page stopped answering.
+        const stopped = async (why) => {
+          // Short: a page too busy to answer mustn't hide how far it got.
+          if (typed) await sendContentMessage(tabId, { type: "endTyping" }, 3000).catch(() => {});
+          const rest = chars.slice(typed).join("");
+          return textResult(
+            `Typed the first ${typed} of ${chars.length} characters, then stopped: ${why}. Not typed: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
+          );
+        };
         for (const char of chars) {
-          // The user can take the tab back mid-way; stop typing into it then.
-          if (!isControlledNow(tabId)) {
-            return textResult(`Stopped after ${typed} characters: the user took this tab back.`);
-          }
+          if (!isControlledNow(tabId)) return stopped("the user took this tab back");
+          if (request.cancelled) return stopped("the call was cancelled");
           // Typing goes key by key; a long text would outlast the tool call.
           if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
-            // Short: a page too busy to answer mustn't hide how far it got.
-            await sendContentMessage(tabId, { type: "endTyping" }, 2000).catch(() => {});
-            const rest = chars.slice(typed).join("");
-            return textResult(
-              `Typed the first ${typed} of ${chars.length} characters; stopped there, since typing all of it would take longer than a tool call may. Type the rest with another call: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
-            );
+            return stopped("typing all of it would take longer than a tool call may; type the rest with another call");
           }
-          const resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) });
+          let resp;
+          try {
+            resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) }, stepTimeout(request));
+          } catch (err) {
+            return stopped(`the page stopped responding (${err.message})`);
+          }
           typed++;
           if (resp?.inserted) inserted++;
           await sleep(10);
         }
         // Fields announce a finished edit with one change event, as when the
         // user moves on.
-        await sendContentMessage(tabId, { type: "endTyping" });
+        await sendContentMessage(tabId, { type: "endTyping" }, stepTimeout(request));
         const shown = `"${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
         if (inserted === 0) {
           return textResult(
@@ -1023,29 +1111,34 @@ const toolHandlers = {
           return textResult("text is required for key action");
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
+        const total = repeat * keys.length;
         let pressed = 0;
+        const stopped = (why) => textResult(`Pressed ${pressed} of ${total} keys, then stopped: ${why}.`);
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
-            if (!isControlledNow(tabId)) return textResult("Stopped: the user took this tab back.");
+            if (!isControlledNow(tabId)) return stopped("the user took this tab back");
+            if (request.cancelled) return stopped("the call was cancelled");
             if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
-              return textResult(
-                `Pressed ${pressed} of ${repeat * keys.length} keys; stopped there, since all of them would take longer than a tool call may.`
-              );
+              return stopped("all of them would take longer than a tool call may");
             }
-            pressed++;
             const { key, code, keyCode, modifiers: keyMod } = parseKeyCombo(keyStr);
-            await sendContentMessage(tabId, {
-              type: "dispatchKeyEvent", eventType: "keyDown",
-              key, code, keyCode, modifiers: keyMod,
-            });
-            await sendContentMessage(tabId, {
-              type: "dispatchKeyEvent", eventType: "keyUp",
-              key, code, keyCode, modifiers: keyMod,
-            });
+            try {
+              await sendContentMessage(tabId, {
+                type: "dispatchKeyEvent", eventType: "keyDown",
+                key, code, keyCode, modifiers: keyMod,
+              }, stepTimeout(request));
+              pressed++;
+              await sendContentMessage(tabId, {
+                type: "dispatchKeyEvent", eventType: "keyUp",
+                key, code, keyCode, modifiers: keyMod,
+              }, stepTimeout(request));
+            } catch (err) {
+              return stopped(`the page stopped responding (${err.message})`);
+            }
             await sleep(30);
           }
         }
-        return textResult(`Pressed ${repeat} key${repeat > 1 ? "s" : ""}: ${args.text}`);
+        return textResult(`Pressed ${total} key${total > 1 ? "s" : ""}: ${args.text}`);
       }
 
       case "scroll": {
@@ -1117,11 +1210,17 @@ const toolHandlers = {
         if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) {
           return textResult("region must be numbers with x1 > x0 and y1 > y0");
         }
-        // captureVisibleTab's rect is in page coordinates, so add the scroll offset.
-        const [{ result: view }] = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY, innerWidth: window.innerWidth }),
-        });
+        // captureVisibleTab's rect is in page coordinates, so add the scroll
+        // offset. A page busy with a script can't answer: not waited for long.
+        const offsets = await Promise.race([
+          chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY, innerWidth: window.innerWidth }),
+          }),
+          sleep(3000).then(() => null),
+        ]);
+        const view = offsets?.[0]?.result;
+        if (!view) return textResult("Error: the page didn't respond (it may be busy, e.g. with a script that's still running), so the region can't be located.");
         // The rect must be whole pixels (scroll offsets can be fractional on
         // scaled displays); round outwards so the whole region is covered.
         const left = Math.floor(view.scrollX + x0);
@@ -1311,7 +1410,9 @@ const toolHandlers = {
   async handle_dialog(args) {
     const { tabId, accept, promptText } = args;
     const nextAnswer = { accept: !!accept, promptText: promptText ?? null };
-    const res = await callPageHooks(tabId, { nextAnswer });
+    // The page itself, not its frames: an answer armed in every frame would
+    // answer a confirm in each of them.
+    const res = await callPageHooks(tabId, { nextAnswer, report: false }, 0);
     if (!res) return textResult("Error: this page can't be scripted, so its dialogs can't be handled.");
     const what = accept ? `accepted${promptText !== undefined ? ` with "${promptText}"` : ""}` : "cancelled";
     return textResult(`The next confirm or prompt on this page will be ${what}. Alerts are always acknowledged.`);
@@ -1362,7 +1463,8 @@ const PAGE_TOOLS = new Set([
 
 // --- Tool dispatch ---
 // The MCP server gives up on a call after 60 s. A tool here stops a little
-// before, so that its answer, and the cleanup after it, still arrive.
+// before, so that its answer, and the cleanup after it, still arrive. The
+// time counts from when the request arrived.
 const TOOL_DEADLINE_MS = 55000;
 const TYPING_MARGIN_MS = 3000; // type and key stop this long before the deadline
 
@@ -1372,28 +1474,35 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
     sendError(id, `Unknown tool: ${tool}`);
     return;
   }
+  // What a tool knows about its call: the server that sent it, when it must
+  // be done by, and whether the user cancelled it (see cancelRequest).
+  const request = { serverVersion, deadline: Date.now() + TOOL_DEADLINE_MS, cancelled: false };
   await stateReady;
 
   // A request the server sent again after the connection dropped (see
   // "Not running a request twice"). Only those are looked up: servers
   // before 2.0.1 start their ids over when they restart.
   const journaled = !isRepeatable(tool, args);
-  if (journaled) {
-    if (resent && runningRequests.has(id)) return; // still running here: that run answers
-    const seen = resent ? journal.get(id) : undefined;
+  if (journaled && resent) {
+    if (runningRequests.has(id)) return; // still running here: that run answers
+    const seen = journal.get(id);
     if (seen) {
       answerFromJournal(id, tool, args, seen);
       return;
     }
-    journal.set(id, { tool, state: "started", at: Date.now() });
-    await saveJournal();
   }
 
-  runningRequests.add(id);
+  // Running from here on, before anything else is awaited: an update waits
+  // for it, and a resend arriving meanwhile doesn't start it a second time.
+  runningRequests.set(id, request);
   toolCallsRunning++;
   let outcome;
   try {
-    outcome = { result: await runTool(tool, handler, args, serverVersion) };
+    if (journaled) {
+      journal.set(id, { tool, state: "started", at: Date.now() });
+      await saveJournal();
+    }
+    outcome = { result: await runTool(tool, handler, args, request) };
   } catch (err) {
     outcome = { error: `${tool} failed: ${withPermissionHelp(err.message)}` };
   } finally {
@@ -1401,8 +1510,7 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
     toolCallsRunning--;
   }
   if (journaled) {
-    const kept = JSON.stringify(outcome).length <= JOURNAL_RESULT_MAX ? outcome : {};
-    journal.set(id, { tool, state: "done", at: Date.now(), ...kept });
+    journal.set(id, { tool, state: "done", at: Date.now(), ...keptOutcome(tool, args, outcome) });
     await saveJournal();
   }
   if (outcome.error) sendError(id, outcome.error);
@@ -1410,8 +1518,14 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
   reloadIfIdle();
 }
 
-async function runTool(tool, handler, args, serverVersion) {
-  const request = { serverVersion, deadline: Date.now() + TOOL_DEADLINE_MS };
+// The user cancelled the call in Claude. Tools that go step by step (typing,
+// keys) stop before the next step; what already happened stays done.
+function cancelRequest(id) {
+  const request = runningRequests.get(id);
+  if (request) request.cancelled = true;
+}
+
+async function runTool(tool, handler, args, request) {
   let finish = null;
   try {
     let control = null;
@@ -1453,7 +1567,9 @@ async function runTool(tool, handler, args, serverVersion) {
     }
     return result;
   } finally {
-    if (finish) await finish(null).catch(() => {});
+    // Cut short (an error, or the deadline): clean up without waiting on a
+    // page that may be what held it up.
+    if (finish) finish(null).catch(() => {});
   }
 }
 
@@ -1480,16 +1596,31 @@ const JOURNAL_STORAGE_KEY = "requestJournal";
 const JOURNAL_KEEP_MS = 2 * 60 * 1000;
 const JOURNAL_RESULT_MAX = 50000; // characters; a larger result isn't kept
 const journal = new Map(); // request id -> { tool, state: "started" | "done", at, result?, error? }
-const runningRequests = new Set();
+const runningRequests = new Map(); // request id -> its request (see handleToolRequest)
 
 function isRepeatable(tool, args) {
   if (REPEATABLE_UNLESS_CLEARING.has(tool)) return !args.clear;
   return REPEATABLE_TOOLS.has(tool) || (tool === "computer" && REPEATABLE_ACTIONS.has(args.action));
 }
 
-async function saveJournal() {
+// What's kept of a finished call, to answer a resend with: not what Claude
+// typed or put in a form (a password, say), nor a result too large to keep.
+function keptOutcome(tool, args, outcome) {
+  if (tool === "form_input" || (tool === "computer" && args.action === "type")) return {};
+  return JSON.stringify(outcome).length <= JOURNAL_RESULT_MAX ? outcome : {};
+}
+
+function pruneJournal() {
   const now = Date.now();
-  for (const [id, entry] of journal) if (now - entry.at > JOURNAL_KEEP_MS) journal.delete(id);
+  let pruned = false;
+  for (const [id, entry] of journal) {
+    if (now - entry.at > JOURNAL_KEEP_MS) pruned = journal.delete(id);
+  }
+  return pruned;
+}
+
+async function saveJournal() {
+  pruneJournal();
   try {
     await chrome.storage.local.set({ [JOURNAL_STORAGE_KEY]: [...journal] });
   } catch {}
@@ -1512,7 +1643,7 @@ function answerFromJournal(id, tool, args, seen) {
   } else if (seen.result) {
     sendResponse(id, seen.result);
   } else {
-    sendResponse(id, textResult(`This ${what} already ran before the connection to Claude dropped, so it wasn't run again. Its result was too large to keep; check the page for it.`));
+    sendResponse(id, textResult(`This ${what} already ran before the connection to Claude dropped, so it wasn't run again. Its result wasn't kept; check the page for it.`));
   }
 }
 
@@ -1876,7 +2007,7 @@ async function moveTabsToUser(tabIds) {
   await chrome.windows.update(focusWindowId, { focused: true });
   // Dialogs there are answered for Claude only while it's working, as in
   // any shared tab.
-  for (const id of tabIds) callPageHooks(id, { answerUntil: dialogDeadline(id, "shared") });
+  for (const id of tabIds) callPageHooks(id, { answerUntil: dialogDeadline(id, "shared"), report: false });
 }
 
 // "Stop Sharing" on one of Claude's own tabs: it leaves the group and stays
@@ -2080,12 +2211,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // The format of what's kept in storage.local: claudeGroupId (number),
 // tabOrigins ([tabId, { windowId, index, pinned? }] pairs), lastUserWindowId
-// (number) and requestJournal ([requestId, { tool, state, at, result?,
-// error? }] pairs). Bump it when that changes. Data in any other format is
-// discarded rather than migrated: all of it rebuilds itself (the group is
-// found by name, a tab without a home goes to the last-used window). That
-// includes 1.1.x's mcpWindowId: its window isn't adopted, because after a
-// Firefox restart the id can belong to one of the user's windows.
+// (number), requestJournal ([requestId, { tool, state, at, result?,
+// error? }] pairs) and browserId (string). Bump it when that changes. Data
+// in any other format is discarded rather than migrated: all of it rebuilds
+// itself (the group is found by name, a tab without a home goes to the
+// last-used window). That includes 1.1.x's mcpWindowId: its window isn't
+// adopted, because after a Firefox restart the id can belong to one of the
+// user's windows.
 // storage.session needs no version: Firefox clears it whenever the
 // extension is updated.
 const STORAGE_VERSION = 1;
@@ -2110,6 +2242,8 @@ async function restoreState() {
     // could point at a different tab after Firefox restarts.
     const { [SHARED_STORAGE_KEY]: shared = [] } = await chrome.storage.session.get(SHARED_STORAGE_KEY);
     for (const id of shared) sharedTabs.add(id);
+    const { [STARTED_STORAGE_KEY]: started = [] } = await chrome.storage.session.get(STARTED_STORAGE_KEY);
+    for (const id of started) startedTabs.add(id);
   } catch {}
   try {
     // Share requests still open: the tool call that asked was answered
@@ -2127,8 +2261,14 @@ async function restoreState() {
     if (typeof stored[GROUP_STORAGE_KEY] === "number") claudeGroupId = stored[GROUP_STORAGE_KEY];
   } catch {}
   try {
+    const { [BROWSER_ID_STORAGE_KEY]: stored } = await chrome.storage.local.get(BROWSER_ID_STORAGE_KEY);
+    browserId = typeof stored === "string" ? stored : crypto.randomUUID();
+    if (browserId !== stored) await chrome.storage.local.set({ [BROWSER_ID_STORAGE_KEY]: browserId });
+  } catch {}
+  try {
     const { [JOURNAL_STORAGE_KEY]: entries = [] } = await chrome.storage.local.get(JOURNAL_STORAGE_KEY);
     for (const [id, entry] of entries) journal.set(id, entry);
+    if (pruneJournal()) await saveJournal(); // old entries go as soon as they can
   } catch {}
   try {
     // Check the remembered group is still Claude's, and learn its tabs.

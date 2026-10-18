@@ -68,7 +68,7 @@ const UNKNOWN_OUTCOME =
 // Primary mode: track client MCP server connections
 const clientSockets = new Map(); // clientId -> socket
 let clientIdCounter = 0;
-// Map from prefixed request ID -> { clientId, originalId, tool, args, resent }
+// Map from prefixed request ID -> { clientId, originalId, tool, args, serverVersion, conn, resends }
 const clientRequestMap = new Map();
 
 // Client mode: TCP connection to the primary
@@ -77,14 +77,33 @@ let clientBuffer = Buffer.alloc(0);
 
 // --- sendToExtension: works in both modes ---
 
-function sendToExtension(tool, args) {
+// `signal` aborts when the user cancels the call in Claude: the extension is
+// told to stop (tool_cancel), and stops what it still can.
+function sendToExtension(tool, args, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Cancelled."));
+      return;
+    }
     const id = `${REQUEST_ID_PREFIX}-${++requestIdCounter}`;
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
       reject(new Error(`Tool request timed out after 60s. ${UNKNOWN_OUTCOME}`));
     }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, resent: false });
+    // conn: the browser connection it went out on; resends: see detachExtension.
+    const entry = { resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, conn: null, resends: 0 };
+    pendingRequests.set(id, entry);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        if (pendingRequests.get(id) !== entry) return; // already answered
+        clearTimeout(timer);
+        pendingRequests.delete(id);
+        sendCancel(id);
+        reject(new Error("Cancelled."));
+      },
+      { once: true }
+    );
 
     if (mode === "primary") {
       if (!extensionConnected()) {
@@ -93,6 +112,7 @@ function sendToExtension(tool, args) {
         reject(new Error("Browser extension is not connected. Make sure Firefox is running with the Claude MCP in Fayar kitsune extension installed and enabled."));
         return;
       }
+      entry.conn = extensionConn;
       extensionConn.send({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION });
     } else {
       // Client mode: send to primary server
@@ -106,6 +126,14 @@ function sendToExtension(tool, args) {
       primarySocket.write(msg);
     }
   });
+}
+
+function sendCancel(id) {
+  if (mode === "primary") {
+    if (extensionConnected()) extensionConn.send({ type: "tool_cancel", id });
+  } else if (primarySocket && !primarySocket.destroyed) {
+    primarySocket.write(JSON.stringify({ type: "tool_cancel", id }) + "\n");
+  }
 }
 
 // --- Pidfile management ---
@@ -173,11 +201,17 @@ function handleResponse(msg) {
   }
 }
 
-function processLine(line) {
+function processLine(line, conn) {
   if (!line) return;
   try {
     const msg = JSON.parse(line);
     if (msg.type === "heartbeat") return;
+    if (msg.type === "extension_hello") {
+      // Which browser (Firefox profile) this is: requests are only resent to
+      // the same one (see detachExtension).
+      if (conn && typeof msg.browserId === "string") conn.browserId = msg.browserId;
+      return;
+    }
     handleResponse(msg);
   } catch {}
 }
@@ -195,26 +229,42 @@ function attachExtension(conn) {
   return true;
 }
 
+// How often a request is sent again after the browser's connection drops
+// (e.g. dropping twice in a row).
+const MAX_RESENDS = 3;
+
 function detachExtension(conn) {
   if (extensionConn !== conn) return;
   extensionConn = null;
-  // Only the requests that were in flight on this connection, this session's
-  // and those forwarded from client sessions: anything sent after a
-  // reconnect already reached the new connection and mustn't repeat.
-  const inFlight = [...pendingRequests.keys()];
-  const forwarded = [...clientRequestMap.keys()];
+  // Only the requests that went out on this connection, this session's and
+  // those forwarded from client sessions: one sent after a reconnect
+  // already reached the new connection and mustn't repeat.
+  const sentOnIt = (map) => [...map].filter(([, entry]) => entry.conn === conn).map(([id]) => id);
+  const inFlight = sentOnIt(pendingRequests);
+  const forwarded = sentOnIt(clientRequestMap);
   if (inFlight.length === 0 && forwarded.length === 0) return;
-  // Give the extension a few seconds to reconnect, then resend each once.
-  // The extension may have run it already: it remembers the ids of what it
-  // ran, and doesn't run an action twice (see handleToolRequest there).
+  // Give the extension a few seconds to reconnect, then resend. The
+  // extension may have run it already: from 2.0.1 on it remembers what it
+  // ran and doesn't run an action twice (see handleToolRequest there), and
+  // says which browser it is (extension_hello). A request is only resent to
+  // the same browser (another Firefox profile may have connected meanwhile),
+  // to an older extension only once.
   const disconnected = `Browser extension disconnected. ${UNKNOWN_OUTCOME}`;
+  const canResend = (entry) =>
+    extensionConnected() &&
+    (!conn.browserId || conn.browserId === extensionConn.browserId) &&
+    entry.resends < (conn.browserId ? MAX_RESENDS : 1);
+  const resend = (id, entry) => {
+    entry.resends++;
+    entry.conn = extensionConn;
+    extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
+  };
   setTimeout(() => {
     for (const id of inFlight) {
       const entry = pendingRequests.get(id);
       if (!entry) continue; // answered or timed out meanwhile
-      if (extensionConnected() && !entry.resent) {
-        entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
+      if (canResend(entry)) {
+        resend(id, entry);
       } else {
         clearTimeout(entry.timer);
         pendingRequests.delete(id);
@@ -224,9 +274,8 @@ function detachExtension(conn) {
     for (const id of forwarded) {
       const entry = clientRequestMap.get(id);
       if (!entry) continue; // answered, or the client left
-      if (extensionConnected() && !entry.resent) {
-        entry.resent = true;
-        extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
+      if (canResend(entry)) {
+        resend(id, entry);
       } else {
         clientRequestMap.delete(id);
         const clientSocket = clientSockets.get(entry.clientId);
@@ -257,10 +306,14 @@ httpServer.on("upgrade", (req, socket, head) => {
 });
 
 function setupExtensionWebSocket(ws) {
+  // Before anything else: an error on a socket without a listener (a bad
+  // frame, say, even on one about to be refused) would crash the server.
+  ws.on("error", () => {});
   const conn = {
     send: (msg) => ws.send(JSON.stringify(msg)),
     close: () => ws.terminate(),
     isOpen: () => ws.readyState === ws.OPEN,
+    browserId: null, // from extension_hello
   };
   if (!attachExtension(conn)) {
     ws.close(1008, "Another browser profile is already connected.");
@@ -270,8 +323,7 @@ function setupExtensionWebSocket(ws) {
   // Tell the extension which server it's talking to, so it can warn when the
   // two versions differ (e.g. Firefox updated the extension, the .mcpb not).
   conn.send({ type: "server_hello", version: SERVER_VERSION });
-  ws.on("message", (data) => processLine(data.toString("utf-8")));
-  ws.on("error", () => {});
+  ws.on("message", (data) => processLine(data.toString("utf-8"), conn));
   ws.on("close", () => {
     if (extensionConn === conn) process.stderr.write("Browser extension disconnected\n");
     detachExtension(conn);
@@ -387,7 +439,8 @@ function setupClientConnection(socket, initialBuffer) {
           const prefixedId = `c${clientId}_${msg.id}`;
           const serverVersion = typeof msg.serverVersion === "string" ? msg.serverVersion : "";
           // tool/args are kept so the request can be resent after a reconnect
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, serverVersion, resent: false });
+          const entry = { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, serverVersion, conn: extensionConn, resends: 0 };
+          clientRequestMap.set(prefixedId, entry);
 
           if (!extensionConnected()) {
             // Send error back to client
@@ -395,6 +448,12 @@ function setupClientConnection(socket, initialBuffer) {
             clientRequestMap.delete(prefixedId);
           } else {
             extensionConn.send({ ...msg, id: prefixedId, serverVersion });
+          }
+        } else if (msg.type === "tool_cancel" && msg.id) {
+          // The client's user cancelled the call: pass it on.
+          const prefixedId = `c${clientId}_${msg.id}`;
+          if (clientRequestMap.delete(prefixedId) && extensionConnected()) {
+            extensionConn.send({ type: "tool_cancel", id: prefixedId });
           }
         }
       } catch {}
@@ -567,14 +626,16 @@ function mixedResult(parts) {
   return { content: parts };
 }
 
-async function callTool(toolName, args) {
+// extra is the SDK's request context: its signal aborts when the user
+// cancels the call. A failure is marked as an error for Claude.
+async function callTool(toolName, args, extra) {
   try {
-    const result = await sendToExtension(toolName, args);
+    const result = await sendToExtension(toolName, args, extra?.signal);
     if (typeof result === "string") return textResult(result);
     if (result && result.content) return result;
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
-    return textResult(`Error: ${err.message}`);
+    return { ...textResult(`Error: ${err.message}`), isError: true };
   }
 }
 
@@ -696,7 +757,7 @@ server.tool(
   "tabs_context_mcp",
   "Get context information about the current MCP tab group (the Firefox tab group named \"Claude\"). Returns all tab IDs inside the group if it exists, plus any of the user's own tabs they shared with you. The group survives Claude restarts, so tabs from an earlier conversation may still be there. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
   { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
-  async (args) => callTool("tabs_context_mcp", args)
+  async (args, extra) => callTool("tabs_context_mcp", args, extra)
 );
 
 // 2. tabs_create_mcp
@@ -704,7 +765,7 @@ server.tool(
   "tabs_create_mcp",
   "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
   {},
-  async (args) => callTool("tabs_create_mcp", args)
+  async (args, extra) => callTool("tabs_create_mcp", args, extra)
 );
 
 server.tool(
@@ -713,7 +774,7 @@ server.tool(
   {
     tabId: z.number().describe("ID of the tab to close. Must be a tab in the MCP tab group, or one the user shared."),
   },
-  async (args) => callTool("tabs_close_mcp", args)
+  async (args, extra) => callTool("tabs_close_mcp", args, extra)
 );
 
 server.tool(
@@ -723,7 +784,7 @@ server.tool(
     reason: z.string().optional().describe("One short sentence, shown to the user, on what you need the tab for."),
     query: z.string().optional().describe("Text that the wanted tab's title or URL contains (e.g. 'mail.google.com'). Matching tabs are listed first; the user still chooses."),
   },
-  async (args) => callTool("tabs_request_access", args)
+  async (args, extra) => callTool("tabs_request_access", args, extra)
 );
 
 server.tool(
@@ -743,7 +804,7 @@ server.tool(
   {
     tabId: z.number().describe("ID of a tab the user shared with you."),
   },
-  async (args) => callTool("tabs_release", args)
+  async (args, extra) => callTool("tabs_release", args, extra)
 );
 
 server.tool(
@@ -754,7 +815,7 @@ server.tool(
     accept: z.boolean().describe("true to answer OK, false to answer Cancel."),
     promptText: z.string().optional().describe("For prompt(): the text to answer with when accept is true. Defaults to the prompt's default value."),
   },
-  async (args) => callTool("handle_dialog", args)
+  async (args, extra) => callTool("handle_dialog", args, extra)
 );
 
 // 3. navigate
@@ -765,7 +826,7 @@ server.tool(
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
     tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("navigate", args)
+  async (args, extra) => callTool("navigate", args, extra)
 );
 
 // 4. computer
@@ -790,7 +851,7 @@ server.tool(
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
   },
-  async (args) => callTool("computer", args)
+  async (args, extra) => callTool("computer", args, extra)
 );
 
 // 5. find
@@ -801,7 +862,7 @@ server.tool(
     query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
     tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("find", args)
+  async (args, extra) => callTool("find", args, extra)
 );
 
 // 6. form_input
@@ -813,7 +874,7 @@ server.tool(
     value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
     tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("form_input", args)
+  async (args, extra) => callTool("form_input", args, extra)
 );
 
 // 7. get_page_text
@@ -823,7 +884,7 @@ server.tool(
   {
     tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("get_page_text", args)
+  async (args, extra) => callTool("get_page_text", args, extra)
 );
 
 // 8. gif_creator
@@ -844,7 +905,7 @@ server.tool(
       quality: z.number().optional().describe("GIF compression quality, 1-30 (lower = better quality, slower encoding). Default: 10"),
     }).optional().describe("Optional GIF enhancement options for 'export' action. Properties: showClickIndicators (bool), showDragPaths (bool), showActionLabels (bool), showProgressBar (bool), showWatermark (bool), quality (number 1-30). All default to true except quality (default: 10)."),
   },
-  async (args) => callTool("gif_creator", args)
+  async (args, extra) => callTool("gif_creator", args, extra)
 );
 
 // 9. javascript_tool
@@ -857,7 +918,7 @@ server.tool(
     tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
     timeout: z.number().optional().describe("Seconds to wait for the result (default 30, max 50). A script still running after that is reported as timed out."),
   },
-  async (args) => callTool("javascript_tool", args)
+  async (args, extra) => callTool("javascript_tool", args, extra)
 );
 
 // 10. read_console_messages
@@ -871,7 +932,7 @@ server.tool(
     onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
     clear: z.boolean().optional().describe("If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false."),
   },
-  async (args) => callTool("read_console_messages", args)
+  async (args, extra) => callTool("read_console_messages", args, extra)
 );
 
 // 11. read_network_requests
@@ -884,7 +945,7 @@ server.tool(
     limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
     clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
   },
-  async (args) => callTool("read_network_requests", args)
+  async (args, extra) => callTool("read_network_requests", args, extra)
 );
 
 // 12. read_page
@@ -898,7 +959,7 @@ server.tool(
     ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
     max_chars: z.number().optional().describe("Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."),
   },
-  async (args) => callTool("read_page", args)
+  async (args, extra) => callTool("read_page", args, extra)
 );
 
 // 13. resize_window
@@ -910,7 +971,7 @@ server.tool(
     height: z.number().describe("Target window height in pixels"),
     tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group (a tab the user shared is in their window, which keeps its size: see tabs_request_handover). Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("resize_window", args)
+  async (args, extra) => callTool("resize_window", args, extra)
 );
 
 // 14. shortcuts_list
@@ -920,7 +981,7 @@ server.tool(
   {
     tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
-  async (args) => callTool("shortcuts_list", args)
+  async (args, extra) => callTool("shortcuts_list", args, extra)
 );
 
 // 15. shortcuts_execute
@@ -932,7 +993,7 @@ server.tool(
     shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
     command: z.string().optional().describe("The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."),
   },
-  async (args) => callTool("shortcuts_execute", args)
+  async (args, extra) => callTool("shortcuts_execute", args, extra)
 );
 
 // 16. switch_browser
@@ -940,7 +1001,7 @@ server.tool(
   "switch_browser",
   "Switch which Firefox browser is used for browser automation. Call this when the user wants to connect to a different Firefox browser.",
   {},
-  async (args) => callTool("switch_browser", args)
+  async (args, extra) => callTool("switch_browser", args, extra)
 );
 
 // 17. update_plan
@@ -951,7 +1012,7 @@ server.tool(
     domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com']). These domains will be approved for the session when the user accepts the plan."),
     approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
   },
-  async (args) => callTool("update_plan", args)
+  async (args, extra) => callTool("update_plan", args, extra)
 );
 
 // 18. upload_image
@@ -965,7 +1026,7 @@ server.tool(
     coordinate: z.array(z.number()).optional().describe("Viewport coordinates [x, y] for drag & drop to a visible location. Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both."),
     filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
   },
-  async (args) => callTool("upload_image", args)
+  async (args, extra) => callTool("upload_image", args, extra)
 );
 
 // --- Start MCP server ---

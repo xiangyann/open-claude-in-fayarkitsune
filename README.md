@@ -20,7 +20,7 @@
 
 ---
 
-This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension, forked from [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox). It gives Claude Code (and Claude Desktop) full browser automation via 18 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
+This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension, forked from [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox). It gives Claude Code (and Claude Desktop) full browser automation via 23 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
 
 ## What's Different
 
@@ -29,7 +29,7 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser** | Chrome and Edge only | Firefox |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | 18 MCP tools | Same 18 MCP tools |
+| **Tools** | 18 MCP tools | The same 18, plus 5: closing tabs, sharing your own tabs, handing them over and back, and answering page dialogs |
 | **Automation method** | Chrome DevTools Protocol (CDP) | Firefox WebExtension APIs |
 
 ### Blocked Domains in the Official Extension
@@ -66,7 +66,7 @@ No native messaging host, registry keys or install script: the extension finds t
 
 - **Web pages can't connect.** The server only accepts WebSocket connections whose origin is `moz-extension://`, and pages can't fake that header. Plain HTTP requests, the only other thing a page can send to the port, are refused.
 - **Other Firefox add-ons can.** Every add-on has a `moz-extension://` origin, and the server doesn't check which add-on is connecting. If another add-on in the same Firefox profile connects first, it takes the server's single browser slot. It would then see the tool requests Claude sends (URLs, text to type, JavaScript to run) and could send fake results back to Claude. It can't use that connection to control the browser. Use a Firefox profile with only add-ons you trust.
-- **Programs on your computer can.** Anything running as your user can connect to `127.0.0.1:18765` and send tool requests, the same way a second Claude session does. Such a program already has your user's access to the machine, so this adds little, but it's worth knowing.
+- **Programs on your computer can, and on a shared computer so can other users'.** The server listens on `127.0.0.1:18765`, which every user of the machine can reach, and there's no password: any program can connect and send tool requests, the same way a second Claude session does. Another user's program (on a shared PC, a Remote Desktop host or a multi-user Linux machine) could also open the port before your Claude does, and your extension would connect to it. On a computer only you use, this adds little, since such a program already has your access. On a computer you share with other users, don't use this extension.
 - **Your other tabs are off limits.** Tools only work in Claude's tab group and in tabs you shared. Sharing is something only you can do, from the tab menu or the window `tabs_request_access` opens; neither Claude nor a web page can click "Share" for you. Moving a shared tab into Claude's window also takes your yes (or your drag), though a program connecting to the server directly, as described above, could move a tab you shared.
 
 ## Installation
@@ -294,7 +294,9 @@ Console messages, uncaught errors and unhandled promise rejections are captured 
 
 ### Interrupted calls
 
-If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again once the extension is back. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
+If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, and up to three times). Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
+
+If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one; what was already done stays done.
 
 The extension updates itself, but waits until no tool is running, so an update doesn't cut an action short. A tool that runs into the 60-second limit (a page busy with a script, a very long text to type) stops a little before, says how far it got, and doesn't act on the page afterwards.
 

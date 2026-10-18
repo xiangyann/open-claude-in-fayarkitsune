@@ -19,7 +19,9 @@ const MAX_CANDIDATES = 60;
 
 // Error messages Firefox gives for `await` and `return` outside a function.
 function needsFunctionBody(message) {
-  return /await is only valid in async functions|return not in function/i.test(String(message));
+  // (`for await` outside one says "for await (... of ...) is only valid in
+  // async functions …")
+  return /only valid in async functions|return not in function/i.test(String(message));
 }
 
 // Offsets where the last statement could begin, earliest first: the start of
@@ -43,12 +45,37 @@ function statementStarts(code) {
 // starts a regular expression unless it follows something a value ends
 // with (an identifier, a number, `)` or `]`); keywords like `return` are
 // the usual exception.
+//
+// A newline is only a boundary where JavaScript would end the statement
+// too: not after a loop or `if` header without braces (`for (…)`, `else`),
+// not after an operator, and not before a line that starts with one (or
+// with `(`, `[` or a template, which continue the line before). Starting a
+// candidate there would put `return (` inside the statement: a loop would
+// stop after its first round, `a\n- b` would become `return -b`.
 function topLevelBoundaries(code) {
   const out = [];
   const closers = []; // expected closing characters; "`" marks a template's ${ }
+  const headers = []; // alongside closers: whether that "(" opens a for/while/if/with header
   let lastSignificant = ""; // the last code character that isn't whitespace
   let lastWord = "";
+  let afterHeader = false; // just after the ")" of such a header
   const regexCanFollowWord = /^(return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
+
+  // Whether the statement goes on past the newline at i.
+  const continues = (i) => {
+    if (afterHeader) return true;
+    if (/^(else|do)$/.test(lastWord) && /[\w$]/.test(lastSignificant)) return true;
+    if (/[=+\-*/%&|^!~<>?:,.]/.test(lastSignificant)) {
+      // i++ and i-- end a value.
+      const before = code.slice(Math.max(0, i - 8), i).trimEnd();
+      if (!/(\+\+|--)$/.test(before)) return true;
+    }
+    let j = i + 1;
+    while (j < code.length && /[ \t\r]/.test(code[j])) j++;
+    const next = code.slice(j, j + 2);
+    if (/^(\+\+|--|\/\/|\/\*)/.test(next)) return false;
+    return /^[.+\-*/%&|^?:,=<>)\]([`]/.test(next);
+  };
 
   for (let i = 0; i < code.length; i++) {
     const ch = code[i];
@@ -70,11 +97,15 @@ function topLevelBoundaries(code) {
       }
       lastSignificant = ch;
       lastWord = "";
+      afterHeader = false;
       continue;
     }
     if (ch === "`" || (ch === "}" && closers[closers.length - 1] === "`")) {
       // A template literal, or the rest of one after a ${ } expression.
-      if (ch === "}") closers.pop();
+      if (ch === "}") {
+        closers.pop();
+        headers.pop();
+      }
       for (i++; i < code.length; i++) {
         if (code[i] === "\\") {
           i++;
@@ -82,12 +113,14 @@ function topLevelBoundaries(code) {
           break;
         } else if (code[i] === "$" && code[i + 1] === "{") {
           closers.push("`");
+          headers.push(false);
           i++;
           break;
         }
       }
       lastSignificant = "`";
       lastWord = "";
+      afterHeader = false;
       continue;
     }
     if (ch === "/") {
@@ -101,17 +134,25 @@ function topLevelBoundaries(code) {
           else if (code[i] === "/" && !inClass) break;
         }
         while (/[a-z]/i.test(code[i + 1] || "")) i++; // flags
-        lastSignificant = "/";
+        lastSignificant = ")"; // a regular expression ends a value
         lastWord = "";
+        afterHeader = false;
         continue;
       }
     }
 
+    let closedHeader = false;
     if (ch === "(" || ch === "[" || ch === "{") {
+      headers.push(ch === "(" && /^(for|while|if|with)$/.test(lastWord) && /[\w$]/.test(lastSignificant));
       closers.push({ "(": ")", "[": "]", "{": "}" }[ch]);
     } else if (ch === ")" || ch === "]" || ch === "}") {
-      if (closers[closers.length - 1] === ch) closers.pop();
-    } else if ((ch === "\n" || ch === ";") && closers.length === 0) {
+      if (closers[closers.length - 1] === ch) {
+        closers.pop();
+        closedHeader = headers.pop() && closers.length === 0;
+      }
+    } else if (ch === ";" && closers.length === 0) {
+      out.push(i + 1);
+    } else if (ch === "\n" && closers.length === 0 && !continues(i)) {
       out.push(i + 1);
     }
 
@@ -120,7 +161,10 @@ function topLevelBoundaries(code) {
     } else if (!/\s/.test(ch)) {
       lastWord = "";
     }
-    if (!/\s/.test(ch)) lastSignificant = ch;
+    if (!/\s/.test(ch)) {
+      lastSignificant = ch;
+      afterHeader = closedHeader;
+    }
   }
   return out;
 }

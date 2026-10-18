@@ -45,7 +45,7 @@ function isSecretName(name) {
 // or a number that isn't a count or a time.
 function isSecretValue(name, value) {
   if (!isSecretName(name)) return false;
-  if (typeof value === "string") return value !== "";
+  if (typeof value === "string") return value !== "" && !value.startsWith("[hidden");
   if (typeof value !== "number") return false;
   return !COUNTING_WORDS.has(nameWords(name).pop());
 }
@@ -61,23 +61,27 @@ const BEARER_ANYWHERE = /\b(Bearer)\s+[A-Za-z0-9\-._~+/]{12,}=*/gi;
 const LOOSE_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[^;]*$/;
 
 // The whole string is a Cookie header / document.cookie: "a=1; b=2". With
-// two or more pairs, values may be anything. A single pair has to look like
-// a real cookie value, so text like "width=device-width, initial-scale=1"
-// isn't taken for one, and like a secret one: a session-like name, or a
-// value that looks like a token (16+ characters, letters and digits mixed).
-// "q=foo" or "#section=introduction-to-things" stay readable.
+// two or more pairs, values may be anything, and at most half the parts may
+// look otherwise: an odd cookie (a bracket or space in its name, one without
+// a name) or a label in front mustn't expose all the others. A single pair
+// has to look like a real cookie value, so text like "width=device-width,
+// initial-scale=1" or a query string isn't taken for one, and like a secret
+// one: a session-like name, or a value that looks like a token (16+
+// characters, letters and digits mixed). "q=foo" or
+// "#section=introduction-to-things" stay readable.
 function looksLikeCookieString(s) {
   const parts = s.split(";").map((p) => p.trim());
   if (parts[parts.length - 1] === "") parts.pop();
   if (parts.length === 0) return false;
   if (parts.length === 1) {
-    if (!COOKIE_PAIR.test(parts[0])) return false;
+    if (!COOKIE_PAIR.test(parts[0]) || parts[0].includes("&")) return false;
     const at = parts[0].indexOf("=");
     const name = parts[0].slice(0, at);
     const value = parts[0].slice(at + 1);
     return isSecretName(name) || (value.length >= 16 && /\d/.test(value) && /[A-Za-z]/.test(value));
   }
-  return parts.every((p) => LOOSE_COOKIE_PAIR.test(p));
+  const pairs = parts.filter((p) => LOOSE_COOKIE_PAIR.test(p)).length;
+  return pairs >= 2 && pairs * 2 >= parts.length;
 }
 
 function redactString(s) {
@@ -87,7 +91,18 @@ function redactString(s) {
     try {
       const parsed = JSON.parse(s);
       const redacted = redactValue(parsed);
-      if (JSON.stringify(redacted) !== JSON.stringify(parsed)) return JSON.stringify(redacted);
+      if (JSON.stringify(redacted) !== JSON.stringify(parsed)) {
+        // Rewritten, the text would lose its formatting and the precision of
+        // large numbers (IDs, say). Replacing values in the text keeps both;
+        // only when that can't hide everything the structure did is it
+        // rewritten.
+        const inPlace = redactTokens(s);
+        try {
+          const again = JSON.parse(inPlace);
+          if (JSON.stringify(redactValue(again)) === JSON.stringify(again)) return inPlace;
+        } catch {}
+        return JSON.stringify(redacted);
+      }
     } catch {}
   }
   return redactTokens(s);
@@ -105,8 +120,12 @@ function redactErrorText(text) {
 // inside other text): the value may run to the end of the text.
 const JSON_STRING_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)"((?:[^"\\]|\\.)*)(?:"|$)/g;
 const JSON_NUMBER_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)(-?\d+(?:\.\d+)?)(?![\d.])/g;
-// name=value in a URL's query or fragment.
-const URL_PARAM = /([?&#])([^=&#\s"'<>]{1,200})=([^&#\s"'<>]+)/g;
+// name=value in a URL's query, fragment or path parameters (;jsessionid=),
+// in a cookie string, or in text (API_KEY=…). A value stops at the next
+// separator, so a secret after a nested "?" is found too.
+const NAME_VALUE = /(^|[?&#;,\s])([^=&#?;,\s"'<>]{1,200})=([^&#?;,\s"'<>]+)/g;
+// A "name: value" header line: Authorization, Set-Cookie, X-CSRF-Token, …
+const HEADER_LINE = /^([ \t]*)([A-Za-z][\w-]{0,100})(:[ \t]*)(\S[^\r\n]*)$/gm;
 
 // Secrets embedded in longer text, e.g. a page's HTML, a console message, a
 // URL, or JSON too long to have reached here whole.
@@ -120,21 +139,36 @@ function redactTokens(s) {
     .replace(JSON_NUMBER_PAIR, (pair, name, colon, number) =>
       isSecretValue(name, Number(number)) ? `"${name}"${colon}"[hidden: value of ${name}]"` : pair
     )
-    .replace(URL_PARAM, (pair, sep, name) => (isSecretName(name) ? `${sep}${name}=[hidden]` : pair));
+    .replace(HEADER_LINE, (line, indent, name, colon, value) =>
+      isSecretName(name) && !value.startsWith("[hidden") ? `${indent}${name}${colon}[hidden]` : line
+    )
+    .replace(NAME_VALUE, (pair, sep, name, value) =>
+      isSecretName(name) && value !== "[hidden]" ? `${sep}${name}=[hidden]` : pair
+    );
 }
 
 function hidden(name) {
   return `[hidden: value of "${name}"]`;
 }
 
+// Set as an own property: a key like "__proto__" mustn't become a prototype.
+function setProperty(out, name, value) {
+  Object.defineProperty(out, name, { value, enumerable: true, writable: true, configurable: true });
+}
+
 function redactValue(value, depth = 0) {
   if (typeof value === "string") return redactString(value);
   if (!value || typeof value !== "object" || depth > 32) return value;
   if (Array.isArray(value)) {
-    // A [name, value] pair, as from Object.entries(localStorage), a Map,
-    // FormData or a split cookie string.
-    if (value.length === 2 && typeof value[0] === "string" && isSecretValue(value[0], value[1])) {
-      return [value[0], hidden(value[0])];
+    // [name, value] pairs, as from Object.entries(localStorage), a Map,
+    // FormData or a split cookie string. Only in a list of such pairs: a
+    // two-item list of names (Object.keys) isn't one.
+    const pairs = value.length > 0 &&
+      value.every((item) => Array.isArray(item) && item.length === 2 && typeof item[0] === "string");
+    if (pairs) {
+      return value.map(([name, item]) =>
+        isSecretValue(name, item) ? [name, hidden(name)] : [name, redactValue(item, depth + 1)]
+      );
     }
     return value.map((item) => redactValue(item, depth + 1));
   }
@@ -145,7 +179,7 @@ function redactValue(value, depth = 0) {
     // Hide the secret itself; objects under such names are searched instead,
     // so { session: { user, token } } still shows the user.
     const secret = isSecretValue(name, item) || (name === "value" && label !== null && isSecretValue(label, item));
-    out[name] = secret ? hidden(name === "value" ? label : name) : redactValue(item, depth + 1);
+    setProperty(out, name, secret ? hidden(name === "value" ? label : name) : redactValue(item, depth + 1));
   }
   return out;
 }
