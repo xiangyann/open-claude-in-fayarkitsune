@@ -1489,9 +1489,14 @@ async function saveJournal() {
 function answerFromJournal(id, tool, args, seen) {
   const what = tool === "computer" && args.action ? `${tool} ${args.action}` : tool;
   if (seen.state === "started") {
+    // A script goes on running in the page without the extension: checking
+    // too early would show it as not done, and it would then run twice.
+    const script = tool === "javascript_tool"
+      ? " The script keeps running in the page after the extension restarts, so allow the time it needs (and anything it waits for) before checking."
+      : "";
     sendError(
       id,
-      `The browser extension restarted while this ${what} was running, so it may have been done fully, partly or not at all. Before repeating it, check whether it took effect (a screenshot, read_page or get_page_text): if it did, don't repeat it; if it didn't, run it again. If you still can't tell, ask the user.`
+      `The browser extension restarted while this ${what} was running, so it may have been done fully, partly or not at all.${script} Before repeating it, check whether it took effect (a screenshot, read_page or get_page_text): if it did, don't repeat it; if it didn't, run it again. If you still can't tell, ask the user.`
     );
   } else if (seen.error) {
     sendError(id, seen.error);
