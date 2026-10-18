@@ -389,7 +389,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // while it was private.
 // A page loading from another site starts the list over (the tool's
 // description promises that); within a site, earlier pages' requests stay.
-const pageOrigins = new Map(); // tabId -> origin of the last page loaded
+// The redirects of one navigation share its request id: they don't start
+// it over, they only change where it's going.
+const pageOrigins = new Map(); // tabId -> { origin, requestId } of the last page loaded
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -397,8 +399,9 @@ chrome.webRequest.onBeforeRequest.addListener(
     let reqs = networkRequests.get(details.tabId) || [];
     if (details.type === "main_frame") {
       const origin = URL.canParse(details.url) ? new URL(details.url).origin : null;
-      if (pageOrigins.has(details.tabId) && pageOrigins.get(details.tabId) !== origin) reqs = [];
-      pageOrigins.set(details.tabId, origin);
+      const last = pageOrigins.get(details.tabId);
+      if (last && last.requestId !== details.requestId && last.origin !== origin) reqs = [];
+      pageOrigins.set(details.tabId, { origin, requestId: details.requestId });
     }
     reqs.push({
       url: details.url,
@@ -991,7 +994,8 @@ const toolHandlers = {
           }
           // Typing goes key by key; a long text would outlast the tool call.
           if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
-            await sendContentMessage(tabId, { type: "endTyping" });
+            // Short: a page too busy to answer mustn't hide how far it got.
+            await sendContentMessage(tabId, { type: "endTyping" }, 2000).catch(() => {});
             const rest = chars.slice(typed).join("");
             return textResult(
               `Typed the first ${typed} of ${chars.length} characters; stopped there, since typing all of it would take longer than a tool call may. Type the rest with another call: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
@@ -1462,19 +1466,24 @@ async function runTool(tool, handler, args, serverVersion) {
 // finished gets its result again, one still running here answers once, and
 // one an extension restart cut short is reported as unknown, for Claude to
 // check whether it happened, and to ask the user if it can't tell.
+// (handle_dialog isn't one: a dialog can have used its answer already, and
+// running it again would answer the next one too.)
 const REPEATABLE_TOOLS = new Set([
-  "tabs_context_mcp", "read_page", "get_page_text", "find", "read_console_messages",
-  "read_network_requests", "resize_window", "handle_dialog", "update_plan",
+  "tabs_context_mcp", "read_page", "get_page_text", "find", "resize_window", "update_plan",
   "upload_image", "gif_creator", "shortcuts_list", "shortcuts_execute", "switch_browser",
 ]);
 const REPEATABLE_ACTIONS = new Set(["screenshot", "zoom", "wait", "hover", "scroll_to"]);
+// Reading what was recorded repeats fine, unless the first read cleared it.
+const REPEATABLE_UNLESS_CLEARING = new Set(["read_console_messages", "read_network_requests"]);
 const JOURNAL_STORAGE_KEY = "requestJournal";
-const JOURNAL_KEEP_MS = 10 * 60 * 1000; // a resent request comes within seconds
+// The server resends within a few seconds, and gives up on a call after 60 s.
+const JOURNAL_KEEP_MS = 2 * 60 * 1000;
 const JOURNAL_RESULT_MAX = 50000; // characters; a larger result isn't kept
 const journal = new Map(); // request id -> { tool, state: "started" | "done", at, result?, error? }
 const runningRequests = new Set();
 
 function isRepeatable(tool, args) {
+  if (REPEATABLE_UNLESS_CLEARING.has(tool)) return !args.clear;
   return REPEATABLE_TOOLS.has(tool) || (tool === "computer" && REPEATABLE_ACTIONS.has(args.action));
 }
 

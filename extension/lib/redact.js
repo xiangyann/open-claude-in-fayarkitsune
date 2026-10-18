@@ -63,16 +63,19 @@ const LOOSE_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[^;]*$/;
 // The whole string is a Cookie header / document.cookie: "a=1; b=2". With
 // two or more pairs, values may be anything. A single pair has to look like
 // a real cookie value, so text like "width=device-width, initial-scale=1"
-// isn't taken for one, and like a secret one: a session-like name or a
-// token-length value, so "q=foo" or "#tab=settings" stay readable.
+// isn't taken for one, and like a secret one: a session-like name, or a
+// value that looks like a token (16+ characters, letters and digits mixed).
+// "q=foo" or "#section=introduction-to-things" stay readable.
 function looksLikeCookieString(s) {
   const parts = s.split(";").map((p) => p.trim());
   if (parts[parts.length - 1] === "") parts.pop();
   if (parts.length === 0) return false;
   if (parts.length === 1) {
     if (!COOKIE_PAIR.test(parts[0])) return false;
-    const [name, value] = [parts[0].slice(0, parts[0].indexOf("=")), parts[0].slice(parts[0].indexOf("=") + 1)];
-    return isSecretName(name) || value.length >= 16;
+    const at = parts[0].indexOf("=");
+    const name = parts[0].slice(0, at);
+    const value = parts[0].slice(at + 1);
+    return isSecretName(name) || (value.length >= 16 && /\d/.test(value) && /[A-Za-z]/.test(value));
   }
   return parts.every((p) => LOOSE_COOKIE_PAIR.test(p));
 }
