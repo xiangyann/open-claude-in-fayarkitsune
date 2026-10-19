@@ -12,6 +12,10 @@
   if (window.__openClaudeInFirefoxLoaded) return;
   window.__openClaudeInFirefoxLoaded = true;
 
+  // See the message listener: a message is only acted on this long before
+  // the background stops waiting for its answer.
+  const CONTENT_DEADLINE_MARGIN_MS = 1000;
+
   // --- Element reference map ---
   // Persistent ref IDs stored as WeakRefs so GC still works
   let refCounter = 0;
@@ -685,6 +689,9 @@
 
   const GLOW_LINGER_MS = 4000;
   let glowHost = null;
+  // One left by this script before the extension was updated or reloaded:
+  // its timers are gone, so it would never fade.
+  for (const stale of document.querySelectorAll("claude-mcp-glow")) stale.remove();
   let glowTimer = null;
 
   function buildGlow() {
@@ -744,8 +751,9 @@
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Arrived after the background stopped waiting (the page was busy): the
-    // tool already reported it as not done, so it mustn't happen now.
-    if (typeof msg.deadline === "number" && Date.now() > msg.deadline) {
+    // tool already reported it as not done, so it mustn't happen now. A
+    // second's margin, so that what's done here is answered before then.
+    if (typeof msg.deadline === "number" && Date.now() > msg.deadline - CONTENT_DEADLINE_MARGIN_MS) {
       sendResponse({ error: "expired" });
       return;
     }

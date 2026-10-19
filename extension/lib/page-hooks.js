@@ -47,12 +47,40 @@ function installPageHooks(settings) {
       hooks.logs.push({ level, text: cut(text, MAX_TEXT), url: location.href, timestamp: Date.now() });
       if (hooks.logs.length > MAX_LOGS) hooks.logs.splice(0, hooks.logs.length - MAX_LOGS);
     };
+    // Objects are shown as JSON, but only so much of them: a page logging a
+    // huge object, or one whose parts are shared many times over, mustn't
+    // pay for all of it.
+    const MAX_ITEMS = 300;
+    const MAX_DEPTH = 6;
+    const sample = (v, depth, budget) => {
+      if (budget.items-- <= 0) return "…";
+      if (typeof v === "string") return v.length > MAX_TEXT ? `${v.slice(0, MAX_TEXT)}…` : v;
+      if (typeof v === "bigint") return `${v}n`;
+      if (typeof v === "function") return `[function ${v.name || "anonymous"}]`;
+      if (typeof v === "symbol") return String(v);
+      if (v === null || typeof v !== "object") return v;
+      if (v instanceof Date) return isNaN(v) ? "Invalid Date" : v.toISOString();
+      if (budget.seen.has(v)) return "[circular]";
+      if (depth >= MAX_DEPTH) return Array.isArray(v) ? "[…]" : "{…}";
+      budget.seen.add(v);
+      try {
+        if (Array.isArray(v)) return v.slice(0, 100).map((item) => sample(item, depth + 1, budget));
+        const out = {};
+        for (const key of Object.keys(v).slice(0, 100)) {
+          if (budget.items <= 0) break;
+          out[key] = sample(v[key], depth + 1, budget);
+        }
+        return out;
+      } finally {
+        budget.seen.delete(v);
+      }
+    };
     const show = (arg) => {
       if (arg instanceof Error) return arg.stack ? `${arg.name}: ${arg.message}\n${showStack(arg.stack)}` : `${arg.name}: ${arg.message}`;
       if (typeof arg === "string") return arg;
       if (typeof arg !== "object" || arg === null) return String(arg);
       try {
-        return JSON.stringify(arg);
+        return JSON.stringify(sample(arg, 0, { items: MAX_ITEMS, seen: new Set() }));
       } catch {
         return String(arg);
       }
@@ -133,6 +161,9 @@ function installPageHooks(settings) {
     if (settings.clear) hooks.logs.length = 0;
     return { logs };
   }
+  // Only a tool's own before and after calls take the dialogs, to report
+  // them; other calls leave them for those.
+  if (settings && settings.report === false) return {};
   const dropped = hooks.droppedDialogs;
   hooks.droppedDialogs = 0;
   return { dialogs: hooks.dialogs.splice(0), dropped };
