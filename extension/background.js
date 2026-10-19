@@ -491,9 +491,10 @@ chrome.webRequest.onErrorOccurred.addListener(
 // failed.
 const CONTENT_TIMEOUT_MS = 20000;
 
-// One step of a tool (a key, say) gets no more time than its call has left.
+// One step of a tool (a key, say) gets no more time than its call has left,
+// less a second to answer with how far it got.
 function stepTimeout(request) {
-  return Math.max(3000, Math.min(CONTENT_TIMEOUT_MS, request.deadline - Date.now()));
+  return Math.max(1500, Math.min(CONTENT_TIMEOUT_MS, request.deadline - Date.now() - 1000));
 }
 
 async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS) {
@@ -505,11 +506,19 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS
         `The page didn't respond within ${Math.round(timeoutMs / 1000)} s: it may be busy, e.g. with a script that's still running. It won't act on this later.`
       )), Math.max(0, deadline - Date.now()));
     });
+    let response;
     try {
-      return await Promise.race([chrome.tabs.sendMessage(tabId, { ...message, deadline }), late]);
+      response = await Promise.race([chrome.tabs.sendMessage(tabId, { ...message, deadline }), late]);
     } finally {
       clearTimeout(timer);
     }
+    // The page got it too late to act on it (see content.js): not done.
+    if (response?.error === "expired") {
+      const err = new Error("The page was too busy to take this in time; it wasn't done.");
+      err.notDone = true;
+      throw err;
+    }
+    return response;
   };
   try {
     return await send();
@@ -722,13 +731,19 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 const windowQueues = new Map(); // windowId -> the last screenshot queued there
 const SCREENSHOT_TIMEOUT_MS = 10000;
 
+// A task gets its turn ({ over }): once it's given up on, it must not
+// activate a tab or capture anymore, since the next task has the window.
 function inWindowQueue(windowId, task) {
   const timed = () => {
+    const turn = { over: false };
     let timer;
     const late = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error("the screenshot took too long: the page may be busy")), SCREENSHOT_TIMEOUT_MS);
+      timer = setTimeout(() => {
+        turn.over = true;
+        reject(new Error("the screenshot took too long: the page may be busy"));
+      }, SCREENSHOT_TIMEOUT_MS);
     });
-    return Promise.race([task(), late]).finally(() => clearTimeout(timer));
+    return Promise.race([task(turn), late]).finally(() => clearTimeout(timer));
   };
   const run = (windowQueues.get(windowId) || Promise.resolve()).catch(() => {}).then(timed);
   windowQueues.set(windowId, run);
@@ -740,12 +755,14 @@ function inWindowQueue(windowId, task) {
 
 async function takeScreenshot(tabId, options = {}) {
   const { windowId } = await chrome.tabs.get(tabId);
-  return inWindowQueue(windowId, () => takeScreenshotNow(tabId, options));
+  return inWindowQueue(windowId, (turn) => takeScreenshotNow(tabId, options, turn));
 }
 
-async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
-  // It may have waited its turn: is the tab still Claude's to show?
+async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}, turn = { over: false }) {
+  // It may have waited its turn: is the tab still Claude's to show? And is
+  // it still this screenshot's turn?
   const stillClaudes = () => {
+    if (turn.over) throw new Error("the screenshot took too long: the page may be busy");
     if (!isControlledNow(tabId)) throw new Error("the user took this tab back");
   };
   stillClaudes();
@@ -753,6 +770,7 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
 
   // Activate the tab so captureVisibleTab captures the right content
   if (!tab.active) {
+    stillClaudes();
     await chrome.tabs.update(tabId, { active: true });
     await sleep(100);
   }
@@ -760,7 +778,9 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}) {
   const capture = async (quality) => {
     // Still this tab? The user can switch tabs too: then make it active again,
     // once.
+    stillClaudes();
     if (!(await chrome.tabs.get(tabId)).active) {
+      stillClaudes();
       await chrome.tabs.update(tabId, { active: true });
       await sleep(100);
       if (!(await chrome.tabs.get(tabId)).active) {
@@ -1068,17 +1088,23 @@ const toolHandlers = {
         const chars = [...args.text];
         // Stops early, saying how far it got: the user took the tab back or
         // cancelled the call, typing all of it would outlast the tool call,
-        // or the page stopped answering.
-        const stopped = async (why) => {
-          // Short: a page too busy to answer mustn't hide how far it got.
-          if (typed) await sendContentMessage(tabId, { type: "endTyping" }, 3000).catch(() => {});
+        // or the page stopped answering. The field gets its change event
+        // only while the tab is still Claude's and the page answers. When
+        // the page didn't confirm a character, it may still have been typed.
+        const stopped = async (why, { finishEdit = true, unsure = false } = {}) => {
+          if (finishEdit && typed && isControlledNow(tabId)) {
+            await sendContentMessage(tabId, { type: "endTyping" }, 2000).catch(() => {});
+          }
           const rest = chars.slice(typed).join("");
+          const unsureNote = unsure
+            ? ` The next character ("${chars[typed]}") may or may not have been typed: check the field before typing the rest.`
+            : "";
           return textResult(
-            `Typed the first ${typed} of ${chars.length} characters, then stopped: ${why}. Not typed: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
+            `Typed the first ${typed} of ${chars.length} characters, then stopped: ${why}.${unsureNote} Still to type: "${rest.substring(0, 50)}${rest.length > 50 ? "..." : ""}" (${rest.length} characters).`
           );
         };
         for (const char of chars) {
-          if (!isControlledNow(tabId)) return stopped("the user took this tab back");
+          if (!isControlledNow(tabId)) return stopped("the user took this tab back", { finishEdit: false });
           if (request.cancelled) return stopped("the call was cancelled");
           // Typing goes key by key; a long text would outlast the tool call.
           if (Date.now() > request.deadline - TYPING_MARGIN_MS) {
@@ -1088,7 +1114,7 @@ const toolHandlers = {
           try {
             resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) }, stepTimeout(request));
           } catch (err) {
-            return stopped(`the page stopped responding (${err.message})`);
+            return stopped(`the page stopped responding (${err.message})`, { finishEdit: false, unsure: !err.notDone });
           }
           typed++;
           if (resp?.inserted) inserted++;
@@ -1113,7 +1139,9 @@ const toolHandlers = {
         const keys = args.text.split(" ").filter(Boolean);
         const total = repeat * keys.length;
         let pressed = 0;
-        const stopped = (why) => textResult(`Pressed ${pressed} of ${total} keys, then stopped: ${why}.`);
+        const stopped = (why, unsure = false) => textResult(
+          `Pressed ${pressed} of ${total} keys, then stopped: ${why}.${unsure ? " The next key may or may not have been pressed: check the page before pressing the rest." : ""}`
+        );
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
             if (!isControlledNow(tabId)) return stopped("the user took this tab back");
@@ -1127,13 +1155,17 @@ const toolHandlers = {
                 type: "dispatchKeyEvent", eventType: "keyDown",
                 key, code, keyCode, modifiers: keyMod,
               }, stepTimeout(request));
-              pressed++;
+            } catch (err) {
+              return stopped(`the page stopped responding (${err.message})`, !err.notDone);
+            }
+            pressed++;
+            try {
               await sendContentMessage(tabId, {
                 type: "dispatchKeyEvent", eventType: "keyUp",
                 key, code, keyCode, modifiers: keyMod,
               }, stepTimeout(request));
             } catch (err) {
-              return stopped(`the page stopped responding (${err.message})`);
+              return stopped(`the page stopped responding while that key was being released (${err.message})`);
             }
             await sleep(30);
           }
@@ -1520,9 +1552,13 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
 
 // The user cancelled the call in Claude. Tools that go step by step (typing,
 // keys) stop before the next step; what already happened stays done.
+// A cancel can come while the call still waits for the stored state; it
+// waits for it too, and so finds the call running.
 function cancelRequest(id) {
-  const request = runningRequests.get(id);
-  if (request) request.cancelled = true;
+  stateReady.then(() => {
+    const request = runningRequests.get(id);
+    if (request) request.cancelled = true;
+  });
 }
 
 async function runTool(tool, handler, args, request) {
@@ -1604,9 +1640,11 @@ function isRepeatable(tool, args) {
 }
 
 // What's kept of a finished call, to answer a resend with: not what Claude
-// typed or put in a form (a password, say), nor a result too large to keep.
+// typed, put in a form or gave a prompt (a password, say), nor a result too
+// large to keep.
 function keptOutcome(tool, args, outcome) {
-  if (tool === "form_input" || (tool === "computer" && args.action === "type")) return {};
+  // (handle_dialog's answer can carry the text given to a prompt.)
+  if (tool === "form_input" || tool === "handle_dialog" || (tool === "computer" && args.action === "type")) return {};
   return JSON.stringify(outcome).length <= JOURNAL_RESULT_MAX ? outcome : {};
 }
 
@@ -1701,7 +1739,7 @@ async function evalInPage(tabId, code) {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (code, packSource) => {
+    func: async (code, packSource, needsBodySource) => {
       const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
       let pack;
       try {
@@ -1713,7 +1751,7 @@ async function evalInPage(tabId, code) {
       try {
         value = (0, eval)(code); // eslint-disable-line no-eval
       } catch (e) {
-        if (e instanceof SyntaxError && /await is only valid in async functions|return not in function/.test(e.message)) {
+        if (e instanceof SyntaxError && new RegExp(needsBodySource, "i").test(e.message)) {
           return { needsFunctionBody: true };
         }
         return { thrown: describe(e) };
@@ -1724,7 +1762,7 @@ async function evalInPage(tabId, code) {
         return { thrown: describe(e) };
       }
     },
-    args: [code, packValue.toString()],
+    args: [code, packValue.toString(), NEEDS_FUNCTION_BODY.source],
   });
   if (res?.error) return { thrown: errorText(res.error) };
   return res?.result ?? { thrown: "The script produced no result." };

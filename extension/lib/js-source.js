@@ -17,12 +17,10 @@ const AUTO_RETURN_MAX_LENGTH = 100000;
 const LAST_STATEMENT_WINDOW = 4000;
 const MAX_CANDIDATES = 60;
 
-// Error messages Firefox gives for `await` and `return` outside a function.
-function needsFunctionBody(message) {
-  // (`for await` outside one says "for await (... of ...) is only valid in
-  // async functions …")
-  return /only valid in async functions|return not in function/i.test(String(message));
-}
+// Error messages Firefox gives for `await` and `return` outside a function
+// (`for await` outside one says "for await (... of ...) is only valid in
+// async functions …"). Its source is sent to pages, which test with it.
+const NEEDS_FUNCTION_BODY = /only valid in async functions|return not in function/i;
 
 // Offsets where the last statement could begin, earliest first: the start of
 // a line, or after a semicolon, outside any brackets. Comments, strings,
@@ -70,10 +68,25 @@ function topLevelBoundaries(code) {
       const before = code.slice(Math.max(0, i - 8), i).trimEnd();
       if (!/(\+\+|--)$/.test(before)) return true;
     }
+    // The next token, past blank lines and comments: an operator after them
+    // still continues the statement.
     let j = i + 1;
-    while (j < code.length && /[ \t\r]/.test(code[j])) j++;
+    for (;;) {
+      while (j < code.length && /\s/.test(code[j])) j++;
+      if (code.startsWith("//", j)) {
+        while (j < code.length && code[j] !== "\n") j++;
+      } else if (code.startsWith("/*", j)) {
+        const end = code.indexOf("*/", j + 2);
+        j = end === -1 ? code.length : end + 2;
+      } else {
+        break;
+      }
+    }
     const next = code.slice(j, j + 2);
-    if (/^(\+\+|--|\/\/|\/\*)/.test(next)) return false;
+    if (/^(\+\+|--)/.test(next)) return false;
+    // After a block (`if (…) {}`), a line starting with ( [ or ` is a new
+    // statement.
+    if (lastSignificant === "}" && /^[([`]/.test(next)) return false;
     return /^[.+\-*/%&|^?:,=<>)\]([`]/.test(next);
   };
 
@@ -143,7 +156,8 @@ function topLevelBoundaries(code) {
 
     let closedHeader = false;
     if (ch === "(" || ch === "[" || ch === "{") {
-      headers.push(ch === "(" && /^(for|while|if|with)$/.test(lastWord) && /[\w$]/.test(lastSignificant));
+      // (`for await (` too: its last word is `await`.)
+      headers.push(ch === "(" && /(?:^|[^\w$.])(?:for(?:\s+await)?|while|if|with)\s*$/.test(code.slice(Math.max(0, i - 24), i)));
       closers.push({ "(": ")", "[": "]", "{": "}" }[ch]);
     } else if (ch === ")" || ch === "]" || ch === "}") {
       if (closers[closers.length - 1] === ch) {

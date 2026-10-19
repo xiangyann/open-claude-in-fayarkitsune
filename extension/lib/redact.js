@@ -74,11 +74,13 @@ function looksLikeCookieString(s) {
   if (parts[parts.length - 1] === "") parts.pop();
   if (parts.length === 0) return false;
   if (parts.length === 1) {
-    if (!COOKIE_PAIR.test(parts[0]) || parts[0].includes("&")) return false;
+    if (!COOKIE_PAIR.test(parts[0])) return false;
     const at = parts[0].indexOf("=");
     const name = parts[0].slice(0, at);
     const value = parts[0].slice(at + 1);
-    return isSecretName(name) || (value.length >= 16 && /\d/.test(value) && /[A-Za-z]/.test(value));
+    if (isSecretName(name)) return true; // its value may hold "&" too
+    // A token-like value; "&" means a query string, not a cookie.
+    return !value.includes("&") && value.length >= 16 && /\d/.test(value) && /[A-Za-z]/.test(value);
   }
   const pairs = parts.filter((p) => LOOSE_COOKIE_PAIR.test(p)).length;
   return pairs >= 2 && pairs * 2 >= parts.length;
