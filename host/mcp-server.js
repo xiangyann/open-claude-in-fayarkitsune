@@ -60,6 +60,9 @@ let requestIdCounter = 0;
 // late answer meant for a server that's gone mustn't match another's.
 const REQUEST_ID_PREFIX = randomUUID().slice(0, 8);
 
+// How long a call may take; the extension is told what's left of it.
+const TOOL_TIMEOUT_MS = 60000;
+
 // When a call's outcome is unknown, Claude has to find out whether it
 // happened before repeating it.
 const UNKNOWN_OUTCOME =
@@ -89,9 +92,13 @@ function sendToExtension(tool, args, signal) {
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
       reject(new Error(`Tool request timed out after 60s. ${UNKNOWN_OUTCOME}`));
-    }, 60000);
-    // conn: the browser connection it went out on; resends: see detachExtension.
-    const entry = { resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, conn: null, resends: 0 };
+    }, TOOL_TIMEOUT_MS);
+    // conn: the browser connection it went out on; resends: see
+    // detachExtension; expiresAt: when the timer above gives up.
+    const entry = {
+      resolve, reject, timer, tool, args, serverVersion: SERVER_VERSION, conn: null, resends: 0,
+      expiresAt: Date.now() + TOOL_TIMEOUT_MS,
+    };
     pendingRequests.set(id, entry);
     signal?.addEventListener(
       "abort",
@@ -113,7 +120,7 @@ function sendToExtension(tool, args, signal) {
         return;
       }
       entry.conn = extensionConn;
-      extensionConn.send({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION });
+      extensionConn.send({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION, timeLeft: TOOL_TIMEOUT_MS });
     } else {
       // Client mode: send to primary server
       if (!primarySocket || primarySocket.destroyed) {
@@ -122,7 +129,7 @@ function sendToExtension(tool, args, signal) {
         reject(new Error("Lost connection to primary MCP server."));
         return;
       }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION }) + "\n";
+      const msg = JSON.stringify({ id, type: "tool_request", tool, args, serverVersion: SERVER_VERSION, timeLeft: TOOL_TIMEOUT_MS }) + "\n";
       primarySocket.write(msg);
     }
   });
@@ -130,10 +137,27 @@ function sendToExtension(tool, args, signal) {
 
 function sendCancel(id) {
   if (mode === "primary") {
-    if (extensionConnected()) extensionConn.send({ type: "tool_cancel", id });
+    cancelInExtension(id);
   } else if (primarySocket && !primarySocket.destroyed) {
     primarySocket.write(JSON.stringify({ type: "tool_cancel", id }) + "\n");
   }
+}
+
+// Tells the extension to stop a call. While it's away (its connection can drop
+// and come back with the call still running there), the message waits for
+// it: nothing else would stop that call. It keeps as long as a call can run.
+const undeliveredCancels = new Map(); // id -> when it's not needed anymore
+
+function cancelInExtension(id) {
+  if (extensionConnected()) extensionConn.send({ type: "tool_cancel", id });
+  else undeliveredCancels.set(id, Date.now() + TOOL_TIMEOUT_MS);
+}
+
+function deliverCancels() {
+  for (const [id, until] of undeliveredCancels) {
+    if (Date.now() < until && extensionConnected()) extensionConn.send({ type: "tool_cancel", id });
+  }
+  undeliveredCancels.clear();
 }
 
 // --- Pidfile management ---
@@ -225,6 +249,8 @@ function extensionConnected() {
 // Returns false if another browser is already connected.
 function attachExtension(conn) {
   if (extensionConnected()) return false;
+  // One still closing: its calls need the same care as if it had closed.
+  if (extensionConn) detachExtension(extensionConn);
   extensionConn = conn;
   return true;
 }
@@ -232,6 +258,9 @@ function attachExtension(conn) {
 // How often a request is sent again after the browser's connection drops
 // (e.g. dropping twice in a row).
 const MAX_RESENDS = 3;
+// With less time left than this, a request isn't sent again: the extension
+// keeps 5 seconds of a call for itself, and wouldn't start it anymore.
+const MIN_RESEND_TIME_MS = 6000;
 
 function detachExtension(conn) {
   if (extensionConn !== conn) return;
@@ -248,16 +277,23 @@ function detachExtension(conn) {
   // ran and doesn't run an action twice (see handleToolRequest there), and
   // says which browser it is (extension_hello). A request is only resent to
   // the same browser (another Firefox profile may have connected meanwhile),
-  // to an older extension only once.
+  // and never to an extension that didn't say which browser it is: one
+  // before 2.0.1 keeps no such record and would run the action again.
+  // With it goes the time left before this server gives up on the call.
   const disconnected = `Browser extension disconnected. ${UNKNOWN_OUTCOME}`;
   const canResend = (entry) =>
     extensionConnected() &&
-    (!conn.browserId || conn.browserId === extensionConn.browserId) &&
-    entry.resends < (conn.browserId ? MAX_RESENDS : 1);
+    Boolean(conn.browserId) &&
+    conn.browserId === extensionConn.browserId &&
+    entry.resends < MAX_RESENDS &&
+    entry.expiresAt - Date.now() >= MIN_RESEND_TIME_MS;
   const resend = (id, entry) => {
     entry.resends++;
     entry.conn = extensionConn;
-    extensionConn.send({ id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion, resent: true });
+    extensionConn.send({
+      id, type: "tool_request", tool: entry.tool, args: entry.args, serverVersion: entry.serverVersion,
+      resent: true, timeLeft: Math.max(0, entry.expiresAt - Date.now()),
+    });
   };
   setTimeout(() => {
     for (const id of inFlight) {
@@ -323,6 +359,7 @@ function setupExtensionWebSocket(ws) {
   // Tell the extension which server it's talking to, so it can warn when the
   // two versions differ (e.g. Firefox updated the extension, the .mcpb not).
   conn.send({ type: "server_hello", version: SERVER_VERSION });
+  deliverCancels();
   ws.on("message", (data) => processLine(data.toString("utf-8"), conn));
   ws.on("close", () => {
     if (extensionConn === conn) process.stderr.write("Browser extension disconnected\n");
@@ -436,10 +473,16 @@ function setupClientConnection(socket, initialBuffer) {
           // Forward to the extension with a prefixed ID, and the version of
           // the client's server: its tools are the ones Claude sees there
           // (a client before 2.0.0 doesn't say it: "").
-          const prefixedId = `c${clientId}_${msg.id}`;
+          // (With this server's own prefix: a client before 2.0.1 numbers its
+          // requests from 1 again, also after another session took over.)
+          const prefixedId = `c${REQUEST_ID_PREFIX}-${clientId}_${msg.id}`;
           const serverVersion = typeof msg.serverVersion === "string" ? msg.serverVersion : "";
+          const timeLeft = typeof msg.timeLeft === "number" ? msg.timeLeft : TOOL_TIMEOUT_MS;
           // tool/args are kept so the request can be resent after a reconnect
-          const entry = { clientId, originalId: msg.id, tool: msg.tool, args: msg.args, serverVersion, conn: extensionConn, resends: 0 };
+          const entry = {
+            clientId, originalId: msg.id, tool: msg.tool, args: msg.args, serverVersion, conn: extensionConn, resends: 0,
+            expiresAt: Date.now() + timeLeft,
+          };
           clientRequestMap.set(prefixedId, entry);
 
           if (!extensionConnected()) {
@@ -447,14 +490,12 @@ function setupClientConnection(socket, initialBuffer) {
             socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
             clientRequestMap.delete(prefixedId);
           } else {
-            extensionConn.send({ ...msg, id: prefixedId, serverVersion });
+            extensionConn.send({ ...msg, id: prefixedId, serverVersion, timeLeft });
           }
         } else if (msg.type === "tool_cancel" && msg.id) {
           // The client's user cancelled the call: pass it on.
-          const prefixedId = `c${clientId}_${msg.id}`;
-          if (clientRequestMap.delete(prefixedId) && extensionConnected()) {
-            extensionConn.send({ type: "tool_cancel", id: prefixedId });
-          }
+          const prefixedId = `c${REQUEST_ID_PREFIX}-${clientId}_${msg.id}`;
+          if (clientRequestMap.delete(prefixedId)) cancelInExtension(prefixedId);
         }
       } catch {}
     }
@@ -470,9 +511,13 @@ function setupClientConnection(socket, initialBuffer) {
 
   socket.on("close", () => {
     clientSockets.delete(clientId);
-    // Clean up any pending client requests
+    // Clean up any pending client requests: nobody is waiting for them, and
+    // the session is gone, so the extension stops what it can of them.
     for (const [prefixedId, info] of clientRequestMap) {
-      if (info.clientId === clientId) clientRequestMap.delete(prefixedId);
+      if (info.clientId === clientId) {
+        clientRequestMap.delete(prefixedId);
+        cancelInExtension(prefixedId);
+      }
     }
     process.stderr.write(`Client MCP server disconnected (client ${clientId})\n`);
   });
@@ -651,14 +696,18 @@ const HANDOVER_ANSWER_TIMEOUT_MS = 5 * 60 * 1000;
 const HANDOVER_CONVERSATION_WINDOW_MS = 10 * 60 * 1000;
 const handoverAskedInConversation = new Map(); // tabId -> time asked
 
-async function requestHandover({ tabIds, reason, confirmed }) {
+// extra: the call's context; its signal aborts when the user cancels the
+// call, and then nothing is moved, not even on a later "yes".
+async function requestHandover({ tabIds, reason, confirmed }, extra) {
   const ids = [...new Set(tabIds)];
+  const signal = extra?.signal;
+  const cancelled = () => ({ ...textResult("Cancelled; the tabs weren't moved."), isError: true });
 
   // Check the tabs are shared before asking anything, and name them in the
   // question. (If the extension can't answer, tabs_handover reports it.)
   let described = ids.map((id) => `tab ${id}`);
   try {
-    const context = await sendToExtension("tabs_context_mcp", {});
+    const context = await sendToExtension("tabs_context_mcp", {}, signal);
     // The first line is JSON, unless there are no tabs at all (no group,
     // nothing shared): then nothing is shared either.
     const firstLine = context.content[0].text.split("\n")[0];
@@ -666,9 +715,10 @@ async function requestHandover({ tabIds, reason, confirmed }) {
     const shared = availableTabs.filter((t) => t.sharedByUser);
     const notShared = ids.filter((id) => !shared.some((t) => t.tabId === id));
     if (notShared.length) {
-      return textResult(
-        `Only tabs the user shared with you can be handed over; not shared: ${notShared.join(", ")}. Use tabs_context_mcp to see them.`
-      );
+      return {
+        ...textResult(`Only tabs the user shared with you can be handed over; not shared: ${notShared.join(", ")}. Use tabs_context_mcp to see them.`),
+        isError: true,
+      };
     }
     described = ids.map((id) => {
       const tab = shared.find((t) => t.tabId === id);
@@ -679,9 +729,10 @@ async function requestHandover({ tabIds, reason, confirmed }) {
   const askedInConversation = ids.every(
     (id) => Date.now() - (handoverAskedInConversation.get(id) ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS
   );
+  if (signal?.aborted) return cancelled();
   if (confirmed && askedInConversation) {
     for (const id of ids) handoverAskedInConversation.delete(id);
-    return callTool("tabs_handover", { tabIds: ids });
+    return callTool("tabs_handover", { tabIds: ids }, extra);
   }
   const askInConversation = (why) => {
     for (const id of ids) handoverAskedInConversation.set(id, Date.now());
@@ -711,16 +762,18 @@ async function requestHandover({ tabIds, reason, confirmed }) {
           required: ["move"],
         },
       },
-      { timeout: HANDOVER_ANSWER_TIMEOUT_MS }
+      { timeout: HANDOVER_ANSWER_TIMEOUT_MS, signal }
     );
   } catch (err) {
+    if (signal?.aborted) return cancelled();
     return askInConversation(`The app's confirmation prompt didn't work (${err.message}).`);
   }
   for (const id of ids) handoverAskedInConversation.delete(id); // answered in the prompt
+  if (signal?.aborted) return cancelled();
   if (answer.action !== "accept" || !answer.content?.move) {
     return textResult("The user chose to keep the tabs where they are. They're still shared with you.");
   }
-  return callTool("tabs_handover", { tabIds: ids });
+  return callTool("tabs_handover", { tabIds: ids }, extra);
 }
 
 // --- MCP Server and its tools ---
@@ -729,6 +782,13 @@ const server = new McpServer({
   name: "open-claude-in-fayarkitsune",
   version: SERVER_VERSION,
 });
+
+// The first request a server sends has id 0, and the SDK's client ignores a
+// cancellation for id 0 (it reads the id as missing). A ping takes that id, so
+// that a handover prompt can always be withdrawn.
+server.server.oninitialized = () => {
+  server.server.ping().catch(() => {});
+};
 
 // Pre-validation arg coercion
 {
@@ -795,7 +855,7 @@ server.tool(
     reason: z.string().optional().describe("One short sentence, shown to the user, on why you need them in Claude's window."),
     confirmed: z.boolean().optional().describe("Only when this tool told you to ask in the conversation: true once the user agreed there."),
   },
-  async (args) => requestHandover(args)
+  async (args, extra) => requestHandover(args, extra)
 );
 
 server.tool(
@@ -809,7 +869,7 @@ server.tool(
 
 server.tool(
   "handle_dialog",
-  "Choose how the next JavaScript confirm() or prompt() on a page is answered. Dialogs never block your tools: alerts are acknowledged, and confirm/prompt are cancelled unless you choose otherwise here. Each one is reported in the result of the tool call during which it opened. Applies to the page currently loaded in the tab.",
+  "Choose how the next JavaScript confirm() or prompt() on a page is answered. While you work in a tab, alerts are acknowledged, and confirm/prompt are cancelled unless you choose otherwise here. Each one is reported in the result of the tool call during which it opened. In a tab the user shared, this only holds while you're working there and for 15 seconds after; other dialogs are left for the user, and pause the page until they answer. Applies to the page currently loaded in the tab, not to frames inside it.",
   {
     tabId: z.number().describe("Tab ID of the page. Must be a tab in the current group, or one the user shared with you."),
     accept: z.boolean().describe("true to answer OK, false to answer Cancel."),
@@ -838,18 +898,18 @@ server.tool(
       "left_click", "right_click", "double_click", "triple_click",
       "type", "screenshot", "wait", "scroll", "key",
       "left_click_drag", "zoom", "scroll_to", "hover"
-    ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
+    ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools, or the page to a position (coordinate) in CSS pixels.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for tooltips and dropdown menus that listen for the mouse. CSS :hover styles don\'t change: only the real mouse can do that.'),
     tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
+    coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates, in the pixels of a screenshot of the tab (find's coordinates are too; ones computed with javascript_tool are not, when the screenshot says the viewport is larger than the image). Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
     ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions.'),
-    region: z.array(z.number()).min(4).max(4).optional().describe("(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."),
+    region: z.array(z.number()).min(4).max(4).optional().describe("(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in screenshot pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."),
     repeat: z.number().min(1).max(100).optional().describe("Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times."),
     scroll_direction: z.enum(["up", "down", "left", "right"]).optional().describe("The direction to scroll. Required for `scroll`."),
     scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
-    text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
+    text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all). Page shortcuts work; what Firefox itself does for a key, like copying, pasting or its own shortcuts, doesn\'t happen, and the result says so. Keys go to a frame after you click in it.'),
   },
   async (args, extra) => callTool("computer", args, extra)
 );
@@ -857,9 +917,9 @@ server.tool(
 // 5. find
 server.tool(
   "find",
-  'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+  'Find elements on the page, frames included, by words from their text, label, role or type (e.g., "search bar", "login button", "organic mango"). Results have every word that says which element it is, or the most of them, best first. Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
-    query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
+    query: z.string().describe('A few words for what to find (e.g., "search bar", "add to cart button", "organic mango")'),
     tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args, extra) => callTool("find", args, extra)
@@ -868,7 +928,7 @@ server.tool(
 // 6. form_input
 server.tool(
   "form_input",
-  "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Set values in form elements using element reference ID from the read_page tool. If the field can't take the value (no such option, a format it refuses, read-only), the result is an error and the field stays as it was. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     ref: z.string().describe('Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")'),
     value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
@@ -880,7 +940,7 @@ server.tool(
 // 7. get_page_text
 server.tool(
   "get_page_text",
-  "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Extract raw text content from the page, prioritizing article content, and from the frames on it. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
@@ -890,7 +950,7 @@ server.tool(
 // 8. gif_creator
 server.tool(
   "gif_creator",
-  "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
+  "Not available in this extension: GIF recording isn't implemented, and every call returns an error. (In Claude in Chrome, this records browser actions and exports them as an animated GIF.)",
   {
     action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)"),
     tabId: z.number().describe("Tab ID to identify which tab group this operation applies to"),
@@ -951,11 +1011,11 @@ server.tool(
 // 12. read_page
 server.tool(
   "read_page",
-  "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Get an accessibility tree representation of the visible elements on the page, and of the frames on it (each one after the page, under a heading). Elements without a role or a name are left out. Output is limited to 50000 characters by default; longer output is cut, and says so: then use a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)'),
-    depth: z.number().optional().describe("Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."),
+    filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all visible elements with a role or a name (default: all)'),
+    depth: z.number().optional().describe("Maximum depth of the tree shown (default: 15). Use a smaller depth if output is too large."),
     ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
     max_chars: z.number().optional().describe("Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."),
   },
@@ -977,7 +1037,7 @@ server.tool(
 // 14. shortcuts_list
 server.tool(
   "shortcuts_list",
-  "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
+  "Not available in this extension: there are no shortcuts or workflows here, and every call returns an error.",
   {
     tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
@@ -987,7 +1047,7 @@ server.tool(
 // 15. shortcuts_execute
 server.tool(
   "shortcuts_execute",
-  "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
+  "Not available in this extension: there are no shortcuts or workflows here, and every call returns an error.",
   {
     tabId: z.number().describe("Tab ID to execute the shortcut on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
     shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
@@ -999,7 +1059,7 @@ server.tool(
 // 16. switch_browser
 server.tool(
   "switch_browser",
-  "Switch which Firefox browser is used for browser automation. Call this when the user wants to connect to a different Firefox browser.",
+  "Not available in this extension, and every call returns an error: it uses whichever Firefox has it loaded. To use another Firefox, the user can install the extension there and close the other one.",
   {},
   async (args, extra) => callTool("switch_browser", args, extra)
 );
@@ -1007,9 +1067,9 @@ server.tool(
 // 17. update_plan
 server.tool(
   "update_plan",
-  "Present a plan to the user for approval before taking actions. The user will see the domains you intend to visit and your approach. Once approved, you can proceed with actions on the approved domains without additional permission prompts.",
+  "Note your plan: the domains you intend to visit and your approach. This extension has no approval step: nothing is shown to the user and no domain needs approving, so tell them your plan in the conversation if they should see it.",
   {
-    domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com']). These domains will be approved for the session when the user accepts the plan."),
+    domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com'])."),
     approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
   },
   async (args, extra) => callTool("update_plan", args, extra)
@@ -1018,7 +1078,7 @@ server.tool(
 // 18. upload_image
 server.tool(
   "upload_image",
-  "Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.",
+  "Not available in this extension: Firefox WebExtensions can't put a file into a file input or a drop target, and every call returns an error. Ask the user to upload the file.",
   {
     imageId: z.string().describe("ID of a previously captured screenshot (from the computer tool's screenshot action) or a user-uploaded image"),
     tabId: z.number().describe("Tab ID where the target element is located. This is where the image will be uploaded to."),

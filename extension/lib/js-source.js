@@ -2,10 +2,10 @@
 //
 // Code first runs as is, so the value of its last statement comes back as in
 // a console. Top-level `await` and `return` only parse inside a function, so
-// for code that uses them we try function bodies that return the last
-// expression: `return (` is inserted at each place a statement could start,
-// earliest first, and the first body that parses is the one that runs. A body
-// that doesn't parse never runs, so trying several has no side effects.
+// code that doesn't parse as a script is tried as function bodies that return
+// the last expression: `return (` is inserted at each place a statement could
+// start, earliest first, and the first body that parses is the one that runs.
+// A body that doesn't parse never runs, so trying several has no side effects.
 
 // Each candidate is a full copy of the code, so the search is bounded: only
 // code up to AUTO_RETURN_MAX_LENGTH gets one, and only the last
@@ -17,49 +17,65 @@ const AUTO_RETURN_MAX_LENGTH = 100000;
 const LAST_STATEMENT_WINDOW = 4000;
 const MAX_CANDIDATES = 60;
 
-// Error messages Firefox gives for `await` and `return` outside a function
-// (`for await` outside one says "for await (... of ...) is only valid in
-// async functions …"). Its source is sent to pages, which test with it.
-const NEEDS_FUNCTION_BODY = /only valid in async functions|return not in function/i;
-
 // Offsets where the last statement could begin, earliest first: the start of
 // a line, or after a semicolon, outside any brackets. Comments, strings,
 // template literals and regular expressions are skipped: a `;` in a comment
 // isn't a statement boundary, and starting a candidate there would turn
-// commented-out code into code that runs.
+// commented-out code into code that runs. `end` is where the code ends, before
+// any comments after it.
 function statementStarts(code) {
-  if (code.length > AUTO_RETURN_MAX_LENGTH) return [];
+  if (code.length > AUTO_RETURN_MAX_LENGTH) return { starts: [], end: code.length };
   const from = Math.max(0, code.length - LAST_STATEMENT_WINDOW);
   const starts = from === 0 ? [0] : [];
-  for (const at of topLevelBoundaries(code)) {
+  const { boundaries, end } = scanCode(code);
+  for (const at of boundaries) {
     if (at >= from) starts.push(at);
   }
-  return starts.slice(-MAX_CANDIDATES);
+  return { starts: starts.slice(-MAX_CANDIDATES), end };
+}
+
+// Whether the code has an `await (x)`, `await [x]`, await and a line break, …
+// outside any function. Those parse as a script too, with `await` as a plain
+// name, and would fail when they run, so they don't show up as code that
+// needs a function body.
+function awaitsAtTopLevel(code) {
+  return code.length <= AUTO_RETURN_MAX_LENGTH && scanCode(code).bareAwait;
 }
 
 // A small scanner, enough to tell code from comments, strings, template
-// literals and regular expressions. Returns the offsets just after each
-// newline or semicolon that sits in code outside any (), [] or {}. A `/`
+// literals and regular expressions. boundaries: the offsets just after each
+// newline or semicolon that sits in code outside any (), [] or {}. end: just
+// after the last character of code. bareAwait: see awaitsAtTopLevel. A `/`
 // starts a regular expression unless it follows something a value ends
 // with (an identifier, a number, `)` or `]`); keywords like `return` are
-// the usual exception.
+// the usual exception, and so is the `)` of an `if (…)`.
 //
 // A newline is only a boundary where JavaScript would end the statement
 // too: not after a loop or `if` header without braces (`for (…)`, `else`),
 // not after an operator, and not before a line that starts with one (or
 // with `(`, `[` or a template, which continue the line before). Starting a
 // candidate there would put `return (` inside the statement: a loop would
-// stop after its first round, `a\n- b` would become `return -b`.
-function topLevelBoundaries(code) {
+// stop after its first round, `a\n- b` would become `return -b`. (The `while`
+// that ends a `do` statement is the end of it, not a header.)
+function scanCode(code) {
   const out = [];
   const closers = []; // expected closing characters; "`" marks a template's ${ }
-  const headers = []; // alongside closers: whether that "(" opens a for/while/if/with header
+  // Alongside closers: the keyword if that "(" opens a header (for, while, …),
+  // "body" if that "{" opens a function's body.
+  const headers = [];
   let lastSignificant = ""; // the last code character that isn't whitespace
   let lastWord = "";
-  let afterHeader = false; // just after the ")" of such a header
+  let afterHeader = false; // just after the ")" of such a header, outside any brackets
+  let afterAnyHeader = false; // the same, inside brackets too
+  let end = 0; // just after the last character of code
+  let functionDepth = 0; // function bodies around this point
+  let openDos = 0; // `do` statements still waiting for their `while`
+  let bareAwait = false;
   const regexCanFollowWord = /^(return|typeof|instanceof|in|of|new|delete|void|throw|case|do|else|yield|await)$/;
 
   // Whether the statement goes on past the newline at i.
+  let skipFrom = -1; // the last run of whitespace and comments looked past
+  let skipTo = -1;
   const continues = (i) => {
     if (afterHeader) return true;
     if (/^(else|do)$/.test(lastWord) && /[\w$]/.test(lastSignificant)) return true;
@@ -69,18 +85,26 @@ function topLevelBoundaries(code) {
       if (!/(\+\+|--)$/.test(before)) return true;
     }
     // The next token, past blank lines and comments: an operator after them
-    // still continues the statement.
+    // still continues the statement. The newlines in a run of blank lines
+    // and comments share one next token, found once: otherwise each would
+    // scan the rest of the run again.
     let j = i + 1;
-    for (;;) {
-      while (j < code.length && /\s/.test(code[j])) j++;
-      if (code.startsWith("//", j)) {
-        while (j < code.length && code[j] !== "\n") j++;
-      } else if (code.startsWith("/*", j)) {
-        const end = code.indexOf("*/", j + 2);
-        j = end === -1 ? code.length : end + 2;
-      } else {
-        break;
+    if (j >= skipFrom && j <= skipTo) {
+      j = skipTo;
+    } else {
+      for (;;) {
+        while (j < code.length && /\s/.test(code[j])) j++;
+        if (code.startsWith("//", j)) {
+          while (j < code.length && code[j] !== "\n") j++;
+        } else if (code.startsWith("/*", j)) {
+          const end = code.indexOf("*/", j + 2);
+          j = end === -1 ? code.length : end + 2;
+        } else {
+          break;
+        }
       }
+      skipFrom = i + 1;
+      skipTo = j;
     }
     const next = code.slice(j, j + 2);
     if (/^(\+\+|--)/.test(next)) return false;
@@ -94,7 +118,10 @@ function topLevelBoundaries(code) {
     const ch = code[i];
     const next = code[i + 1];
 
-    if (ch === "/" && next === "/") {
+    // (`<!--` and, first on a line, `-->` are comments too in a script.)
+    const htmlComment = (ch === "<" && code.startsWith("<!--", i)) ||
+      (ch === "-" && code.startsWith("-->", i) && /(?:^|\n)[ \t]*$/.test(code.slice(Math.max(0, i - 80), i)));
+    if (htmlComment || (ch === "/" && next === "/")) {
       while (i < code.length && code[i] !== "\n") i++;
       i--; // the newline is handled as code, so it can be a boundary
       continue;
@@ -110,7 +137,8 @@ function topLevelBoundaries(code) {
       }
       lastSignificant = ch;
       lastWord = "";
-      afterHeader = false;
+      afterHeader = afterAnyHeader = false;
+      end = Math.min(i + 1, code.length);
       continue;
     }
     if (ch === "`" || (ch === "}" && closers[closers.length - 1] === "`")) {
@@ -133,11 +161,12 @@ function topLevelBoundaries(code) {
       }
       lastSignificant = "`";
       lastWord = "";
-      afterHeader = false;
+      afterHeader = afterAnyHeader = false;
+      end = Math.min(i + 1, code.length);
       continue;
     }
     if (ch === "/") {
-      const valueEnds = /[\w$)\]]/.test(lastSignificant) && !regexCanFollowWord.test(lastWord);
+      const valueEnds = /[\w$)\]]/.test(lastSignificant) && !regexCanFollowWord.test(lastWord) && !afterAnyHeader;
       if (!valueEnds) {
         let inClass = false;
         for (i++; i < code.length && code[i] !== "\n"; i++) {
@@ -149,20 +178,36 @@ function topLevelBoundaries(code) {
         while (/[a-z]/i.test(code[i + 1] || "")) i++; // flags
         lastSignificant = ")"; // a regular expression ends a value
         lastWord = "";
-        afterHeader = false;
+        afterHeader = afterAnyHeader = false;
+        end = Math.min(i + 1, code.length);
         continue;
       }
     }
 
     let closedHeader = false;
+    let closedAnyHeader = false;
     if (ch === "(" || ch === "[" || ch === "{") {
       // (`for await (` too: its last word is `await`.)
-      headers.push(ch === "(" && /(?:^|[^\w$.])(?:for(?:\s+await)?|while|if|with)\s*$/.test(code.slice(Math.max(0, i - 24), i)));
+      const header = ch === "(" && /(?:^|[^\w$.])(for(?:\s+await)?|while|if|with|catch|switch)\s*$/.exec(code.slice(Math.max(0, i - 24), i));
+      // A `{` after `=>`, or after a `)` that closed no header, is a function's.
+      const body = ch === "{" && ((lastSignificant === ")" && !afterAnyHeader) || (lastSignificant === ">" && code[end - 2] === "="));
+      if (body) functionDepth++;
+      headers.push(body ? "body" : header ? header[1] : false);
       closers.push({ "(": ")", "[": "]", "{": "}" }[ch]);
     } else if (ch === ")" || ch === "]" || ch === "}") {
       if (closers[closers.length - 1] === ch) {
         closers.pop();
-        closedHeader = headers.pop() && closers.length === 0;
+        const header = headers.pop();
+        if (header === "body") {
+          functionDepth--;
+        } else if (header) {
+          closedAnyHeader = true;
+          closedHeader = closers.length === 0;
+          if (closedHeader && header === "while" && openDos > 0) {
+            openDos--;
+            closedHeader = false;
+          }
+        }
       }
     } else if (ch === ";" && closers.length === 0) {
       out.push(i + 1);
@@ -172,23 +217,34 @@ function topLevelBoundaries(code) {
 
     if (/[\w$]/.test(ch)) {
       lastWord = /[\w$]/.test(lastSignificant) && code[i - 1] && /[\w$]/.test(code[i - 1]) ? lastWord + ch : ch;
+      if (!/[\w$]/.test(next || "") && code[i - lastWord.length] !== ".") {
+        if (lastWord === "do" && closers.length === 0) openDos++;
+        // `await x` doesn't parse as a script; these do.
+        if (lastWord === "await" && functionDepth === 0 && /^(?:\s*[([`]|[ \t]*\r?\n)/.test(code.slice(i + 1, i + 200))) {
+          bareAwait = true;
+        }
+      }
     } else if (!/\s/.test(ch)) {
       lastWord = "";
     }
     if (!/\s/.test(ch)) {
       lastSignificant = ch;
       afterHeader = closedHeader;
+      afterAnyHeader = closedAnyHeader;
+      end = i + 1;
     }
   }
-  return out;
+  return { boundaries: out, end, bareAwait };
 }
 
-// The async function body that returns the expression starting at `at`, or
-// null when nothing follows. Self-contained: its source is also sent to
-// pages, which build the candidates themselves.
-function returnBodyAt(code, at) {
-  const last = code.slice(at).replace(/[\s;]+$/, "");
-  if (!last.trim()) return null;
+// The async function body that returns the expression starting at `at` and
+// ending at `end`, or null when there's none: nothing follows, or it's a
+// function declaration, which `return (` would turn into an expression that
+// code above it can't call. Self-contained: its source is also sent to pages,
+// which build the candidates themselves.
+function returnBodyAt(code, at, end = code.length) {
+  const last = code.slice(at, end).replace(/[\s;]+$/, "");
+  if (!last.trim() || /^\s*(?:async\s+)?function\b/.test(last)) return null;
   // Newlines around the expression keep a trailing // comment from
   // swallowing the closing parenthesis.
   return `${code.slice(0, at)}\nreturn (\n${last}\n);`;
@@ -198,8 +254,9 @@ function returnBodyAt(code, at) {
 // one is the code unchanged, for code whose last statement isn't an
 // expression.
 function* functionBodies(code) {
-  for (const at of statementStarts(code)) {
-    const body = returnBodyAt(code, at);
+  const { starts, end } = statementStarts(code);
+  for (const at of starts) {
+    const body = returnBodyAt(code, at, end);
     if (body !== null) yield body;
   }
   yield code;

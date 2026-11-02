@@ -17,15 +17,20 @@
   const CONTENT_DEADLINE_MARGIN_MS = 1000;
 
   // --- Element reference map ---
-  // Persistent ref IDs stored as WeakRefs so GC still works
+  // Persistent ref IDs stored as WeakRefs so GC still works. A ref names its
+  // document, so one from before a navigation can't mean an element of the
+  // next page, and its frame, for the background to send messages about it
+  // to (ref_f<frame id>_…).
   let refCounter = 0;
+  const frameId = chrome.runtime.getFrameId(window);
+  const refPrefix = `ref_${frameId > 0 ? `f${frameId}_` : ""}${Math.random().toString(36).slice(2, 6)}_`;
   const elementMap = {}; // refId -> WeakRef<Element>
   const reverseMap = new WeakMap(); // Element -> refId
 
   function getOrAssignRef(el) {
     const existing = reverseMap.get(el);
     if (existing && elementMap[existing]?.deref() === el) return existing;
-    const ref = `ref_${++refCounter}`;
+    const ref = `${refPrefix}${++refCounter}`;
     elementMap[ref] = new WeakRef(el);
     reverseMap.set(el, ref);
     return ref;
@@ -78,6 +83,8 @@
     audio: "audio",
     section: "region",
     article: "article",
+    iframe: "iframe",
+    frame: "iframe",
   };
 
   function getRole(el) {
@@ -103,6 +110,7 @@
   // --- Accessible name ---
   // On one line: text from the page keeps its source's newlines and
   // indentation.
+  let labelIndex = null; // id -> its <label>, while every element gets a name
   function getAccessibleName(el) {
     return nameFromPage(el).replace(/\s+/g, " ").trim();
   }
@@ -130,7 +138,7 @@
 
     // Associated <label>
     if (el.id) {
-      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const label = labelIndex ? labelIndex.get(el.id) : document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (label) return label.textContent.trim();
     }
     if (el.closest("label")) {
@@ -177,12 +185,13 @@
     let output = "";
     let charCount = 0;
     let truncated = false;
+    let tooDeep = false;
 
     function append(text) {
       if (truncated) return false;
       if (charCount + text.length > maxChars) {
         output += text.substring(0, maxChars - charCount);
-        output += "\n... (truncated)";
+        output += "\n... (truncated: use a smaller depth, or ref_id to read one part of the page)";
         truncated = true;
         return false;
       }
@@ -191,9 +200,10 @@
       return true;
     }
 
+    // depth counts the levels shown, not the elements around them: pages nest
+    // their content in rows of unnamed <div>s.
     function walk(el, depth, indent) {
       if (truncated) return;
-      if (depth > maxDepth) return;
       if (!el || el.nodeType !== 1) return;
 
       const tag = el.tagName.toLowerCase();
@@ -206,14 +216,19 @@
       const visible = isVisible(el);
 
       // Filter: if interactive-only mode, skip non-interactive non-container elements
-      const isContainer = el.children.length > 0;
+      const isContainer = el.children.length > 0 || !!el.shadowRoot;
       if (filter === "interactive" && !interactive && !isContainer) return;
 
       const shouldShow =
         (filter === "all" && (role || name)) ||
         (filter === "interactive" && interactive);
 
-      if (shouldShow && visible) {
+      const shown = shouldShow && visible;
+      if (shown && depth > maxDepth) {
+        tooDeep = true;
+        return;
+      }
+      if (shown) {
         const ref = getOrAssignRef(el);
         let line = `${indent}`;
 
@@ -228,7 +243,7 @@
           // A password (often filled in by Firefox) isn't shown, only that
           // there is one; nor are card numbers and one-time codes.
           const secret = el.type === "password" ||
-            /^(cc-number|cc-csc|one-time-code|current-password|new-password)$/.test(el.getAttribute("autocomplete") || "");
+            /(?:^|\s)(?:cc-number|cc-csc|one-time-code|current-password|new-password)(?:\s|$)/i.test(el.getAttribute("autocomplete") || "");
           line += secret ? ` value="[hidden]"` : ` value="${el.value.substring(0, 100)}"`;
         }
         if (tag === "input") line += ` type="${el.type || "text"}"`;
@@ -249,29 +264,52 @@
       }
 
       // Recurse children (including shadow DOM)
-      const nextIndent = shouldShow && visible ? indent + "  " : indent;
+      const nextIndent = shown ? indent + "  " : indent;
+      const nextDepth = shown ? depth + 1 : depth;
       if (el.shadowRoot) {
         for (const child of el.shadowRoot.children) {
-          walk(child, depth + 1, nextIndent);
+          walk(child, nextDepth, nextIndent);
         }
       }
       for (const child of el.children) {
-        walk(child, depth + 1, nextIndent);
+        walk(child, nextDepth, nextIndent);
       }
     }
 
     let root = document.body;
     if (startRefId) {
       const el = resolveRef(startRefId);
-      if (el) root = el;
-      else return `Error: ref_id "${startRefId}" not found or element was garbage collected.`;
+      if (!el || !el.isConnected) return { error: `ref_id "${startRefId}" is no longer on the page. Use read_page or find again.` };
+      root = el;
     }
 
     walk(root, 0, "");
+    if (tooDeep && !truncated) output += "... (deeper elements left out: use a larger depth, or ref_id to read one part of the page)\n";
     return output;
   }
 
   // --- Page text extraction ---
+  const TEXT_LIMIT = 100000;
+  const SKIPPED_TEXT = new Set(["script", "style", "noscript", "template", "svg"]);
+  const BLOCK_TAG = /^(?:address|article|aside|blockquote|br|dd|details|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|option|p|pre|section|summary|table|td|th|tr|ul)$/;
+
+  // The text under a node, into `parts`: elements that are blocks are kept
+  // apart, and open shadow roots are read too.
+  function collectText(node, parts) {
+    if (node.nodeType === 3) {
+      parts.push(node.data);
+      return;
+    }
+    const tag = node.localName || "";
+    if (SKIPPED_TEXT.has(tag) || node === glowHost) return;
+    const block = BLOCK_TAG.test(tag);
+    if (block) parts.push(" ");
+    const assigned = tag === "slot" ? node.assignedNodes() : [];
+    const children = node.shadowRoot?.childNodes ?? (assigned.length ? assigned : node.childNodes);
+    for (const child of children) collectText(child, parts);
+    if (block) parts.push(" ");
+  }
+
   function getPageText() {
     const selectors = [
       "article",
@@ -301,18 +339,49 @@
     const url = location.href;
     const tag = source.tagName.toLowerCase();
 
-    // Clean text: remove script/style content, collapse whitespace
-    const clone = source.cloneNode(true);
-    clone.querySelectorAll("script, style, noscript, template, svg").forEach((el) => el.remove());
-    const text = clone.textContent.replace(/\s+/g, " ").trim();
+    // Clean text: without script/style content, whitespace collapsed
+    const parts = [];
+    collectText(source, parts);
+    const text = parts.join("").replace(/\s+/g, " ").trim();
 
-    return JSON.stringify({ title, url, sourceTag: tag, text: text.substring(0, 100000) });
+    return JSON.stringify({
+      title, url, sourceTag: tag,
+      text: text.substring(0, TEXT_LIMIT),
+      fullLength: text.length,
+    });
   }
 
   // --- Element finding ---
+  const MAX_FOUND = 20;
+  // Words that only join a description ("add to cart button").
+  const FILLER_WORDS = new Set(["a", "an", "and", "called", "containing", "for", "in", "named", "of", "on", "or", "says", "that", "the", "to", "with"]);
+  // Words for the kind of thing wanted: they rank results, but a search box
+  // needn't contain "bar" to be the "search bar".
+  const KIND_WORDS = new Set(["area", "bar", "box", "btn", "button", "element", "field", "icon", "input", "link", "section"]);
+
+  // The element's own text, not its children's: asking every element on a page
+  // for all the text under it takes long, and matches what's around a result.
+  function ownText(el) {
+    let text = "";
+    for (const node of el.childNodes) {
+      if (node.nodeType === 3) text += node.data;
+    }
+    return text.trim().substring(0, 200);
+  }
+
+  // Elements described by the query, best first. Each word of it is looked for
+  // at the start of a word in an element's role, name, text and attributes
+  // ("search" finds "searchbox", "me" doesn't find "frame"). The elements with
+  // all of them are the results, or else those with the most of them: tier
+  // says how many, for the background to rank results from frames.
   function findElements(query) {
-    const q = query.toLowerCase();
-    const results = [];
+    const lower = query.toLowerCase();
+    const words = lower.split(/\s+/).filter((w) => w && !FILLER_WORDS.has(w));
+    if (!words.length) words.push(lower.trim());
+    const needed = words.filter((w) => !KIND_WORDS.has(w));
+    if (!needed.length) needed.push(...words);
+    const startsWord = new Map(words.map((w) => [w, new RegExp(`(?:^|[^\\p{L}\\p{N}])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "u")]));
+    const has = (text, w) => startsWord.get(w).test(text);
 
     // Collect all elements including those inside shadow roots
     function collectAll(root) {
@@ -327,110 +396,165 @@
       return elements;
     }
 
-    const all = collectAll(document);
+    labelIndex = new Map();
+    for (const label of document.querySelectorAll("label[for]")) {
+      if (!labelIndex.has(label.htmlFor)) labelIndex.set(label.htmlFor, label);
+    }
+    const matches = [];
+    let lastInteractive = null;
+    try {
+      for (const el of collectAll(document)) {
+        const tag = el.tagName.toLowerCase();
+        if (["script", "style", "noscript", "template"].includes(tag)) continue;
 
-    for (const el of all) {
-      if (results.length >= 20) break;
-      if (!isVisible(el)) continue;
+        const role = getRole(el) || "";
+        const name = getAccessibleName(el) || "";
+        const text = ownText(el);
+        // Attributes, not properties (see getAccessibleName).
+        const attrs = ["placeholder", "aria-label", "title", "type"].map((a) => el.getAttribute(a) || "");
+        const searchable = `${role} ${name} ${text} ${attrs.join(" ")} ${tag}`.toLowerCase();
 
-      const tag = el.tagName.toLowerCase();
-      if (["script", "style", "noscript", "template"].includes(tag)) continue;
-
-      const role = getRole(el) || "";
-      const name = getAccessibleName(el) || "";
-      const text = el.textContent?.trim()?.substring(0, 200) || "";
-      // Attributes, not properties (see getAccessibleName).
-      const attrs = ["placeholder", "aria-label", "title", "type"].map((a) => el.getAttribute(a) || "");
-
-      const searchable = `${role} ${name} ${text} ${attrs.join(" ")} ${tag}`.toLowerCase();
-
-      if (searchable.includes(q)) {
-        const ref = getOrAssignRef(el);
-        const rect = el.getBoundingClientRect();
-        const center = [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)];
-        results.push({
-          ref,
-          role: role || tag,
-          name: name || text.substring(0, 80),
-          coordinates: center,
-          offscreen: !inViewport(...center),
+        const hasNeeded = needed.filter((w) => has(searchable, w)).length;
+        if (!hasNeeded) continue;
+        // The text inside a button or link is that button or link.
+        const interactive = isInteractive(el);
+        if (!interactive && lastInteractive && isWithin(el, lastInteractive)) continue;
+        if (interactive) lastInteractive = el;
+        matches.push({
+          el, role, name, text, tag, interactive, hasNeeded,
+          score: words.filter((w) => has(searchable, w)).length,
         });
       }
+    } finally {
+      labelIndex = null;
     }
-    return results;
+
+    const best = matches.reduce((most, m) => Math.max(most, m.hasNeeded), 0);
+    const ranked = matches
+      .filter((m) => m.hasNeeded === best)
+      .sort((a, b) => b.score - a.score || b.interactive - a.interactive);
+
+    const found = [];
+    for (const { el, role, name, text, tag, interactive, score } of ranked) {
+      if (!isVisible(el)) continue;
+      if (found.length === MAX_FOUND) return { found, more: true, tier: best };
+      const ref = getOrAssignRef(el);
+      const rect = el.getBoundingClientRect();
+      const center = [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)];
+      found.push({
+        ref,
+        role: role || tag,
+        name: name || text.substring(0, 80),
+        coordinates: center,
+        offscreen: !inViewport(...center),
+        score,
+        interactive,
+      });
+    }
+    return { found, more: false, tier: best };
   }
 
   // --- Form input ---
 
-  // Find the actual input/textarea/select inside an element, traversing shadow DOM
+  // Input types that don't take typed text.
+  const NOT_TYPED = /^(?:button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/;
+  function isTextField(el) {
+    const tag = el.localName;
+    return tag === "textarea" || (tag === "input" && !NOT_TYPED.test(el.type));
+  }
+
+  // Sets a field's value through the browser's own setter, not one a page
+  // framework put on the element.
+  function setNativeValue(el, value) {
+    const proto = el.localName === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+  }
+
+  // Find the actual input/textarea/select inside an element: in its shadow
+  // root, among its own children (which may be slotted into that root), or in
+  // the shadow roots of those.
   function findInputInside(el) {
-    const tag = el.tagName.toLowerCase();
-    if (["input", "textarea", "select"].includes(tag)) return el;
-
-    // Check shadow DOM first
-    const root = el.shadowRoot || el;
-    const inner = root.querySelector("input, textarea, select");
-    if (inner) return inner;
-
-    // Recurse into shadow roots of children
-    for (const child of root.querySelectorAll("*")) {
-      if (child.shadowRoot) {
-        const deep = child.shadowRoot.querySelector("input, textarea, select");
+    if (["input", "textarea", "select"].includes(el.localName)) return el;
+    for (const root of [el.shadowRoot, el]) {
+      if (!root) continue;
+      const inner = root.querySelector("input, textarea, select");
+      if (inner) return inner;
+      for (const child of root.querySelectorAll("*")) {
+        const deep = child.shadowRoot?.querySelector("input, textarea, select");
         if (deep) return deep;
       }
     }
     return null;
   }
 
+  const BOOLEAN_WORDS = {
+    true: true, on: true, yes: true, 1: true,
+    false: false, off: false, no: false, 0: false,
+  };
+  const FIELD_FORMATS = {
+    date: "yyyy-mm-dd", month: "yyyy-mm", week: "yyyy-Www", time: "hh:mm",
+    "datetime-local": "yyyy-mm-ddThh:mm", number: "a number",
+  };
+
+  // Sets a form field and checks it took the value; anything else is an error.
   function setFormValue(refId, value) {
     const el = resolveRef(refId);
-    if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
+    if (!el || !el.isConnected) return { error: `Element ${refId} is no longer on the page. Use read_page or find again.` };
 
     el.scrollIntoView({ block: "center", behavior: "instant" });
 
     // Resolve the actual form element (may be inside shadow DOM)
     const target = findInputInside(el) || el;
-    const tag = target.tagName.toLowerCase();
-    const type = (target.type || "").toLowerCase();
+    const tag = target.localName;
+    const type = String(target.type || "").toLowerCase();
+    const wanted = String(value);
+    const field = ["input", "textarea", "select"].includes(tag);
+
+    if (field && target.matches(":disabled")) return { error: `This <${tag}> is disabled.` };
 
     if (tag === "select") {
-      const opt = Array.from(target.options).find(
-        (o) => o.value === String(value) || o.textContent.trim() === String(value)
-      );
-      if (opt) {
-        target.value = opt.value;
-      } else {
-        target.value = String(value);
+      const options = Array.from(target.options);
+      const opt = options.find((o) => o.value === wanted) || options.find((o) => o.textContent.trim() === wanted);
+      if (!opt) {
+        const names = options.slice(0, 50).map((o) => `"${o.textContent.trim() || o.value}"`).join(", ");
+        return { error: `This <select> has no option "${wanted}", and it was left as it was. Its options: ${names}.` };
       }
+      if (opt.disabled) return { error: `Option "${wanted}" is disabled.` };
+      opt.selected = true;
     } else if (type === "checkbox" || type === "radio") {
-      const shouldCheck = typeof value === "boolean" ? value : value === "true";
+      const shouldCheck = BOOLEAN_WORDS[wanted.trim().toLowerCase()];
+      if (shouldCheck === undefined) return { error: `Use true or false for a ${type}, not "${wanted}".` };
+      if (type === "radio" && target.checked && !shouldCheck) {
+        return { error: "A radio button can't be unchecked: choose another one of its group." };
+      }
       if (target.checked !== shouldCheck) target.click();
+      if (target.checked !== shouldCheck) return { error: `The page kept this ${type} ${target.checked ? "checked" : "unchecked"}.` };
       return { success: true, checked: target.checked };
-    } else if (target.contentEditable === "true") {
-      target.textContent = String(value);
-    } else if (["input", "textarea"].includes(tag)) {
-      // Use the native setter for actual input/textarea elements
-      const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) {
-        setter.call(target, String(value));
-      } else {
-        target.value = String(value);
+    } else if (tag === "input" || tag === "textarea") {
+      if (type === "file") return { error: "A file input can't be set from here: ask the user to choose the file." };
+      if (target.readOnly) return { error: `This <${tag}> is read-only.` };
+      const before = target.value;
+      setNativeValue(target, wanted);
+      // The browser empties a value this kind of field can't hold.
+      if (wanted && !target.value) {
+        setNativeValue(target, before);
+        const format = FIELD_FORMATS[type];
+        return { error: `This ${type} field didn't accept "${wanted}"${format ? ` (it takes ${format})` : ""}, and it was left as it was.` };
       }
+    } else if (target.isContentEditable) {
+      target.textContent = wanted;
     } else {
-      // Fallback for unknown elements — try direct assignment
-      try {
-        target.value = String(value);
-      } catch {
-        return { error: `Cannot set value on <${tag}> element. No input found inside.` };
-      }
+      return { error: `<${tag}> isn't a form field, and has none inside: click it and use type, if it takes text.` };
     }
 
     // Dispatch events on the target (bubbles up through shadow DOM)
     target.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     target.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
 
-    return { success: true, value: target.value };
+    if (tag === "select") {
+      return { success: true, value: Array.from(target.selectedOptions, (o) => o.value).join(", ") };
+    }
+    return { success: true, value: target.isContentEditable ? target.textContent : target.value };
   }
 
   // --- Where to click an element given by ref ---
@@ -452,12 +576,58 @@
     return 0 <= x && x < window.innerWidth && 0 <= y && y < window.innerHeight;
   }
 
+  // The element above `el` as the page shows it: past the <slot> it's in, and
+  // out of a shadow root to its host.
+  function parentOf(el) {
+    return el.assignedSlot || el.parentElement || el.getRootNode().host || null;
+  }
+
   // Whether `node` is `el` or inside it, crossing shadow DOM boundaries.
   function isWithin(node, el) {
-    for (let n = node; n; n = n.parentNode || n.host) {
+    for (let n = node; n; n = parentOf(n)) {
       if (n === el) return true;
     }
     return false;
+  }
+
+  // --- Frames ---
+  // This script normally runs only in the page itself; a frame gets it when
+  // Claude first reaches into that frame. What's asked for a point over a
+  // frame is for that frame's document: the answer here says so
+  // ({ intoFrame }) and the background sends the message on, with the point in
+  // that frame's own coordinates.
+
+  // The frame's id if `el` is a frame this extension can address.
+  function frameOf(el) {
+    if (el.localName !== "iframe" && el.localName !== "frame") return null;
+    const id = chrome.runtime.getFrameId(el);
+    return id > 0 ? id : null;
+  }
+
+  // A point of this document in the coordinates of the frame's document.
+  function pointInFrame(frame, x, y) {
+    const rect = frame.getBoundingClientRect();
+    const style = getComputedStyle(frame);
+    const scaleX = frame.offsetWidth ? rect.width / frame.offsetWidth : 1;
+    const scaleY = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
+    return {
+      x: (x - rect.left) / scaleX - frame.clientLeft - parseFloat(style.paddingLeft),
+      y: (y - rect.top) / scaleY - frame.clientTop - parseFloat(style.paddingTop),
+    };
+  }
+
+  // The frames shown in this document, with where each one's top left corner is.
+  function listFrames() {
+    const frames = [];
+    for (const frame of document.querySelectorAll("iframe, frame")) {
+      const id = frameOf(frame);
+      if (id === null) continue;
+      const rect = frame.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2 || !isVisible(frame)) continue;
+      const { x, y } = pointInFrame(frame, 0, 0);
+      frames.push({ frameId: id, x: -x, y: -y });
+    }
+    return frames;
   }
 
   function describeElement(el) {
@@ -538,9 +708,13 @@
       const link = event.composedPath().find(
         (node) => (node instanceof HTMLAnchorElement || node instanceof HTMLAreaElement) && node.href
       );
-      if (!link || link.hasAttribute("download") || !/^(https?|file):/i.test(link.href)) return;
-      const target = (link.getAttribute("target") || "").trim().toLowerCase();
-      const sameTab = ["", "_self", "_top", "_parent"].includes(target);
+      // Web pages only: navigate can't open local files either.
+      if (!link || link.hasAttribute("download") || !/^https?:/i.test(link.href)) return;
+      // Its own target, or the page's <base target>. A name can be a frame's.
+      const named = (link.getAttribute("target") ?? document.querySelector("base[target]")?.getAttribute("target") ?? "").trim();
+      const target = named.toLowerCase();
+      const sameTab = ["", "_self", "_top", "_parent"].includes(target) ||
+        document.querySelector(`iframe[name="${CSS.escape(named)}"], frame[name="${CSS.escape(named)}"]`);
       if (sameTab && !event.ctrlKey && !event.metaKey && !event.shiftKey) return;
       event.preventDefault();
       url = link.href;
@@ -562,7 +736,7 @@
   // away from where it was.
   const FOCUSABLE = 'a[href], area[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable]:not([contenteditable="false"])';
   function focusForClick(el) {
-    for (let node = el; node; node = node.parentElement || node.getRootNode().host) {
+    for (let node = el; node; node = parentOf(node)) {
       if (node.matches?.(FOCUSABLE) && !node.disabled) {
         node.focus({ preventScroll: true });
         return;
@@ -597,22 +771,25 @@
   // hasn't changed the field in between.
   const typedAhead = new WeakMap(); // field -> { text, shown }
   let lastTypedField = null; // gets one change event when typing ends
+  // Fields like email and number have no caret or selection a script can
+  // read: these are the ones whose whole value is selected, and typing there
+  // replaces it.
+  const allSelected = new WeakSet();
 
   // Inserts text at the caret of a text field or editable element. Returns
   // whether there was somewhere to put it.
   function insertText(el, text) {
-    const tag = el.tagName.toLowerCase();
-    if (tag === "input" || tag === "textarea") {
+    if (isTextField(el)) {
+      if (el.readOnly || el.matches(":disabled")) return false;
+      const replacing = allSelected.delete(el);
       const ahead = typedAhead.get(el);
-      const current = ahead && el.value === ahead.shown ? ahead.text : el.value;
+      const current = replacing ? "" : ahead && el.value === ahead.shown ? ahead.text : el.value;
       // selectionStart is null on types like email and number: append.
-      const caretKnown = current === el.value && el.selectionStart !== null;
+      const caretKnown = !replacing && current === el.value && el.selectionStart !== null;
       const start = caretKnown ? el.selectionStart : current.length;
       const end = caretKnown ? el.selectionEnd : current.length;
-      const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
       const newVal = current.slice(0, start) + text + current.slice(end);
-      if (setter) setter.call(el, newVal); else el.value = newVal;
+      setNativeValue(el, newVal);
       if (el.value === newVal) {
         typedAhead.delete(el);
         try {
@@ -633,6 +810,408 @@
     return false;
   }
 
+  function isEditable(el) {
+    return isTextField(el) || el.isContentEditable;
+  }
+
+  // --- What the browser does for a key ---
+  // A synthetic key reaches the page's handlers and does nothing else: no
+  // text changes, the focus stays, no form is submitted. So what a key does in
+  // a browser, unless a handler cancelled it, is done here.
+
+  function selectAll(el) {
+    if (isTextField(el)) {
+      el.select();
+      if (el.selectionStart === null) allSelected.add(el);
+    } else if (el.isContentEditable) {
+      document.execCommand("selectAll");
+    } else {
+      window.getSelection().selectAllChildren(document.body);
+    }
+  }
+
+  // The button Enter presses in a form, if it has one.
+  function defaultButton(form) {
+    const isSubmit = (el) => el.matches?.('button:not([type]), button[type="submit" i], input[type="submit" i], input[type="image" i]');
+    return [...form.elements].find(isSubmit) || form.querySelector('input[type="image" i]');
+  }
+
+  // Enter. Returns whether it submitted a form.
+  function pressEnter(el) {
+    if (el.localName === "textarea") {
+      insertText(el, "\n");
+    } else if (el.isContentEditable) {
+      document.execCommand("insertParagraph");
+    } else if (el.localName === "input" && !/^(?:button|image|reset|submit)$/.test(el.type)) {
+      // A real field gets its change event before the form is submitted.
+      if (lastTypedField === el) {
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        lastTypedField = null;
+      }
+      const form = el.form;
+      if (!form) return false;
+      const button = defaultButton(form);
+      if (button) {
+        if (button.matches(":disabled")) return false;
+        button.click();
+      } else {
+        // Without a button, only a form with one field is submitted.
+        if ([...form.elements].filter((f) => isTextField(f) && f.type !== "hidden").length > 1) return false;
+        form.requestSubmit();
+      }
+      return true;
+    } else if (el.matches?.("a[href], area[href], button, input, summary")) {
+      el.click();
+    }
+    return false;
+  }
+
+  // The elements Tab goes through, in order.
+  function tabStops() {
+    const stops = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll("*")) {
+        if (el === glowHost) continue;
+        if (el.matches(FOCUSABLE) && el.tabIndex >= 0 && el.type !== "hidden" && !el.matches(":disabled") && isVisible(el)) {
+          stops.push(el);
+        }
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    const positive = stops.filter((el) => el.tabIndex > 0).sort((a, b) => a.tabIndex - b.tabIndex);
+    return [...positive, ...stops.filter((el) => el.tabIndex === 0)];
+  }
+
+  function moveFocus(backwards) {
+    const stops = tabStops();
+    if (!stops.length) return;
+    const at = stops.indexOf(focusedElement());
+    const next = at === -1 ? (backwards ? stops[stops.length - 1] : stops[0])
+      : stops[(at + (backwards ? -1 : 1) + stops.length) % stops.length];
+    next.focus({ preventScroll: false });
+    if (isTextField(next)) selectAll(next); // Tab selects what's in a field
+  }
+
+  // Backspace, or Delete with `forward`.
+  function deleteText(el, forward) {
+    if (isTextField(el)) {
+      if (el.readOnly || el.matches(":disabled")) return true;
+      const value = el.value;
+      const noCaret = el.selectionStart === null;
+      let start = noCaret ? value.length : el.selectionStart;
+      let end = noCaret ? value.length : el.selectionEnd;
+      if (allSelected.delete(el)) {
+        start = 0;
+      } else if (start === end) {
+        if (forward) end += /[\uD800-\uDBFF]/.test(value[end] || "") ? 2 : 1;
+        else start -= /[\uDC00-\uDFFF]/.test(value[start - 1] || "") ? 2 : 1;
+        start = Math.max(0, start);
+        end = Math.min(value.length, end);
+      }
+      if (start === end) return true;
+      setNativeValue(el, value.slice(0, start) + value.slice(end));
+      if (!noCaret) el.setSelectionRange(start, start);
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true, composed: true, inputType: forward ? "deleteContentForward" : "deleteContentBackward",
+      }));
+      lastTypedField = el;
+      return true;
+    }
+    if (el.isContentEditable) {
+      document.execCommand(forward ? "forwardDelete" : "delete");
+      return true;
+    }
+    return false;
+  }
+
+  // An arrow key, Home or End in a text field; `extend` (shift) moves only
+  // one end of the selection.
+  function moveCaret(el, key, extend) {
+    if (el.selectionStart === null) return;
+    const value = el.value;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const backwards = key === "ArrowLeft" || key === "ArrowUp" || key === "Home";
+    const reversed = el.selectionDirection === "backward";
+    const anchor = reversed ? end : start;
+    let at = extend ? (reversed ? start : end) : (backwards ? start : end);
+    const lineStart = (p) => (p === 0 ? 0 : value.lastIndexOf("\n", p - 1) + 1);
+    const lineEnd = (p) => (value.indexOf("\n", p) === -1 ? value.length : value.indexOf("\n", p));
+    if (key === "ArrowLeft" || key === "ArrowRight") {
+      if (extend || start === end) at = Math.min(value.length, Math.max(0, at + (backwards ? -1 : 1)));
+    } else if (key === "Home") {
+      at = lineStart(at);
+    } else if (key === "End") {
+      at = lineEnd(at);
+    } else if (el.localName === "textarea") {
+      const column = at - lineStart(at);
+      if (key === "ArrowUp") {
+        const here = lineStart(at);
+        at = here === 0 ? 0 : Math.min(lineStart(here - 1) + column, here - 1);
+      } else {
+        const stop = lineEnd(at);
+        at = stop === value.length ? stop : Math.min(stop + 1 + column, lineEnd(stop + 1));
+      }
+    } else {
+      return;
+    }
+    if (extend) el.setSelectionRange(Math.min(anchor, at), Math.max(anchor, at), at < anchor ? "backward" : "forward");
+    else el.setSelectionRange(at, at);
+  }
+
+  const CARET_MOVES = {
+    ArrowLeft: ["backward", "character"], ArrowRight: ["forward", "character"],
+    ArrowUp: ["backward", "line"], ArrowDown: ["forward", "line"],
+    Home: ["backward", "lineboundary"], End: ["forward", "lineboundary"],
+  };
+
+  // An arrow key on a <select>: the next option that can be chosen.
+  function stepSelect(el, key) {
+    const step = key === "ArrowUp" || key === "ArrowLeft" ? -1 : 1;
+    let at = el.selectedIndex + step;
+    while (el.options[at]?.disabled) at += step;
+    if (!el.options[at]) return;
+    el.selectedIndex = at;
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  }
+
+  // A key that scrolls: what's around the focus if that can move, else the page.
+  function scrollForKey(key, shift) {
+    const line = 40;
+    const screenful = window.innerHeight * 0.9;
+    const dy = { ArrowDown: line, ArrowUp: -line, PageDown: screenful, PageUp: -screenful, " ": shift ? -screenful : screenful, End: 1e9, Home: -1e9 }[key] || 0;
+    const dx = { ArrowRight: line, ArrowLeft: -line }[key] || 0;
+    scrollMoves(findScrollableAncestor(focusedElement(), dx, dy) || window, dx, dy);
+  }
+
+  // Does what the browser does for a key (given that no handler cancelled
+  // it). Returns { noDefault } if it does something this can't do (ctrl+c, a
+  // function key), { submitted } if a form was submitted.
+  function keyDefault(key, modifiers) {
+    const el = focusedElement();
+    const shift = !!(modifiers & 8);
+    if (modifiers & 7) {
+      // ctrl or cmd+a; other shortcuts are the browser's own.
+      if (!(modifiers & 1) && (modifiers & 6) && key.toLowerCase() === "a") {
+        selectAll(el);
+        return {};
+      }
+      return /^(?:Alt|Control|Meta|Shift)$/.test(key) ? {} : { noDefault: true };
+    }
+    switch (key) {
+      case "Enter":
+        return { submitted: pressEnter(el) };
+      case "Tab":
+        moveFocus(shift);
+        return {};
+      case "Backspace":
+      case "Delete":
+        deleteText(el, key === "Delete");
+        return {};
+      case "ArrowLeft":
+      case "ArrowRight":
+      case "ArrowUp":
+      case "ArrowDown":
+      case "Home":
+      case "End":
+        if (el.localName === "select") {
+          if (key.startsWith("Arrow")) stepSelect(el, key);
+        } else if (el.localName === "input" && el.type === "number" && (key === "ArrowUp" || key === "ArrowDown")) {
+          if (key === "ArrowUp") el.stepUp();
+          else el.stepDown();
+          el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          lastTypedField = el;
+        } else if (isTextField(el)) {
+          moveCaret(el, key, shift);
+        } else if (el.isContentEditable) {
+          window.getSelection().modify(shift ? "extend" : "move", ...CARET_MOVES[key]);
+        } else {
+          scrollForKey(key, shift);
+        }
+        return {};
+      case "PageUp":
+      case "PageDown":
+        if (!isEditable(el)) scrollForKey(key, shift);
+        return {};
+      case " ":
+        if (isEditable(el)) insertText(el, " ");
+        else if (el.matches?.('button, input, summary, [role="button"], [role="checkbox"], [role="switch"]')) el.click();
+        else scrollForKey(key, shift);
+        return {};
+      case "Escape":
+      case "Shift":
+      case "Alt":
+      case "Control":
+      case "Meta":
+        return {};
+      default:
+        if ([...key].length === 1) {
+          insertText(el, key);
+          return {};
+        }
+        return { noDefault: true };
+    }
+  }
+
+  // --- Selection by clicking ---
+  // Synthetic clicks don't move the caret or select anything: done here, so
+  // what's typed next lands where it would.
+
+  function isWordCharacter(ch) {
+    return /[\p{L}\p{N}_]/u.test(ch || "");
+  }
+
+  function wordAt(text, at) {
+    let start = Math.min(at, text.length);
+    if (!isWordCharacter(text[start]) && isWordCharacter(text[start - 1])) start--;
+    if (!isWordCharacter(text[start])) return [start, start];
+    let end = start;
+    while (start > 0 && isWordCharacter(text[start - 1])) start--;
+    while (end < text.length && isWordCharacter(text[end])) end++;
+    return [start, end];
+  }
+
+  // detail: how many clicks in a row. One places the caret, two select a word,
+  // three a line (or paragraph, in page text).
+  function selectForClick(el, x, y, detail) {
+    const point = document.caretPositionFromPoint(x, y);
+    if (isTextField(el)) {
+      if (el.selectionStart === null) {
+        // No caret to place here: two clicks or more select all of it.
+        if (detail >= 2) selectAll(el);
+        else allSelected.delete(el);
+        return;
+      }
+      allSelected.delete(el);
+      const value = el.value;
+      const at = point?.offsetNode === el ? point.offset : el.selectionStart;
+      if (detail === 1) {
+        if (point?.offsetNode === el) el.setSelectionRange(at, at);
+      } else if (detail === 2) {
+        el.setSelectionRange(...wordAt(value, at));
+      } else if (el.localName === "textarea") {
+        const start = at === 0 ? 0 : value.lastIndexOf("\n", at - 1) + 1;
+        const stop = value.indexOf("\n", at);
+        el.setSelectionRange(start, stop === -1 ? value.length : stop);
+      } else {
+        el.select();
+      }
+      return;
+    }
+    if (!point?.offsetNode) return;
+    const selection = window.getSelection();
+    const { offsetNode: node, offset } = point;
+    if (detail === 1) {
+      selection.collapse(node, offset);
+    } else if (detail === 2) {
+      if (node.nodeType !== 3) return;
+      const [start, end] = wordAt(node.data, offset);
+      selection.setBaseAndExtent(node, start, node, end);
+    } else {
+      let block = node.nodeType === 3 ? node.parentElement : node;
+      while (block && parentOf(block) && getComputedStyle(block).display.startsWith("inline")) block = parentOf(block);
+      if (block) selection.selectAllChildren(block);
+    }
+  }
+
+  // --- Mouse ---
+  // Pages listen for pointer events as much as for mouse events, and for the
+  // ones sent when the mouse gets to an element: mouseover, mouseenter. A page's
+  // CSS :hover stays as it is: only the real mouse sets that.
+  let hovered = null; // the element the synthetic mouse is over
+
+  function mouseInit(x, y, modifiers, extra = {}) {
+    return {
+      // composed: real events cross shadow DOM boundaries, and the element
+      // may be inside a shadow root.
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, button: 0, buttons: 0, detail: 0,
+      ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1),
+      shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
+      ...extra,
+    };
+  }
+
+  function firePointer(el, type, init) {
+    return el.dispatchEvent(new PointerEvent(type, {
+      ...init, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1,
+      pressure: init.buttons ? 0.5 : 0,
+    }));
+  }
+
+  // pointer<name>, then mouse<name>.
+  function fireBoth(el, name, init) {
+    firePointer(el, `pointer${name}`, init);
+    return el.dispatchEvent(new MouseEvent(`mouse${name}`, init));
+  }
+
+  function moveMouseTo(el, init) {
+    if (el !== hovered) {
+      const from = hovered?.isConnected ? hovered : null;
+      const chain = (node) => {
+        const nodes = [];
+        for (let n = node; n; n = parentOf(n)) nodes.push(n);
+        return nodes;
+      };
+      const left = from ? chain(from) : [];
+      const entered = chain(el);
+      const edge = { bubbles: false, cancelable: false, composed: false };
+      if (from) {
+        fireBoth(from, "out", { ...init, relatedTarget: el });
+        for (const node of left) {
+          if (!entered.includes(node)) fireBoth(node, "leave", { ...init, ...edge, relatedTarget: el });
+        }
+      }
+      fireBoth(el, "over", { ...init, relatedTarget: from });
+      for (const node of [...entered].reverse()) {
+        if (!left.includes(node)) fireBoth(node, "enter", { ...init, ...edge, relatedTarget: from });
+      }
+      hovered = el;
+    }
+    fireBoth(el, "move", init);
+  }
+
+  // A press of the button; whether the page let it go ahead. A page that
+  // cancels pointerdown gets no mousedown, as with a real mouse, but the press
+  // still counts.
+  function pressMouse(el, init) {
+    if (!firePointer(el, "pointerdown", init)) return true;
+    return el.dispatchEvent(new MouseEvent("mousedown", init));
+  }
+
+  function releaseMouse(el, init) {
+    fireBoth(el, "up", init);
+  }
+
+  // A drag of an element with draggable=true: the browser's own drag events.
+  // `points` are the steps of the way. Returns whether the drop was accepted.
+  async function dragAndDrop(source, points, modifiers) {
+    const dataTransfer = new DataTransfer();
+    const fire = (el, type, [x, y]) => el.dispatchEvent(new DragEvent(type, { ...mouseInit(x, y, modifiers), dataTransfer }));
+    if (!fire(source, "dragstart", points[0])) return false;
+    let over = null;
+    let accepted = false;
+    for (const point of points) {
+      const target = elementAtPoint(...point) || document.documentElement;
+      if (target !== over) {
+        if (over) fire(over, "dragleave", point);
+        fire(target, "dragenter", point);
+        over = target;
+      }
+      fire(source, "drag", point);
+      accepted = !fire(over, "dragover", point);
+      await sleep(20);
+    }
+    const last = points[points.length - 1];
+    if (accepted) fire(over, "drop", last);
+    fire(source, "dragend", last);
+    return accepted;
+  }
+
+  // --- Scrolling ---
+
   // Whether a user-scrollable element can still move by (dx, dy).
   function canScroll(node, dx, dy) {
     const style = getComputedStyle(node);
@@ -646,10 +1225,33 @@
   // Nearest element (from el upwards, body included) that can still scroll by
   // (dx, dy); null means the page itself should scroll.
   function findScrollableAncestor(el, dx, dy) {
-    for (let node = el; node && node !== document.documentElement; node = node.parentElement) {
+    for (let node = el; node && node !== document.documentElement; node = parentOf(node)) {
       if (canScroll(node, dx, dy)) return node;
     }
     return null;
+  }
+
+  // Whether el is inside a part of the page that scrolls by itself, even if
+  // it's at its end: a modal's list, say.
+  function inScrollingPart(el) {
+    for (let node = el; node && node !== document.body && node !== document.documentElement; node = parentOf(node)) {
+      const style = getComputedStyle(node);
+      const scrollsY = /auto|scroll|overlay/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1;
+      const scrollsX = /auto|scroll|overlay/.test(style.overflowX) && node.scrollWidth > node.clientWidth + 1;
+      if (scrollsY || scrollsX) return true;
+    }
+    return false;
+  }
+
+  // Whether el is inside a fixed layer over most of the window, as a cookie
+  // wall or a modal is.
+  function inOverlay(el) {
+    for (let node = el; node; node = parentOf(node)) {
+      if (getComputedStyle(node).position !== "fixed") continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width * rect.height > window.innerWidth * window.innerHeight * 0.5) return true;
+    }
+    return false;
   }
 
   // Scroll target (an element or window) instantly; true if it actually moved.
@@ -769,8 +1371,13 @@
     }
 
     if (msg.type === "generateAccessibilityTree") {
-      const result = generateAccessibilityTree(msg.options || {});
-      sendResponse({ result });
+      const tree = generateAccessibilityTree(msg.options || {});
+      sendResponse(typeof tree === "string" ? { result: tree } : tree);
+      return true;
+    }
+
+    if (msg.type === "listFrames") {
+      sendResponse({ result: listFrames() });
       return true;
     }
 
@@ -787,7 +1394,14 @@
     }
 
     if (msg.type === "setFormValue") {
-      const result = setFormValue(msg.ref, msg.value);
+      // A field can refuse a value (a file input throws): say so, rather
+      // than leaving the answer empty.
+      let result;
+      try {
+        result = setFormValue(msg.ref, msg.value);
+      } catch (e) {
+        result = { error: `${e?.name || "Error"}: ${e?.message || e}` };
+      }
       sendResponse({ result });
       return true;
     }
@@ -804,56 +1418,57 @@
       const el = elementAtPoint(x, y);
       if (!el) {
         // Off-screen coordinates hit nothing; don't pretend the page got a click.
-        sendResponse({
-          error: `(${x}, ${y}) is outside the visible area of the page (${window.innerWidth}x${window.innerHeight}). Scroll first, or click by ref.`,
-        });
+        sendResponse({ outside: true });
+        return true;
+      }
+      const frame = frameOf(el);
+      if (frame !== null) {
+        sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, x, y) } });
         return true;
       }
       const buttonMap = { left: 0, middle: 1, right: 2 };
       const btn = buttonMap[button ?? "left"] ?? 0;
       const btns = btn === 0 ? 1 : btn === 1 ? 4 : 2;
-      const shared = {
-        // composed: real clicks cross shadow DOM boundaries, and el may be
-        // inside a shadow root.
-        bubbles: true, cancelable: true, composed: true, view: window,
-        clientX: x, clientY: y, button: btn,
-        ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1),
-        shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
-      };
-      el.dispatchEvent(new MouseEvent("mousemove", { ...shared, buttons: 0, detail: 0 }));
-      const pressed = el.dispatchEvent(new MouseEvent("mousedown", { ...shared, buttons: btns, detail: 1 }));
-      // A page that cancels mousedown (an editor's toolbar button) keeps the
-      // focus where it was, as with a real click.
-      if (pressed) focusForClick(el);
-      el.dispatchEvent(new MouseEvent("mouseup", { ...shared, buttons: 0, detail: 1 }));
-      if (button === "right") {
-        el.dispatchEvent(new MouseEvent("contextmenu", { ...shared, buttons: 0, detail: 0 }));
-      } else if (button !== "middle") {
-        const newTab = watchForNewTabLink();
-        for (let i = 0; i < (clickCount || 1); i++) {
-          el.dispatchEvent(new MouseEvent("click", { ...shared, buttons: 0, detail: i + 1 }));
+      moveMouseTo(el, mouseInit(x, y, modifiers));
+      const presses = button === "left" || button === undefined ? clickCount || 1 : 1;
+      const newTab = watchForNewTabLink();
+      for (let press = 1; press <= presses; press++) {
+        const init = mouseInit(x, y, modifiers, { button: btn, detail: press });
+        const pressed = pressMouse(el, { ...init, buttons: btns });
+        // A page that cancels mousedown (an editor's toolbar button) keeps
+        // the focus and the selection as they were, as with a real click.
+        if (pressed && press === 1) focusForClick(el);
+        if (pressed && btn === 0) {
+          try {
+            selectForClick(el, x, y, press);
+          } catch {
+            // Only a detail of the click: not on every kind of element.
+          }
         }
-        if ((clickCount || 1) >= 2) {
-          el.dispatchEvent(new MouseEvent("dblclick", { ...shared, buttons: 0, detail: 2 }));
-        }
-        const url = newTab.stop();
-        if (url) {
-          sendResponse({ openInNewTab: url });
-          return true;
-        }
+        releaseMouse(el, init);
+        if (btn === 0) el.dispatchEvent(new MouseEvent("click", init));
       }
-      sendResponse({});
+      const init = mouseInit(x, y, modifiers, { button: btn });
+      if (presses >= 2) el.dispatchEvent(new MouseEvent("dblclick", { ...init, detail: 2 }));
+      if (btn === 2) el.dispatchEvent(new MouseEvent("contextmenu", init));
+      if (btn === 1) el.dispatchEvent(new MouseEvent("auxclick", { ...init, detail: 1 }));
+      const url = newTab.stop();
+      sendResponse(url ? { openInNewTab: url } : {});
       return true;
     }
 
     if (msg.type === "dispatchMouseMove") {
-      const el = document.elementFromPoint(msg.x, msg.y) || document.body;
-      el.dispatchEvent(new MouseEvent("mousemove", {
-        bubbles: true, cancelable: true, view: window,
-        clientX: msg.x, clientY: msg.y, buttons: 0,
-        ctrlKey: !!(msg.modifiers & 2), altKey: !!(msg.modifiers & 1),
-        shiftKey: !!(msg.modifiers & 8), metaKey: !!(msg.modifiers & 4),
-      }));
+      const el = elementAtPoint(msg.x, msg.y);
+      if (!el) {
+        sendResponse({ outside: true });
+        return true;
+      }
+      const frame = frameOf(el);
+      if (frame !== null) {
+        sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, msg.x, msg.y) } });
+        return true;
+      }
+      moveMouseTo(el, mouseInit(msg.x, msg.y, msg.modifiers));
       sendResponse({});
       return true;
     }
@@ -864,11 +1479,12 @@
       // keypress follows keydown for Enter and keys that type a character
       // (not with ctrl, alt or meta held), as in a browser.
       const typing = msg.key === "Enter" || (msg.key?.length === 1 && !(msg.modifiers & 7));
+      let allowed = notCanceled;
       if (keyType === "keydown" && notCanceled && typing) {
         const charCode = msg.key === "Enter" ? 13 : msg.key.charCodeAt(0);
-        dispatchKey(focusedElement(), "keypress", { ...msg, charCode }, msg.modifiers);
+        allowed = dispatchKey(focusedElement(), "keypress", { ...msg, charCode }, msg.modifiers);
       }
-      sendResponse({});
+      sendResponse(keyType === "keydown" && allowed ? keyDefault(msg.key, msg.modifiers) : {});
       return true;
     }
 
@@ -876,6 +1492,8 @@
     // the user is done editing it.
     if (msg.type === "endTyping") {
       if (lastTypedField?.isConnected) lastTypedField.dispatchEvent(new Event("change", { bubbles: true }));
+      // (What a field refused isn't for the next call to continue from.)
+      if (lastTypedField) typedAhead.delete(lastTypedField);
       lastTypedField = null;
       sendResponse({});
       return true;
@@ -884,8 +1502,11 @@
     // One character of the `type` action. Pages see the key going down and
     // up around the text, like real typing; if a keydown or keypress handler
     // cancels the event, the character isn't inserted, as in a browser.
+    // Answers whether it went somewhere (inserted), and whether typing can't
+    // go on: Enter submitted a form, or the focus left the field.
     if (msg.type === "typeChar") {
       const { text, key } = msg;
+      const field = focusedElement();
       let insert = true;
       if (key) {
         const modifiers = key.shift ? 8 : 0;
@@ -899,18 +1520,42 @@
       }
       // inserted: the text went into a field, or the page took the key
       // itself (an editor that cancels keydown and inserts on its own).
-      const inserted = insert ? insertText(focusedElement(), text) : true;
+      let inserted = true;
+      let submitted = false;
+      if (insert) {
+        const target = focusedElement();
+        if (text === "\n" || text === "\r") {
+          inserted = isEditable(target);
+          submitted = pressEnter(target);
+          inserted ||= submitted;
+        } else if (text === "\t" && target.localName === "input") {
+          // Between form fields, as on a keyboard. In a text area or an editor
+          // it's part of the text.
+          moveFocus(false);
+        } else {
+          inserted = insertText(target, text);
+        }
+      }
       if (key) dispatchKey(focusedElement(), "keyup", key, key.shift ? 8 : 0);
-      sendResponse({ inserted });
+      const left = text !== "\t" && isEditable(field) && !isEditable(focusedElement());
+      sendResponse({ inserted, submitted, left });
       return true;
     }
 
     if (msg.type === "dispatchScroll") {
       const dx = msg.deltaX || 0;
       const dy = msg.deltaY || 0;
-      const el = document.elementFromPoint(msg.x, msg.y) || document.documentElement;
+      // The element under the point, also inside shadow DOM (a list in a
+      // web component scrolls, not the page around it); the event crosses
+      // shadow boundaries, as a real one does.
+      const el = elementAtPoint(msg.x, msg.y) || document.documentElement;
+      const frame = frameOf(el);
+      if (frame !== null) {
+        sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, msg.x, msg.y) } });
+        return true;
+      }
       const notCanceled = el.dispatchEvent(new WheelEvent("wheel", {
-        bubbles: true, cancelable: true, view: window,
+        bubbles: true, cancelable: true, composed: true, view: window,
         clientX: msg.x, clientY: msg.y,
         deltaX: dx, deltaY: dy,
         deltaMode: WheelEvent.DOM_DELTA_PIXEL,
@@ -935,7 +1580,9 @@
       if (notCanceled) moved = scrollNearest();
       // ...unless it's a scroll lock (cookie walls, modals): force html/body
       // back to overflow:auto, like the usual "unlock scroll" bookmarklet.
-      if (!moved && isScrollLocked(dx, dy)) {
+      // Not when a modal's own list has reached its end, nor in an app that
+      // uses the wheel and keeps its layout to the window on purpose.
+      if (!moved && isScrollLocked(dx, dy) && !inScrollingPart(el) && (notCanceled || inOverlay(el))) {
         unlockScroll();
         unlocked = true;
         moved = scrollNearest();
@@ -946,7 +1593,11 @@
 
     if (msg.type === "scrollToRef") {
       const el = resolveRef(msg.ref);
-      if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+      if (!el || !el.isConnected) {
+        sendResponse({ error: `Element ${msg.ref} is no longer on the page. Use read_page or find again.` });
+        return true;
+      }
+      el.scrollIntoView({ block: "center", behavior: "instant" });
       sendResponse({});
       return true;
     }
@@ -960,29 +1611,49 @@
     if (msg.type === "dispatchDrag") {
       (async () => {
         const { startX, startY, endX, endY, modifiers } = msg;
-        const getEl = (x, y) => document.elementFromPoint(x, y) || document.body;
-        const dispatch = (el, type, x, y, buttons) => {
-          el.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window,
-            clientX: x, clientY: y, button: 0, buttons,
-            ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1),
-            shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
-          }));
-        };
-        dispatch(getEl(startX, startY), "mousemove", startX, startY, 0);
+        const start = elementAtPoint(startX, startY);
+        if (!start) {
+          sendResponse({ outside: true });
+          return;
+        }
+        // All of it inside one frame: for that frame. (Across frames, it stays
+        // here: this document's <iframe> element gets the events.)
+        const frame = frameOf(start);
+        if (frame !== null && elementAtPoint(endX, endY) === start) {
+          const from = pointInFrame(start, startX, startY);
+          const to = pointInFrame(start, endX, endY);
+          sendResponse({ intoFrame: { frameId: frame, startX: from.x, startY: from.y, endX: to.x, endY: to.y } });
+          return;
+        }
+        const getEl = (x, y) => elementAtPoint(x, y) || document.documentElement;
+        const init = (x, y, buttons, extra) => mouseInit(x, y, modifiers, { buttons, ...extra });
+        moveMouseTo(start, init(startX, startY, 0));
         await sleep(50);
-        dispatch(getEl(startX, startY), "mousedown", startX, startY, 1);
+        const pressed = pressMouse(start, init(startX, startY, 1, { detail: 1 }));
         await sleep(50);
         const steps = 10;
+        const points = [];
         for (let i = 1; i <= steps; i++) {
-          const mx = startX + ((endX - startX) * i) / steps;
-          const my = startY + ((endY - startY) * i) / steps;
-          dispatch(getEl(mx, my), "mousemove", mx, my, 1);
-          await sleep(20);
+          points.push([startX + ((endX - startX) * i) / steps, startY + ((endY - startY) * i) / steps]);
         }
-        dispatch(getEl(endX, endY), "mouseup", endX, endY, 0);
-        sendResponse({});
-      })();
+        const source = pressed ? start.closest?.('[draggable="true"]') : null;
+        let dropped = null;
+        if (source) {
+          dropped = await dragAndDrop(source, points, modifiers);
+        } else {
+          for (const [mx, my] of points) {
+            moveMouseTo(getEl(mx, my), init(mx, my, 1));
+            await sleep(20);
+          }
+        }
+        // (After a browser drag, dragend is the end of it.)
+        if (!source) {
+          const end = getEl(endX, endY);
+          releaseMouse(end, init(endX, endY, 0, { detail: 1 }));
+          if (end === start) end.dispatchEvent(new MouseEvent("click", init(endX, endY, 0, { detail: 1 })));
+        }
+        sendResponse({ dropped });
+      })().catch((e) => sendResponse({ error: `${e?.name || "Error"}: ${e?.message || e}` }));
       return true;
     }
 
@@ -1002,6 +1673,10 @@
 
   // This script runs at document_start: tell the background a new page has
   // started, so it can hook console and dialogs early if Claude controls
-  // this tab.
+  // this tab. A page coming back from the back/forward cache starts again in
+  // the same way (see lib/page-hooks.js).
   chrome.runtime.sendMessage({ type: "pageStarted" }).catch(() => {});
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) chrome.runtime.sendMessage({ type: "pageStarted" }).catch(() => {});
+  });
 })();
