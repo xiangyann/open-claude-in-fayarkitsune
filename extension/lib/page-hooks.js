@@ -17,12 +17,25 @@
 // dialogs recorded since the last call.
 
 function installPageHooks(settings) {
+  // (The frames of a page are asked apart from the page itself: see
+  // callPageHooks.)
+  if (settings && settings.subframes && window === window.top) return {};
   const STATE = Symbol.for("claude-mcp-fayarkitsune.hooks");
   let hooks = window[STATE];
 
   if (!hooks) {
     hooks = { logs: [], dialogs: [], droppedDialogs: 0, answerUntil: 0, nextAnswer: null, recording: true };
     Object.defineProperty(window, STATE, { value: hooks });
+
+    // A page back from the back/forward cache: it may have been left there
+    // while Claude could use the tab, and only Claude's next call for it knows
+    // whether it still can. Until then its dialogs are the user's.
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      hooks.answerUntil = 0;
+      hooks.nextAnswer = null;
+      hooks.recording = false;
+    });
 
     const MAX_LOGS = 1000;
     // A page can open dialogs in a loop; only the first ones since the last
@@ -42,14 +55,17 @@ function installPageHooks(settings) {
       if (frames.length > MAX_FRAMES) shown.push(`… ${frames.length - MAX_FRAMES} more frames`);
       return shown.join("\n");
     };
+    // Told apart across frames (a call to clear them names them).
+    const frameTag = Math.random().toString(36).slice(2, 8);
+    let logCounter = 0;
     const record = (level, text) => {
       if (!hooks.recording) return;
-      hooks.logs.push({ level, text: cut(text, MAX_TEXT), url: location.href, timestamp: Date.now() });
+      hooks.logs.push({ id: `${frameTag}${++logCounter}`, level, text: cut(text, MAX_TEXT), url: location.href, timestamp: Date.now() });
       if (hooks.logs.length > MAX_LOGS) hooks.logs.splice(0, hooks.logs.length - MAX_LOGS);
     };
     // Objects are shown as JSON, but only so much of them: a page logging a
     // huge object, or one whose parts are shared many times over, mustn't
-    // pay for all of it.
+    // pay for all of it. Getters aren't run: the console doesn't either.
     const MAX_ITEMS = 300;
     const MAX_DEPTH = 6;
     const sample = (v, depth, budget) => {
@@ -57,18 +73,26 @@ function installPageHooks(settings) {
       if (typeof v === "string") return v.length > MAX_TEXT ? `${v.slice(0, MAX_TEXT)}…` : v;
       if (typeof v === "bigint") return `${v}n`;
       if (typeof v === "function") return `[function ${v.name || "anonymous"}]`;
-      if (typeof v === "symbol") return String(v);
+      if (typeof v === "symbol" || typeof v === "undefined") return String(v);
+      if (typeof v === "number") return Number.isFinite(v) ? v : String(v);
       if (v === null || typeof v !== "object") return v;
       if (v instanceof Date) return isNaN(v) ? "Invalid Date" : v.toISOString();
+      if (v instanceof Error) return `${v.name}: ${v.message}`;
+      if (v instanceof RegExp) return String(v);
+      if (ArrayBuffer.isView(v)) return `[${v.constructor.name}(${v.length ?? v.byteLength})]`;
       if (budget.seen.has(v)) return "[circular]";
       if (depth >= MAX_DEPTH) return Array.isArray(v) ? "[…]" : "{…}";
       budget.seen.add(v);
       try {
         if (Array.isArray(v)) return v.slice(0, 100).map((item) => sample(item, depth + 1, budget));
+        const list = (items) => items.slice(0, 100).map((item) => sample(item, depth + 1, budget));
+        if (v instanceof Map) return { [`Map(${v.size})`]: list([...v]) };
+        if (v instanceof Set) return { [`Set(${v.size})`]: list([...v]) };
         const out = {};
         for (const key of Object.keys(v).slice(0, 100)) {
           if (budget.items <= 0) break;
-          out[key] = sample(v[key], depth + 1, budget);
+          const property = Object.getOwnPropertyDescriptor(v, key);
+          out[key] = property && "value" in property ? sample(property.value, depth + 1, budget) : "[getter]";
         }
         return out;
       } finally {
@@ -89,9 +113,12 @@ function installPageHooks(settings) {
     for (const level of ["log", "info", "warn", "error", "debug"]) {
       const original = console[level];
       console[level] = function (...args) {
-        try {
-          record(level, args.map(show).join(" "));
-        } catch {}
+        // (Nothing is shown or kept while Claude doesn't control the tab.)
+        if (hooks.recording) {
+          try {
+            record(level, args.map(show).join(" "));
+          } catch {}
+        }
         return original.apply(this, args);
       };
     }
@@ -128,7 +155,9 @@ function installPageHooks(settings) {
         return { value: accept };
       }
       const text = accept ? String(chosen.promptText ?? defaultText ?? "") : null;
-      note.answer = accept ? `OK with "${text}"` : "Cancel";
+      // Not the text itself: it can be a password, and this goes on disk with
+      // the tool's result for a moment (see keptOutcome). Claude chose it.
+      note.answer = !accept ? "Cancel" : chosen.promptText != null ? "OK with your text" : "OK with its default text";
       return { value: text };
     };
     window.alert = function alert(message) {
@@ -155,12 +184,13 @@ function installPageHooks(settings) {
       hooks.droppedDialogs = 0;
     }
   }
-  const action = settings && settings.read;
-  if (action === "logs") {
-    const logs = hooks.logs.slice();
-    if (settings.clear) hooks.logs.length = 0;
-    return { logs };
+  // read_console_messages filters what it reads itself, and then has what it
+  // returned cleared: nothing else is lost.
+  if (settings && settings.clearLogs) {
+    const returned = new Set(settings.clearLogs);
+    hooks.logs = hooks.logs.filter((m) => !returned.has(m.id));
   }
+  if (settings && settings.read === "logs") return { logs: hooks.logs.slice() };
   // Only a tool's own before and after calls take the dialogs, to report
   // them; other calls leave them for those.
   if (settings && settings.report === false) return {};

@@ -8,7 +8,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Claude MCP in Fayar kitsune gives you the whole web — in Firefox.</strong></em>
   <br/>
-  <sub>Firefox port of the open-source Claude browser automation extension. No blocklist. Full MCP tool parity.</sub>
+  <sub>Firefox port of the open-source Claude browser automation extension. No blocklist. The same MCP tools as Claude in Chrome (a few aren't available in Firefox).</sub>
 </p>
 
 <p align="center">
@@ -209,27 +209,29 @@ The Claude in Chrome tools, plus a few for tabs you share and page dialogs:
 | `tabs_release` | Give a shared tab back |
 | `navigate` | Navigate to URL, back, forward |
 | `computer` | Mouse, keyboard, screenshots (13 actions) |
-| `read_page` | Accessibility tree with element refs |
-| `get_page_text` | Extract article/main text |
-| `find` | Find elements by text/purpose |
+| `read_page` | Accessibility tree with element refs, frames included |
+| `get_page_text` | Extract article/main text, frames included |
+| `find` | Find elements by words from their text, label, role or type |
 | `form_input` | Set form values by ref |
 | `javascript_tool` | Execute JS in page context (top-level `await` and `return` work; credentials are hidden from results) |
 | `handle_dialog` | Choose the answer to the page's next `confirm()` or `prompt()` |
 | `read_console_messages` | Console output, uncaught errors and promise rejections (filtered) |
 | `read_network_requests` | Network activity |
 | `resize_window` | Resize browser window |
-| `upload_image` | Not supported in Firefox WebExtensions |
-| `gif_creator` | GIF recording (stub) |
-| `shortcuts_list` | List shortcuts (stub) |
-| `shortcuts_execute` | Run shortcut (stub) |
-| `switch_browser` | Switch browser (stub) |
-| `update_plan` | Present plan (auto-approved) |
+| `update_plan` | Notes Claude's plan (nothing is shown to you, and there's nothing to approve) |
+| `upload_image` | Not available: Firefox WebExtensions can't put a file into a page |
+| `gif_creator` | Not available |
+| `shortcuts_list` | Not available |
+| `shortcuts_execute` | Not available |
+| `switch_browser` | Not available: the extension uses whichever Firefox has it loaded |
+
+The tools that aren't available return an error saying so.
 
 ## Firefox Notes
 
 ### Claude's tabs: a tab group
 
-Claude works in a tab group named **Claude** (orange), which it opens in a window of its own so it doesn't take over the tab you're looking at. The group keeps Claude's tabs together when Claude restarts or a conversation loses track of them: `tabs_context_mcp` lists them again. Tabs that Claude's pages open join the group. Firefox's popup blocker ignores a link that opens a new tab (`target="_blank"`, or a ctrl-click) when Claude clicks it, since Claude's clicks are synthetic, so the extension opens such links itself, in a background tab next to the one Claude clicked in.
+Claude works in a tab group named **Claude** (orange), which it opens in a window of its own so it doesn't take over the tab you're looking at. The group keeps Claude's tabs together when Claude restarts or a conversation loses track of them: `tabs_context_mcp` lists them again. Tabs that Claude's pages open join the group. Firefox's popup blocker ignores a link that opens a new tab (`target="_blank"`, or a ctrl-click) when Claude clicks it, since Claude's clicks are synthetic, so the extension opens such links itself, in a background tab next to the one Claude clicked in. Only links to web pages (`http`, `https`) are opened this way, not local files.
 
 After a Firefox restart, the group comes back with a new ID, so the extension finds it again by its name and color. That's also the rule for which tabs are Claude's: a tab you drag into an orange group named "Claude" becomes Claude's, and one you drag out of it isn't anymore. Rename or recolor the group and it's yours, tabs included, until it's an orange "Claude" again. The 1.1.x MCP window isn't reused (after a Firefox restart its saved ID could point at one of your windows): it stays an ordinary window, and Claude starts a new group.
 
@@ -242,7 +244,7 @@ Claude can also work in tabs you're already using, for example a site you're log
 - **You share a tab:** right-click it → **Share Tab with Claude** (with several tabs selected, all of them). **Stop Sharing Tab with Claude** in the same menu takes it back.
 - **Claude asks:** `tabs_request_access` opens a small window listing your tabs. You pick which ones to share, or none. Claude doesn't see the list, only the tabs you share.
 
-Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension. Network requests are only recorded in tabs Claude can use, from the moment it can: `read_network_requests` in a tab you just shared doesn't show what it loaded before. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
+Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. For the same reason, Claude doesn't resize its own window either if you've moved its group into one of your windows. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension. Network requests are only recorded in tabs Claude can use, from the moment it can: `read_network_requests` in a tab you just shared doesn't show what it loaded before. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
 
 **Handing a tab over.** Working in a shared tab means switching your window to it for each screenshot, and its window can't be resized. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**.
 
@@ -259,26 +261,30 @@ Dragging a tab out of the group also takes it back.
 
 ### Page dialogs
 
-A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. In Claude's own tabs this is always on. In a tab you shared, it applies while a tool is working there and for 15 seconds after; otherwise dialogs show up for you as usual. When Claude loses a tab (you stop sharing it, drag it out of the group, or rename the group), its dialogs go back to you right away. Frames inside the page are covered too, from Claude's next action after they load. A dialog still shows up as usual when it comes from a frame added since then, or from a page script that kept the browser's own `alert()` before the extension's hooks were in place.
+A real `alert()`, `confirm()` or `prompt()` pauses the page and doesn't show up in screenshots, so Claude would be stuck without knowing why. While Claude works in a tab, the extension answers them: alerts are acknowledged, and confirms and prompts are cancelled unless Claude chose otherwise with `handle_dialog`. Each one is reported to Claude. An answer `handle_dialog` chose applies to the page itself, not to frames in it. In Claude's own tabs this is always on. In a tab you shared, it applies while a tool is working there and for 15 seconds after; otherwise dialogs show up for you as usual. When Claude loses a tab (you stop sharing it, drag it out of the group, or rename the group), its dialogs go back to you right away, also on pages you go back to with the Back button. Frames inside the page are covered too, from Claude's next action after they load. A dialog still shows up as usual when it comes from a frame added since then, or from a page script that kept the browser's own `alert()` before the extension's hooks were in place.
 
 ### javascript_tool
 
 Code runs like in the browser console: the value of the last expression comes back. Top-level `await` and `return` also work.
 
-Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude, in returned values and in thrown errors alike. That includes name/value pairs, such as `Object.entries(localStorage)`, a `Map`, form data or `cookieStore.getAll()`, and URL parameters like `access_token=`. Console messages, dialog texts and the URLs from `read_network_requests` go through the same checks. `read_page` likewise shows `[hidden]` for the value of password fields. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
+Cookie strings (what `document.cookie` returns), JSON Web Tokens, bearer tokens, and values stored under names like `password`, `token`, `secret` or `session` are replaced with `[hidden: ...]` before the result reaches Claude, in returned values and in thrown errors alike. That includes name/value pairs, such as `Object.entries(localStorage)`, a `Map`, form data or `cookieStore.getAll()`, lists under such names, URL parameters like `access_token=`, `?key=` or `?code=`, a password in a URL, `name="…"` in text, and `name`/`value` pairs in HTML (a CSRF token's `<input>` or `<meta>`). Console messages, dialog texts and the URLs from `read_network_requests` go through the same checks. `read_page` likewise shows `[hidden]` for the value of password fields. This keeps Claude from reading them by accident. It isn't a security boundary: a script can still send them anywhere the page can.
 
 A script is given 30 seconds (up to 50 with `timeout`). Firefox can't stop a script that's still running after that; the tool reports the timeout, and reloading the tab stops it.
 
 ### Synthetic events
 
-Firefox WebExtensions cannot use the Chrome DevTools Protocol. Mouse clicks, keyboard input, and scrolling are dispatched as synthetic DOM events from a content script. These events have `isTrusted: false`, which means:
+Firefox WebExtensions cannot use the Chrome DevTools Protocol. Mouse clicks, keyboard input, and scrolling are dispatched as synthetic DOM events from a content script. These events have `isTrusted: false`, and the browser doesn't act on them by itself, which means:
 
-- Most web apps work fine — synthetic events are standard practice for testing frameworks
+- Most web apps work fine — synthetic events are standard practice for testing frameworks. Clicks send the pointer events too, and the mouse "arrives" at an element (`mouseover`, `mouseenter`) the way a real one does. A drag of an element with `draggable="true"` is a browser drag (`dragstart` … `drop`).
+- What the browser would do for a click or a key is done by the extension: a click puts the caret where it lands, double and triple clicks select a word or a line (or the whole field), and `ctrl+a`, Enter (in a form, it submits it), Tab, Backspace, Delete, the arrow keys, Home, End, Page Up/Down and Space do what they do in Firefox. Keys that only Firefox itself acts on, like copy and paste or its own shortcuts, reach the page's handlers and nothing else; the result says so.
+- CSS `:hover` styles don't change: only the real mouse sets them.
 - A small number of hardened apps check `event.isTrusted` and ignore synthetic events; those interactions will fail silently
+
+Pages in frames (`<iframe>`) are reached too: a click or a scroll at a point inside a frame goes to the frame's own page, keys go to the frame Claude last clicked in, and `read_page`, `find` and `get_page_text` include the frames shown on the page.
 
 ### Screenshots
 
-`tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. If Claude's window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused. In a tab you shared, the switch happens in your window.
+`tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. A screenshot's pixels are the page's CSS pixels, on a zoomed page too. A viewport larger than what Claude's API takes in (about 1568 pixels across, or 1.15 megapixels) is captured smaller, and the coordinates Claude reads off that picture are scaled back when it clicks: the screenshot's result says when that's the case. If Claude's window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused. In a tab you shared, the switch happens in your window.
 
 ### Clicking by ref
 
@@ -290,13 +296,13 @@ The manifest sets the `extension_pages` CSP to `script-src 'self'`. This drops F
 
 ### Console monitoring
 
-Console messages, uncaught errors and unhandled promise rejections are captured by hooks in the page's own JavaScript world. The hooks go into every page loaded in a tab Claude can use, as soon as the page starts loading, so `read_console_messages` sees what the page logged from early on. A few messages from scripts that run before the hooks are in place can still be missed. When Claude loses the tab (you stop sharing it, say), the page stops recording and forgets what it recorded, so if you share it again, Claude only sees what happens from then on.
+Console messages, uncaught errors and unhandled promise rejections are captured by hooks in the page's own JavaScript world. A pattern given to `read_console_messages` is matched by the extension in a worker of its own, which it stops after 2 seconds, so a pattern that takes forever to match can't freeze the page or the extension; `clear` only removes the messages that were returned. The hooks go into every page loaded in a tab Claude can use, as soon as the page starts loading, so `read_console_messages` sees what the page logged from early on. A few messages from scripts that run before the hooks are in place can still be missed. When Claude loses the tab (you stop sharing it, say), the page stops recording and forgets what it recorded, so if you share it again, Claude only sees what happens from then on.
 
 ### Interrupted calls
 
-If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, and up to three times). Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
+If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, up to three times, and not to an extension older than 2.0.1, which can't tell whether it already ran it). A call sent again only gets the time left of its original 60 seconds. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
 
-If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one; what was already done stays done.
+If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back, and so does the end of a Claude session that quits with a call still running. A call sent again with less than a few seconds left isn't run at all.
 
 The extension updates itself, but waits until no tool is running, so an update doesn't cut an action short. A tool that runs into the 60-second limit (a page busy with a script, a very long text to type) stops a little before, says how far it got, and doesn't act on the page afterwards.
 

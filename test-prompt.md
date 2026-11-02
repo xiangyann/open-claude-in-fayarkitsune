@@ -1,6 +1,6 @@
 # Claude MCP in Fayar kitsune — Integration Test Prompt
 
-Copy and paste everything below the line into a new Claude Code session that has the `open-claude-in-fayarkitsune` MCP configured.
+Copy and paste everything below the line into a new Claude Code session that has the `open-claude-in-fayarkitsune` MCP configured. reddit.com blocks `eval()`, so steps 21, 24 and 25 need the extension's optional "User scripts" permission: allow it from the extension's toolbar button first.
 
 ---
 
@@ -55,7 +55,7 @@ Execute these steps in order:
 ## Zoom
 29. Call `computer` with action `zoom` on TAB_1 with region `[0, 0, 640, 400]`.
 
-## Stub Tools (call them — they should return gracefully)
+## Tools not available in Firefox (call them — each should return an error saying so)
 30. Call `gif_creator` with action `"start_recording"` on TAB_1.
 31. Call `shortcuts_list` on TAB_1.
 32. Call `shortcuts_execute` on TAB_1 with command `"test"`.
@@ -63,7 +63,7 @@ Execute these steps in order:
 
 ## Plan + Upload
 34. Call `update_plan` with domains `["reddit.com", "news.ycombinator.com"]` and approach `["Testing browser automation", "Validating all tools", "Checking parity with Claude in Chrome"]`.
-35. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9. (Expected: "not supported" response — this is correct behaviour on Firefox.)
+35. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9. (Expected: an error saying it isn't available — this is correct behaviour on Firefox.)
 
 ## Shared tabs + closing
 36. Call `tabs_request_access` with reason `"Integration test: share any tab, or choose Don't share"`. The user answers in Firefox; any answer counts.
@@ -120,6 +120,6 @@ Computer actions exercised:
 OVERALL: [PASS if all 23 tools called / FAIL if any missed]
 ```
 
-Mark a tool as PASS only if you actually called it and received a response (even if the response was "not implemented" for stub tools). Mark it as FAIL if you skipped it or encountered an error that prevented the call.
+Mark a tool as PASS only if you actually called it and received a response (for the tools not available in Firefox, the error saying so counts). Mark it as FAIL if you skipped it or encountered an error that prevented the call.
 
 If OVERALL is FAIL, list which tools failed and why.

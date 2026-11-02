@@ -21,6 +21,7 @@ let browserId = null;
 const BROWSER_ID_STORAGE_KEY = "browserId";
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp, requestId}]
 const screenshotStore = new Map(); // imageId -> base64
+const keyFrames = new Map(); // tabId -> the frame Claude last clicked in, if not the page itself
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -76,7 +77,7 @@ function connectToServer() {
       return;
     }
     if (msg.type === "tool_request" && msg.id) {
-      handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion, msg.resent === true);
+      handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.serverVersion, msg.resent === true, msg.timeLeft);
     } else if (msg.type === "tool_cancel" && msg.id) {
       cancelRequest(msg.id);
     } else if (msg.type === "server_hello") {
@@ -165,6 +166,12 @@ function sendError(id, error) {
 
 function textResult(text) {
   return { content: [{ type: "text", text }] };
+}
+
+// A tool's answer that says it failed: marked so, for Claude (the server
+// passes it on as it is).
+function errorResult(text) {
+  return { ...textResult(text), isError: true };
 }
 
 // Adds a note after a tool's result. Claude's apps show a result's text
@@ -314,16 +321,20 @@ async function sharedTabList() {
 
 // Whether Claude may use a tab: { tab, kind } with kind "own" (in Claude's
 // group), "shared" (shared by the user) or null. tab is null if it's gone.
+// The tab is read last, with nothing awaited between that and the decision:
+// the tab may be on its way into or out of the group, and what's decided about
+// it must fit where it is then.
 async function tabControl(tabId) {
+  const group = await findClaudeGroup();
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
     return { tab: null, kind: null };
   }
-  const group = await findClaudeGroup();
   if (group && tab.groupId === group.id) {
-    if (sharedTabs.delete(tabId)) saveSharedTabs(); // dragged into the group
+    // Dragged into the group, unless it's on its way out (see moveTabsToUser).
+    if (!movingOut.has(tabId) && sharedTabs.delete(tabId)) saveSharedTabs();
     ownTabs.add(tabId);
     return { tab, kind: "own" };
   }
@@ -402,12 +413,15 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 });
 
 // Clean up when a tab is closed
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await stateReady; // or the restore could bring its ids back afterwards
   networkRequests.delete(tabId);
   if (startedTabs.delete(tabId)) saveStartedTabs();
   pageOrigins.delete(tabId);
   lastWorkAt.delete(tabId);
   hookedTabs.delete(tabId);
+  keyFrames.delete(tabId);
+  knownViews.delete(tabId);
   ownTabs.delete(tabId);
   if (sharedTabs.delete(tabId)) saveSharedTabs();
   if (tabOrigins.delete(tabId)) saveTabOrigins();
@@ -497,18 +511,21 @@ function stepTimeout(request) {
   return Math.max(1500, Math.min(CONTENT_TIMEOUT_MS, request.deadline - Date.now() - 1000));
 }
 
-async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS) {
+// frameId: the page itself, unless a frame is meant (see "Frames" in
+// content.js). tabs.sendMessage goes to every frame with the script otherwise,
+// and the first to answer would count.
+async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS, frameId = 0) {
   const deadline = Date.now() + timeoutMs;
   const send = async () => {
     let timer;
     const late = new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error(
-        `The page didn't respond within ${Math.round(timeoutMs / 1000)} s: it may be busy, e.g. with a script that's still running. It won't act on this later.`
+        `The page didn't respond within ${Math.round(timeoutMs / 1000)} s: it may be busy, e.g. with a script that's still running. It may or may not have done this already (check before repeating it), but it won't do it later.`
       )), Math.max(0, deadline - Date.now()));
     });
     let response;
     try {
-      response = await Promise.race([chrome.tabs.sendMessage(tabId, { ...message, deadline }), late]);
+      response = await Promise.race([chrome.tabs.sendMessage(tabId, { ...message, deadline }, { frameId }), late]);
     } finally {
       clearTimeout(timer);
     }
@@ -527,9 +544,57 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS
     // extension was): inject it and send again. Any other failure, e.g. the
     // page navigating away mid-message, may come after the action happened.
     if (!/Receiving end does not exist|Could not establish connection/i.test(err?.message || "")) throw err;
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    try {
+      await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content.js"], injectImmediately: true });
+    } catch (injectError) {
+      injectError.unreachable = true; // nothing was sent to the page
+      throw injectError;
+    }
     return send();
   }
+}
+
+// Why a call shouldn't go on acting on the tab, if there's a reason.
+function stopReason(tabId, request) {
+  if (!isControlledNow(tabId)) return "the user took this tab back";
+  if (request.cancelled) return "the call was cancelled";
+  if (Date.now() >= request.deadline) return "the call ran out of time";
+  return null;
+}
+
+// Frames a page is shown with, all levels of them, in the coordinates of the
+// top page: [{ frameId, x, y }]. A frame that doesn't answer in time is left
+// out. Few are looked at: a page can have hundreds of ad frames.
+const MAX_FRAME_DEPTH = 4;
+const MAX_FRAMES = 20;
+const FRAME_TIMEOUT_MS = 2000;
+
+async function shownFrames(tabId) {
+  const frames = [];
+  let level = [{ frameId: 0, x: 0, y: 0 }];
+  for (let depth = 0; depth < MAX_FRAME_DEPTH && level.length; depth++) {
+    const lists = await Promise.all(level.map(async (parent) => {
+      const resp = await sendContentMessage(tabId, { type: "listFrames" }, FRAME_TIMEOUT_MS, parent.frameId).catch(() => null);
+      return (resp?.result || []).map((f) => ({ frameId: f.frameId, x: parent.x + f.x, y: parent.y + f.y }));
+    }));
+    level = lists.flat().slice(0, MAX_FRAMES - frames.length);
+    frames.push(...level);
+  }
+  return frames;
+}
+
+// The frame a ref is from (see getOrAssignRef in content.js).
+function refFrame(ref) {
+  return Number(/^ref_f(\d+)_/.exec(ref || "")?.[1] ?? 0);
+}
+
+// Asks each frame of a page, in parallel. Those that fail or don't answer in
+// time are left out.
+function askFrames(tabId, frames, message) {
+  return Promise.all(frames.map(async (frame) => {
+    const resp = await sendContentMessage(tabId, message, FRAME_TIMEOUT_MS, frame.frameId).catch(() => null);
+    return { frame, resp };
+  }));
 }
 
 // --- Working in a page: glow, page hooks, dialog reports ---
@@ -544,7 +609,7 @@ const hookedTabs = new Set(); // tabs whose page may be answering dialogs for Cl
 
 function setGlow(tabId, mode) {
   if (mode === "show" && capturing.has(tabId)) return;
-  chrome.tabs.sendMessage(tabId, { type: "glow", mode }).catch(() => {});
+  chrome.tabs.sendMessage(tabId, { type: "glow", mode }, { frameId: 0 }).catch(() => {});
 }
 
 // While a tool is working in a shared tab, its dialogs are answered for the
@@ -562,14 +627,18 @@ function dialogDeadline(tabId, kind) {
 
 // Installs or updates the hooks in the tab's page and returns what they
 // recorded ({ dialogs, dropped } or { logs }); null where pages can't be
-// scripted, or when the page doesn't answer in time: a script stuck in a
-// loop (one javascript_tool gave up on) blocks the page's world, and the
-// tool result mustn't wait for it.
+// scripted. With busy: true, the page didn't answer in time: a script stuck
+// in a loop (one javascript_tool gave up on) blocks the page's world, and the
+// tool result mustn't wait for it. What was asked still happens, once the
+// page is free: the call stays queued there.
 const PAGE_HOOKS_TIMEOUT_MS = 3000;
+const FRAME_HOOKS_TIMEOUT_MS = 1000;
 
 // The page's frames are hooked too: a frame's alert() would freeze the tab
-// just the same. Their records are merged with the page's. A frame stuck in
-// a script doesn't hold up the page's: then the page alone is asked again.
+// just the same. Their records are merged with the page's. The page and its
+// frames are asked apart, so that what the page answers isn't lost to a frame
+// stuck in a script, and each is only asked once: asking again would take
+// what the first call took, and could undo a release that came after it.
 // Every caller but releasePage acts on a tab Claude controls, so recording
 // is on unless the settings say otherwise.
 // The first call for a tab since Claude started using it also makes the page
@@ -578,6 +647,7 @@ const PAGE_HOOKS_TIMEOUT_MS = 3000;
 // Those tabs are kept in storage.session, which lasts as long as sharing does.
 const STARTED_STORAGE_KEY = "startedTabIds";
 const startedTabs = new Set();
+const REFUSED = Symbol("the page can't be scripted");
 
 function saveStartedTabs() {
   chrome.storage.session.set({ [STARTED_STORAGE_KEY]: [...startedTabs] }).catch(() => {});
@@ -588,38 +658,45 @@ async function callPageHooks(tabId, settings, frameId) {
   // Taken back meanwhile (a tool's last call can come after that): the page
   // must not start recording again.
   if (!releasing && !isControlledNow(tabId)) return null;
+  // Marked before the call, and only unmarked if the page refused it: a call
+  // that takes too long still lands, forgetting what it should, and a later
+  // call that forgot too would take what a tool did in between with it.
+  // (Refused, there's no page yet to have forgotten anything.)
   const starting = !releasing && !startedTabs.has(tabId);
-  if (starting) {
-    startedTabs.add(tabId);
-    saveStartedTabs();
-  } else if (releasing && startedTabs.delete(tabId)) {
-    saveStartedTabs();
-  }
+  if (starting) startedTabs.add(tabId);
+  if (starting || (releasing && startedTabs.delete(tabId))) saveStartedTabs();
   const sent = { recording: true, ...settings, ...(starting ? { forget: true } : {}) };
-  const run = (target, timeoutMs) => {
+  const run = (target, args, timeoutMs) => {
     const call = chrome.scripting
       .executeScript({
         target,
         world: "MAIN",
         injectImmediately: true,
         func: installPageHooks,
-        args: [sent],
+        args: [args],
       })
-      .catch(() => null);
+      .catch(() => REFUSED);
     return Promise.race([call, sleep(timeoutMs).then(() => null)]);
   };
-  let results = frameId === undefined ? await run({ tabId, allFrames: true }, PAGE_HOOKS_TIMEOUT_MS) : null;
-  results ??= await run({ tabId, frameIds: [frameId ?? 0] }, frameId === undefined ? 1000 : PAGE_HOOKS_TIMEOUT_MS);
-  if (!results) return null;
+  const [page, frames] = await Promise.all([
+    run({ tabId, frameIds: [frameId ?? 0] }, sent, PAGE_HOOKS_TIMEOUT_MS),
+    frameId === undefined ? run({ tabId, allFrames: true }, { ...sent, subframes: true }, FRAME_HOOKS_TIMEOUT_MS) : null,
+  ]);
+  if (page === REFUSED) {
+    if (starting && startedTabs.delete(tabId)) saveStartedTabs();
+    return null;
+  }
+  const busy = page === null;
   if (settings?.answerUntil > 0) hookedTabs.add(tabId);
-  const records = results.map((res) => res?.result).filter(Boolean);
-  if (!records.length) return null;
+  const records = [page, frames].flatMap((r) => (Array.isArray(r) ? r : [])).map((res) => res?.result).filter(Boolean);
+  if (!records.length && !busy) return null;
   if (settings?.read === "logs") {
-    return { logs: records.flatMap((r) => r.logs || []).sort((a, b) => a.timestamp - b.timestamp) };
+    return { busy, logs: records.flatMap((r) => r.logs || []).sort((a, b) => a.timestamp - b.timestamp) };
   }
   return {
+    busy,
     dialogs: records.flatMap((r) => r.dialogs || []),
-    dropped: records.reduce((sum, r) => sum + (r.dropped || 0), 0),
+    dropped: records.reduce((sum, r) => sum + (Number(r.dropped) || 0), 0),
   };
 }
 
@@ -646,7 +723,9 @@ function releasePage(tabId) {
 // attached (already in the group), so moves are checked too.
 async function reconsiderTab(tabId) {
   await stateReady;
-  const couldUse = isControlledNow(tabId) || hookedTabs.has(tabId);
+  // (startedTabs too: it outlasts this background script, the others are
+  // only in memory.)
+  const couldUse = isControlledNow(tabId) || hookedTabs.has(tabId) || startedTabs.has(tabId);
   const { kind } = await tabControl(tabId);
   if (!kind) {
     if (couldUse) forgetTab(tabId);
@@ -660,13 +739,24 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 chrome.tabs.onAttached.addListener((tabId) => reconsiderTab(tabId));
 chrome.tabs.onMoved.addListener((tabId) => reconsiderTab(tabId));
 
+// A page can reach what its hooks recorded and write anything there: these
+// records are cut to size and to known words, so a page's text only ever
+// appears quoted, and not in the size of text that keeps redaction busy.
+const DIALOG_TYPES = new Set(["alert", "confirm", "prompt"]);
+const DIALOG_ANSWERS = new Set(["OK", "Cancel", "OK with your text", "OK with its default text"]);
+const MAX_DIALOG_MESSAGE = 500;
+const MAX_DIALOGS_LISTED = 50;
+
 function describeDialogs(dialogs, dropped = 0) {
   if (!dialogs.length && !dropped) return null;
-  const lines = dialogs.map((d) => {
-    const msg = d.message ? ` "${redactString(d.message)}"` : "";
-    return d.answer === "left open for the user"
-      ? `- ${d.type}${msg}: shown to the user (it opened while you weren't working in this tab); the page is paused until they answer it`
-      : `- ${d.type}${msg}: answered ${d.answer} automatically`;
+  const lines = dialogs.slice(0, MAX_DIALOGS_LISTED).map((d) => {
+    const type = DIALOG_TYPES.has(d.type) ? d.type : "dialog";
+    const text = String(d.message ?? "").slice(0, MAX_DIALOG_MESSAGE);
+    const msg = text ? ` "${redactString(text)}"` : "";
+    if (d.answer === "left open for the user") {
+      return `- ${type}${msg}: shown to the user (it opened while you weren't working in this tab); the page is paused until they answer it`;
+    }
+    return `- ${type}${msg}: answered ${DIALOG_ANSWERS.has(d.answer) ? d.answer : "by the page's hooks"} automatically`;
   });
   if (dropped) lines.push(`- … and ${dropped} more, not listed`);
   return `The page opened dialogs:\n${lines.join("\n")}\nUse handle_dialog to choose how the next confirm or prompt is answered.`;
@@ -692,9 +782,15 @@ async function startPageWork(tabId, kind) {
     // released, and neither its dialogs nor what the tool found there are
     // Claude's to see anymore.
     const now = await tabControl(tabId);
+    // Closed meanwhile, maybe by what the tool did (a click on a popup's
+    // close button): the result stands, with a word about it.
+    if (!now.tab) {
+      if (result?.content) addNote(result, `Tab ${tabId} has closed.`);
+      return result;
+    }
     if (!now.kind) {
-      return result && textResult(
-        `The user took tab ${tabId} back while this was running, so what it found there isn't shown. Use tabs_context_mcp to see the tabs you can use.`
+      return result && errorResult(
+        `The user took tab ${tabId} back while this was running. It may have been done, but what it found there isn't shown. Use tabs_context_mcp to see the tabs you can use.`
       );
     }
     setGlow(tabId, "show"); // it fades out a few seconds after the last refresh
@@ -714,15 +810,21 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg?.type !== "pageStarted" || !sender.tab) return;
   (async () => {
     await stateReady;
+    if (sender.frameId === 0) keyFrames.delete(sender.tab.id); // its frames are gone
     const { kind } = await tabControl(sender.tab.id);
-    if (kind) await callPageHooks(sender.tab.id, { answerUntil: dialogDeadline(sender.tab.id, kind) }, sender.frameId);
+    // (report: false: this can come during a tool, whose report they're for.)
+    if (kind) await callPageHooks(sender.tab.id, { answerUntil: dialogDeadline(sender.tab.id, kind), report: false }, sender.frameId);
   })();
 });
 
 // --- Screenshot helper ---
 // Firefox uses tabs.captureVisibleTab() — the tab must be active in its window.
-// scale 1 keeps image pixels equal to CSS pixels, so coordinates read off a
-// screenshot match the ones clicks use, even on HiDPI screens.
+// It renders at scale × the page's zoom: a scale of 1/zoom keeps image pixels
+// equal to CSS pixels, so coordinates read off a screenshot match the ones
+// clicks use, on HiDPI screens and zoomed pages alike. An image larger than
+// what Claude's API takes in is shrunk before Claude sees it, and the
+// coordinates Claude reads off it would be wrong by as much: it's captured
+// at that size (viewOf), and coordinates are taken back from it.
 // rect (optional) is a region in page coordinates, i.e. including scroll offset.
 // Screenshots of a window take turns: another session could otherwise make
 // its own tab the active one between this one's activating and capturing.
@@ -730,6 +832,28 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 // so the next ones still get their turn.
 const windowQueues = new Map(); // windowId -> the last screenshot queued there
 const SCREENSHOT_TIMEOUT_MS = 10000;
+const MAX_IMAGE_EDGE = 1568;
+const MAX_IMAGE_PIXELS = 1150000;
+
+// The tab's viewport in CSS pixels, its zoom, and fit: the image pixels of a
+// screenshot per CSS pixel. The size is read in the extension's own world on
+// the page: the page's script can't change what that sees. A page too busy to
+// answer gets the size it last had. (tabs.get's width is often 0 in Firefox.)
+const knownViews = new Map(); // tabId -> [width, height]
+
+async function viewOf(tabId) {
+  const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
+  const read = chrome.scripting
+    .executeScript({ target: { tabId }, injectImmediately: true, func: () => [window.innerWidth, window.innerHeight] })
+    .then((results) => results?.[0]?.result, () => null);
+  const size = await Promise.race([read, sleep(1000).then(() => null)]);
+  if (Array.isArray(size) && size[0] > 0 && size[1] > 0) knownViews.set(tabId, size);
+  const [width, height] = knownViews.get(tabId) || [0, 0];
+  const fit = width && height
+    ? Math.min(1, MAX_IMAGE_EDGE / Math.max(width, height), Math.sqrt(MAX_IMAGE_PIXELS / (width * height)))
+    : 1;
+  return { zoom, fit, width, height, imageWidth: Math.round(width * fit), imageHeight: Math.round(height * fit) };
+}
 
 // A task gets its turn ({ over }): once it's given up on, it must not
 // activate a tab or capture anymore, since the next task has the window.
@@ -753,17 +877,18 @@ function inWindowQueue(windowId, task) {
   return run;
 }
 
-async function takeScreenshot(tabId, options = {}) {
+async function takeScreenshot(tabId, request, options = {}) {
   const { windowId } = await chrome.tabs.get(tabId);
-  return inWindowQueue(windowId, (turn) => takeScreenshotNow(tabId, options, turn));
+  return inWindowQueue(windowId, (turn) => takeScreenshotNow(tabId, request, options, turn));
 }
 
-async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}, turn = { over: false }) {
-  // It may have waited its turn: is the tab still Claude's to show? And is
-  // it still this screenshot's turn?
+async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { over: false }) {
+  // It may have waited its turn: is the tab still Claude's to show, and does
+  // the call still want it? And is it still this screenshot's turn?
   const stillClaudes = () => {
     if (turn.over) throw new Error("the screenshot took too long: the page may be busy");
-    if (!isControlledNow(tabId)) throw new Error("the user took this tab back");
+    const reason = stopReason(tabId, request);
+    if (reason) throw new Error(reason);
   };
   stillClaudes();
   const tab = await chrome.tabs.get(tabId);
@@ -775,22 +900,32 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}, turn = { over:
     await sleep(100);
   }
 
+  let view;
   const capture = async (quality) => {
-    // Still this tab? The user can switch tabs too: then make it active again,
-    // once.
+    // Still this tab, and still in the window it's captured from? The user
+    // can switch tabs, or move the tab to another window: then the window
+    // shows a tab of theirs. Made active again once; checked again after
+    // the capture, and the picture is dropped if anything changed.
     stillClaudes();
-    if (!(await chrome.tabs.get(tabId)).active) {
+    let now = await chrome.tabs.get(tabId);
+    if (!now.active) {
       stillClaudes();
       await chrome.tabs.update(tabId, { active: true });
       await sleep(100);
-      if (!(await chrome.tabs.get(tabId)).active) {
+      now = await chrome.tabs.get(tabId);
+      if (!now.active) {
         throw new Error("another tab kept becoming the active one in this window; try again");
       }
     }
+    view = await viewOf(tabId); // only known for sure of the active tab
     stillClaudes();
-    const options = { format: "jpeg", quality, scale };
+    const options = { format: "jpeg", quality, scale: (scale ?? view.fit) / view.zoom };
     if (rect) options.rect = rect;
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, options);
+    const dataUrl = await chrome.tabs.captureVisibleTab(now.windowId, options);
+    const after = await chrome.tabs.get(tabId);
+    if (!after.active || after.windowId !== now.windowId || !isControlledNow(tabId)) {
+      throw new Error("the tab was switched away or moved during the screenshot; try again");
+    }
     return dataUrl.replace(/^data:image\/jpeg;base64,/, "");
   };
 
@@ -800,7 +935,7 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}, turn = { over:
   capturing.set(tabId, (capturing.get(tabId) || 0) + 1);
   let base64;
   try {
-    await Promise.race([chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }).catch(() => {}), sleep(1000)]);
+    await Promise.race([chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }, { frameId: 0 }).catch(() => {}), sleep(1000)]);
     base64 = await capture(55);
     if (base64.length > 500000) base64 = await capture(30);
   } finally {
@@ -818,7 +953,7 @@ async function takeScreenshotNow(tabId, { rect, scale = 1 } = {}, turn = { over:
   const keys = Array.from(screenshotStore.keys());
   while (keys.length > 10) screenshotStore.delete(keys.shift());
 
-  return { base64, imageId };
+  return { base64, imageId, view };
 }
 
 function sleep(ms) {
@@ -827,8 +962,13 @@ function sleep(ms) {
 
 // A link Claude clicked that opens a new tab (see content.js): it opens in
 // the background next to the tab it came from, and belongs to Claude the
-// same way that tab does: in Claude's group, or shared.
+// same way that tab does: in Claude's group, or shared. Returns the tab and
+// how it's Claude's. If the user takes the tab back meanwhile, the link's tab
+// isn't shared either: it's only Claude's by way of that tab.
 async function openLinkInNewTab(fromTabId, kind, url) {
+  // Web pages only, as with navigate: not local files or other schemes.
+  if (!/^https?:/i.test(url)) throw new Error(`the link goes to ${url.split(":")[0]}:, which Claude doesn't open`);
+  if (!isControlledNow(fromTabId)) throw new Error("the user took this tab back, so the link wasn't opened");
   const from = await chrome.tabs.get(fromTabId);
   const tab = await chrome.tabs.create({
     url,
@@ -837,13 +977,15 @@ async function openLinkInNewTab(fromTabId, kind, url) {
     openerTabId: fromTabId,
     active: false,
   });
-  if (kind === "own") {
-    if (claudeGroupId !== null) await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] }).catch(() => {});
-  } else {
+  let grouped = false;
+  if (kind === "own" && claudeGroupId !== null) {
+    grouped = await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] }).then(() => true, () => false);
+  }
+  if (!grouped && isControlledNow(fromTabId)) {
     sharedTabs.add(tab.id);
     await saveSharedTabs();
   }
-  return tab;
+  return { tab, where: grouped ? "in Claude's tab group" : "shared with you like the tab it came from" };
 }
 
 const CLICKS = {
@@ -875,7 +1017,14 @@ const toolHandlers = {
   async tabs_create_mcp() {
     const group = await ensureClaudeGroup();
     const tab = await chrome.tabs.create({ windowId: group.windowId, active: true });
-    await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+    try {
+      await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+    } catch (err) {
+      // Not left behind as a tab Claude can't use. (Firefox refuses this
+      // while a private window is the frontmost one, say.)
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      throw err;
+    }
     const result = formatTabContext(group, await tabsInGroup(group), await sharedTabList());
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
@@ -913,7 +1062,7 @@ const toolHandlers = {
     const ids = [...new Set((args.tabIds || []).map(Number))];
     const notShared = ids.filter((id) => !sharedTabs.has(id));
     if (!ids.length || notShared.length) {
-      return textResult(
+      return errorResult(
         `Only tabs the user shared with you can be handed over${notShared.length ? `; not shared: ${notShared.join(", ")}` : ""}. Use tabs_context_mcp to see them.`
       );
     }
@@ -925,7 +1074,7 @@ const toolHandlers = {
 
   async tabs_release(args, { kind }) {
     if (kind === "own") {
-      return textResult(`Tab ${args.tabId} is one of Claude's own tabs. Use tabs_close_mcp to close it.`);
+      return errorResult(`Tab ${args.tabId} is one of Claude's own tabs. Use tabs_close_mcp to close it.`);
     }
     await unshareTab(args.tabId);
     return textResult(`Released tab ${args.tabId}: it's the user's again, and you can't use it anymore.`);
@@ -941,10 +1090,15 @@ const toolHandlers = {
       // add-on's) are off limits: scripting one could act with the
       // extension's own powers, e.g. approve a share request.
       if (/^moz-extension:/i.test(targetUrl)) {
-        return textResult("Claude can't open extension pages (moz-extension: URLs).");
+        return errorResult("Claude can't open extension pages (moz-extension: URLs).");
       }
       if (/^javascript:/i.test(targetUrl) && /^moz-extension:/i.test(control?.tab?.url || "")) {
-        return textResult("This tab shows an extension page; navigate it to a web page first.");
+        return errorResult("This tab shows an extension page; navigate it to a web page first.");
+      }
+      // Web pages only. (Not everything before a colon is a scheme: example.com:8080.)
+      const otherScheme = /^(blob|chrome|data|file|ftp|jar|mailto|resource|view-source):/i.exec(targetUrl);
+      if (otherScheme) {
+        return errorResult(`Claude can't open ${otherScheme[1].toLowerCase()}: URLs, only web pages.`);
       }
       if (
         !targetUrl.match(/^https?:\/\//i) &&
@@ -957,7 +1111,7 @@ const toolHandlers = {
       try {
         targetUrl = new URL(targetUrl).href;
       } catch {
-        return textResult(`Invalid URL: "${url}". Could not parse as a valid URL.`);
+        return errorResult(`Invalid URL: "${url}". Could not parse as a valid URL.`);
       }
     }
 
@@ -966,6 +1120,7 @@ const toolHandlers = {
     // started loading again. A jump within the same page (#anchor) doesn't
     // load anything; it's done when the tab shows the requested URL (for
     // back/forward, any new URL).
+    const urlBefore = control?.tab?.url;
     const loaded = new Promise((resolve) => {
       let started = false;
       const listener = (updatedTabId, info, tab) => {
@@ -977,9 +1132,14 @@ const toolHandlers = {
       const finish = () => {
         chrome.tabs.onUpdated.removeListener(listener);
         clearTimeout(timer);
+        clearTimeout(nothingYet);
         resolve();
       };
       const timer = setTimeout(finish, 10000);
+      // Back or forward with nowhere to go does nothing, and says nothing.
+      const nothingYet = targetUrl === null && setTimeout(() => {
+        if (!started) finish();
+      }, 3000);
       chrome.tabs.onUpdated.addListener(listener);
     });
 
@@ -994,6 +1154,9 @@ const toolHandlers = {
     await loaded;
 
     const tab = await chrome.tabs.get(tabId);
+    if (targetUrl === null && tab.url === urlBefore && tab.status === "complete") {
+      return errorResult(`Nothing happened: this tab has no page to go ${url} to, or that page didn't load. It still shows ${tab.url}.`);
+    }
     const group = await findClaudeGroup();
     const tabs = group && tab.groupId === group.id ? await tabsInGroup(group) : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
@@ -1007,43 +1170,81 @@ const toolHandlers = {
   async computer(args, { kind }, request) {
     const { action, tabId } = args;
 
+    // Everything that acts on the page goes through here. The tab can stop
+    // being Claude's, or the call stop being wanted, between one step and the
+    // next; a message gets no longer than the call has left.
+    const inPage = (message, frameId = 0) => {
+      const reason = stopReason(tabId, request);
+      if (reason) {
+        const err = new Error(`${reason}, so this wasn't done`);
+        err.notDone = true;
+        throw err;
+      }
+      return sendContentMessage(tabId, message, stepTimeout(request), frameId);
+    };
+
+    // A mouse message goes to the page. If its point is in a frame, the page
+    // says so, and it goes on to that frame. Answers with the frame it ended in.
+    const atPoint = async (message, frameId = 0) => {
+      let target = frameId;
+      let sent = message;
+      for (let hops = 0; hops < MAX_FRAME_DEPTH; hops++) {
+        let resp;
+        try {
+          resp = await inPage(sent, target);
+        } catch (err) {
+          if (!err.unreachable) throw err;
+          return { error: `That point is inside a frame Claude can't reach (${err.message}).` };
+        }
+        if (!resp?.intoFrame) return { ...resp, frameId: target };
+        const { frameId: inner, ...points } = resp.intoFrame;
+        target = inner;
+        sent = { ...message, ...points };
+      }
+      return { error: "That point is inside frames nested too deep to reach." };
+    };
+
+    // Coordinates Claude gives are in screenshot pixels. (Usually CSS pixels:
+    // see viewOf.)
+    const view = await viewOf(tabId);
+    const toPage = (point) => (view.fit === 1 ? point : point.map((v) => Math.round(v / view.fit)));
+    const outside = (x, y) => errorResult(
+      `Error: (${x}, ${y}) is outside the visible area of the page (${view.imageWidth}x${view.imageHeight}). Scroll first, or click by ref.`
+    );
+
     // A ref is turned into a point on screen. The element is scrolled into
     // view first if needed: coordinates can only reach what's visible.
-    let coordinate = args.coordinate;
+    let coordinate = args.coordinate; // as Claude knows it
+    let point = coordinate ? toPage(coordinate) : null; // in the page
+    let startFrame = 0;
     let refNote = "";
     if (args.ref && !coordinate && (action in CLICKS || action === "hover" || action === "scroll")) {
-      const resp = await sendContentMessage(tabId, { type: "locateRef", ref: args.ref });
+      startFrame = refFrame(args.ref);
+      const resp = await inPage({ type: "locateRef", ref: args.ref }, startFrame);
       const loc = resp?.result;
-      if (!loc) return textResult(`Could not resolve ref "${args.ref}" to coordinates.`);
-      if (loc.error) return textResult(`Error: ${loc.error}`);
-      coordinate = [loc.x, loc.y];
+      if (!loc) return errorResult(`Could not resolve ref "${args.ref}" to coordinates.`);
+      if (loc.error) return errorResult(`Error: ${loc.error}`);
+      point = [loc.x, loc.y];
+      coordinate = point.map((v) => Math.round(v * view.fit));
       if (loc.scrolled) refNote += ` (scrolled ${args.ref} into view first)`;
       if (loc.coveredBy) {
         refNote += `. Note: ${loc.coveredBy} is on top of ${args.ref} at that point, so it received the input instead`;
       }
     }
+    // Where the result says it acted: a frame's coordinates aren't the page's.
+    const at = startFrame ? `on ${args.ref}` : coordinate ? `at (${coordinate[0]}, ${coordinate[1]})` : "";
 
     const modifiers = modifierBits(args.modifiers);
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId } = await takeScreenshot(tabId);
-        let dims = "";
-        try {
-          // A busy page can't answer; the size is only a detail.
-          const vpResult = await Promise.race([
-            chrome.scripting.executeScript({
-              target: { tabId },
-              world: "MAIN",
-              func: () => window.innerWidth + "x" + window.innerHeight,
-            }),
-            sleep(1000).then(() => null),
-          ]);
-          if (vpResult?.[0]?.result) dims = vpResult[0].result;
-        } catch {}
+        const { base64, imageId, view: shot } = await takeScreenshot(tabId, request);
+        const size = shot.fit < 1
+          ? `${shot.imageWidth}x${shot.imageHeight}, jpeg, of a ${shot.width}x${shot.height} viewport; use this image's pixels as coordinates`
+          : `${shot.width}x${shot.height}, jpeg`;
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}` },
+            { type: "text", text: `Successfully captured screenshot (${size}) - ID: ${imageId}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -1053,39 +1254,47 @@ const toolHandlers = {
       case "right_click":
       case "double_click":
       case "triple_click": {
-        if (!coordinate) return textResult(`coordinate or ref is required for ${action}`);
+        if (!coordinate) return errorResult(`Error: coordinate or ref is required for ${action}`);
         const { button, count, verb } = CLICKS[action];
-        const resp = await sendContentMessage(tabId, {
+        const resp = await atPoint({
           type: "dispatchMouseClick",
-          x: coordinate[0], y: coordinate[1],
+          x: point[0], y: point[1],
           button, clickCount: count, modifiers,
-        });
-        if (resp?.error) return textResult(`Error: ${resp.error}`);
+        }, startFrame);
+        if (resp.outside) return outside(...coordinate);
+        if (resp.error) return errorResult(`Error: ${resp.error}`);
+        // Keys go where the click put the focus.
+        if (resp.frameId) keyFrames.set(tabId, resp.frameId);
+        else keyFrames.delete(tabId);
         let opened = "";
-        if (resp?.openInNewTab) {
-          const tab = await openLinkInNewTab(tabId, kind, resp.openInNewTab);
-          opened = `. The link opens in a new tab: tab ${tab.id} (${resp.openInNewTab}), ${kind === "own" ? "in Claude's tab group" : "shared with you like the tab it came from"}`;
+        if (resp.openInNewTab) {
+          const { tab, where } = await openLinkInNewTab(tabId, kind, resp.openInNewTab);
+          opened = `. The link opens in a new tab: tab ${tab.id} (${resp.openInNewTab}), ${where}`;
         }
-        return textResult(`${verb} at (${coordinate[0]}, ${coordinate[1]})${refNote}${opened}`);
+        return textResult(`${verb} ${at}${refNote}${opened}`);
       }
 
       case "hover": {
         if (!coordinate)
-          return textResult("coordinate or ref is required for hover");
-        await sendContentMessage(tabId, {
+          return errorResult("Error: coordinate or ref is required for hover");
+        const resp = await atPoint({
           type: "dispatchMouseMove",
-          x: coordinate[0], y: coordinate[1], modifiers,
-        });
+          x: point[0], y: point[1], modifiers,
+        }, startFrame);
+        if (resp.outside) return outside(...coordinate);
+        if (resp.error) return errorResult(`Error: ${resp.error}`);
         await sleep(200);
-        return textResult(`Hovered at (${coordinate[0]}, ${coordinate[1]})${refNote}`);
+        return textResult(`Hovered ${at}${refNote}`);
       }
 
       case "type": {
         if (!args.text)
-          return textResult("text is required for type action");
+          return errorResult("Error: text is required for type action");
+        const frameId = await keyFrame(tabId);
         let inserted = 0;
         let typed = 0;
-        const chars = [...args.text];
+        let submitted = false;
+        const chars = [...args.text.replace(/\r\n?/g, "\n")];
         // Stops early, saying how far it got: the user took the tab back or
         // cancelled the call, typing all of it would outlast the tool call,
         // or the page stopped answering. The field gets its change event
@@ -1093,7 +1302,7 @@ const toolHandlers = {
         // the page didn't confirm a character, it may still have been typed.
         const stopped = async (why, { finishEdit = true, unsure = false } = {}) => {
           if (finishEdit && typed && isControlledNow(tabId)) {
-            await sendContentMessage(tabId, { type: "endTyping" }, 2000).catch(() => {});
+            await sendContentMessage(tabId, { type: "endTyping" }, 2000, frameId).catch(() => {});
           }
           const rest = chars.slice(typed).join("");
           const unsureNote = unsure
@@ -1112,33 +1321,52 @@ const toolHandlers = {
           }
           let resp;
           try {
-            resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) }, stepTimeout(request));
+            resp = await sendContentMessage(tabId, { type: "typeChar", text: char, key: keyForChar(char) }, stepTimeout(request), frameId);
           } catch (err) {
             return stopped(`the page stopped responding (${err.message})`, { finishEdit: false, unsure: !err.notDone });
           }
           typed++;
           if (resp?.inserted) inserted++;
+          submitted ||= !!resp?.submitted;
+          if (typed < chars.length && (resp?.submitted || resp?.left)) {
+            return stopped(resp.submitted ? "Enter submitted the form" : "the focus left the field");
+          }
           await sleep(10);
         }
         // Fields announce a finished edit with one change event, as when the
         // user moves on.
-        await sendContentMessage(tabId, { type: "endTyping" }, stepTimeout(request));
+        // All of it is typed by now: a page too slow for this last step
+        // mustn't turn that into a failure (typing it again would double it).
+        let changeNote = "";
+        try {
+          await sendContentMessage(tabId, { type: "endTyping" }, stepTimeout(request), frameId);
+        } catch {
+          if (!submitted) changeNote = " (the page didn't answer afterwards, so the field may not have had its change event)";
+        }
         const shown = `"${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
         if (inserted === 0) {
-          return textResult(
+          return errorResult(
             `Sent the keys for ${shown}, but no text field had focus, so no text was inserted. Click the field first.`
           );
         }
-        return textResult(`Typed ${shown}`);
+        if (inserted < chars.length) {
+          return textResult(
+            `Only ${inserted} of the ${chars.length} characters of ${shown} went into a text field: there was none with the focus for the others. Check the field.`
+          );
+        }
+        return textResult(`Typed ${shown}${submitted ? " (Enter submitted the form)" : ""}${changeNote}`);
       }
 
       case "key": {
         if (!args.text)
-          return textResult("text is required for key action");
+          return errorResult("Error: text is required for key action");
+        const frameId = await keyFrame(tabId);
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
         const total = repeat * keys.length;
         let pressed = 0;
+        let submitted = false;
+        const noDefault = new Set(); // keys that only reached the page's handlers
         const stopped = (why, unsure = false) => textResult(
           `Pressed ${pressed} of ${total} keys, then stopped: ${why}.${unsure ? " The next key may or may not have been pressed: check the page before pressing the rest." : ""}`
         );
@@ -1150,50 +1378,69 @@ const toolHandlers = {
               return stopped("all of them would take longer than a tool call may");
             }
             const { key, code, keyCode, modifiers: keyMod } = parseKeyCombo(keyStr);
+            let resp;
             try {
-              await sendContentMessage(tabId, {
+              resp = await sendContentMessage(tabId, {
                 type: "dispatchKeyEvent", eventType: "keyDown",
                 key, code, keyCode, modifiers: keyMod,
-              }, stepTimeout(request));
+              }, stepTimeout(request), frameId);
             } catch (err) {
               return stopped(`the page stopped responding (${err.message})`, !err.notDone);
             }
             pressed++;
+            if (resp?.noDefault) noDefault.add(keyStr);
+            submitted ||= !!resp?.submitted;
             try {
               await sendContentMessage(tabId, {
                 type: "dispatchKeyEvent", eventType: "keyUp",
                 key, code, keyCode, modifiers: keyMod,
-              }, stepTimeout(request));
+              }, stepTimeout(request), frameId);
             } catch (err) {
+              // Enter can take the page away: nothing's left to release it in.
+              if (submitted) break;
               return stopped(`the page stopped responding while that key was being released (${err.message})`);
             }
             await sleep(30);
           }
         }
-        return textResult(`Pressed ${total} key${total > 1 ? "s" : ""}: ${args.text}`);
+        // A field changed by keys gets its change event, as after typing.
+        await sendContentMessage(tabId, { type: "endTyping" }, 2000, frameId).catch(() => {});
+        const notes = [
+          ...(submitted ? [" (Enter submitted the form)"] : []),
+          ...(noDefault.size ? [` (${[...noDefault].join(", ")} only reached the page's own key handlers: synthetic keys don't do what they do in Firefox itself, like copying or browser shortcuts)`] : []),
+        ];
+        return textResult(`Pressed ${total} key${total > 1 ? "s" : ""}: ${args.text}${notes.join("")}`);
       }
 
       case "scroll": {
         if (!coordinate)
-          return textResult("coordinate is required for scroll");
+          return errorResult("Error: coordinate is required for scroll");
         const dir = args.scroll_direction || "down";
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
         const deltaY = dir === "up" ? -amount * 100 : dir === "down" ? amount * 100 : 0;
-        const outcome = await sendContentMessage(tabId, {
+        const outcome = await atPoint({
           type: "dispatchScroll",
-          x: coordinate[0], y: coordinate[1],
+          x: point[0], y: point[1],
           deltaX, deltaY, modifiers,
-        });
+        }, startFrame);
+        if (outcome.error) return errorResult(`Error: ${outcome.error}`);
         let note = "";
-        if (outcome?.unlocked) note = " (the page had scrolling locked; forced overflow:auto on html/body)";
-        if (outcome?.handledByPage) note = " (the page handled the wheel event itself, e.g. a map or carousel)";
-        else if (outcome && !outcome.moved) note += " (nothing scrolled: already at the edge, or nothing scrollable here)";
+        if (outcome.unlocked) note = " (the page had scrolling locked; forced overflow:auto on html/body)";
+        if (outcome.handledByPage) note = " (the page handled the wheel event itself, e.g. a map or carousel)";
+        else if (outcome.moved === false) note += " (nothing scrolled: already at the edge, or nothing scrollable here)";
         await sleep(300);
-        const { base64 } = await takeScreenshot(tabId);
+        const scrolled = `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})${note}`;
+        // The scroll happened; a screenshot that fails afterwards doesn't undo it.
+        let base64;
+        try {
+          ({ base64 } = await takeScreenshot(tabId, request));
+        } catch (err) {
+          return textResult(`${scrolled}. No screenshot afterwards: ${err.message}.`);
+        }
         return {
           content: [
-            { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})${note}` },
+            { type: "text", text: scrolled },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -1201,12 +1448,13 @@ const toolHandlers = {
 
       case "scroll_to": {
         if (!coordinate && !args.ref)
-          return textResult("coordinate or ref is required for scroll_to");
+          return errorResult("Error: coordinate or ref is required for scroll_to");
         if (args.ref) {
-          await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
+          const resp = await inPage({ type: "scrollToRef", ref: args.ref }, refFrame(args.ref));
+          if (resp?.error) return errorResult(`Error: ${resp.error}`);
         }
         if (coordinate) {
-          await sendContentMessage(tabId, {
+          await inPage({
             type: "scrollToPosition",
             x: coordinate[0], y: coordinate[1],
           });
@@ -1216,52 +1464,57 @@ const toolHandlers = {
       }
 
       case "wait": {
-        const duration = Math.min(args.duration || 1, 30);
+        const duration = Math.min(args.duration ?? 1, 30);
         await sleep(duration * 1000);
         return textResult(`Waited for ${duration} second${duration !== 1 ? "s" : ""}`);
       }
 
       case "left_click_drag": {
         if (!args.start_coordinate || !coordinate) {
-          return textResult("start_coordinate and coordinate are required for left_click_drag");
+          return errorResult("Error: start_coordinate and coordinate are required for left_click_drag");
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
-        await sendContentMessage(tabId, {
+        const [startX, startY] = toPage(args.start_coordinate);
+        const resp = await atPoint({
           type: "dispatchDrag",
-          startX: sx, startY: sy, endX: ex, endY: ey, modifiers,
+          startX, startY, endX: point[0], endY: point[1], modifiers,
         });
-        return textResult(`Dragged from (${sx}, ${sy}) to (${ex}, ${ey})`);
+        if (resp.outside) return outside(sx, sy);
+        if (resp.error) return errorResult(`Error: ${resp.error}`);
+        const dropNote = resp.dropped === false ? " (a browser drag: the page didn't accept the drop there)" : "";
+        return textResult(`Dragged from (${sx}, ${sy}) to (${ex}, ${ey})${dropNote}`);
       }
 
       case "zoom": {
         if (!args.region || args.region.length !== 4) {
-          return textResult("region [x0, y0, x1, y1] is required for zoom");
+          return errorResult("Error: region [x0, y0, x1, y1] is required for zoom");
         }
-        const [x0, y0, x1, y1] = args.region.map(Number);
-        if (![x0, y0, x1, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) {
-          return textResult("region must be numbers with x1 > x0 and y1 > y0");
+        const region = args.region.map(Number);
+        if (!region.every(Number.isFinite) || region[2] <= region[0] || region[3] <= region[1]) {
+          return errorResult("Error: region must be numbers with x1 > x0 and y1 > y0");
         }
+        const [x0, y0, x1, y1] = toPage(region);
         // captureVisibleTab's rect is in page coordinates, so add the scroll
         // offset. A page busy with a script can't answer: not waited for long.
         const offsets = await Promise.race([
           chrome.scripting.executeScript({
             target: { tabId },
-            func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY, innerWidth: window.innerWidth }),
+            func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY }),
           }),
           sleep(3000).then(() => null),
         ]);
-        const view = offsets?.[0]?.result;
-        if (!view) return textResult("Error: the page didn't respond (it may be busy, e.g. with a script that's still running), so the region can't be located.");
+        const scrolled = offsets?.[0]?.result;
+        if (!scrolled) return errorResult("Error: the page didn't respond (it may be busy, e.g. with a script that's still running), so the region can't be located.");
         // The rect must be whole pixels (scroll offsets can be fractional on
         // scaled displays); round outwards so the whole region is covered.
-        const left = Math.floor(view.scrollX + x0);
-        const top = Math.floor(view.scrollY + y0);
-        const width = Math.ceil(view.scrollX + x1) - left;
-        const height = Math.ceil(view.scrollY + y1) - top;
+        const left = Math.floor(scrolled.scrollX + x0);
+        const top = Math.floor(scrolled.scrollY + y0);
+        const width = Math.ceil(scrolled.scrollX + x1) - left;
+        const height = Math.ceil(scrolled.scrollY + y1) - top;
         // Render the region at up to 4x so it fills roughly a viewport's width.
-        const scale = Math.min(4, Math.max(1, view.innerWidth / width));
-        const { base64 } = await takeScreenshot(tabId, {
+        const scale = Math.min(4, Math.max(1, view.imageWidth / width));
+        const { base64 } = await takeScreenshot(tabId, request, {
           rect: { x: left, y: top, width, height },
           scale,
         });
@@ -1274,14 +1527,13 @@ const toolHandlers = {
       }
 
       default:
-        return textResult(`Unknown computer action: ${action}`);
+        return errorResult(`Error: unknown computer action: ${action}`);
     }
   },
 
-  async read_page(args) {
+  async read_page(args, control, request) {
     const { tabId } = args;
-
-    const resp = await sendContentMessage(tabId, {
+    const message = {
       type: "generateAccessibilityTree",
       options: {
         filter: args.filter,
@@ -1289,39 +1541,75 @@ const toolHandlers = {
         max_chars: args.max_chars,
         ref_id: args.ref_id,
       },
-    });
+    };
 
-    let tree = resp?.result || "Error: Could not generate accessibility tree";
-    try {
-      const vpResult = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: () => window.innerWidth + "x" + window.innerHeight,
-      });
-      if (vpResult[0]?.result) tree += `\n\nViewport: ${vpResult[0].result}`;
-    } catch {}
-    return textResult(tree);
+    const resp = await sendContentMessage(tabId, message, stepTimeout(request), refFrame(args.ref_id));
+    if (resp?.error) return errorResult(`Error: ${resp.error}`);
+    if (typeof resp?.result !== "string") return errorResult("Error: Could not generate accessibility tree");
+    let tree = resp.result;
+
+    // The frames on the page, unless a part of the page was asked for.
+    if (!args.ref_id) {
+      for (const { frame, resp: inner } of await askFrames(tabId, await shownFrames(tabId), message)) {
+        if (inner?.result?.trim()) tree += `\n--- frame ${frame.frameId} ---\n${inner.result}`;
+      }
+    }
+    const maxChars = args.max_chars || 50000;
+    if (tree.length > maxChars) {
+      tree = `${tree.slice(0, maxChars)}\n... (truncated: use a smaller depth, or ref_id to read one part of the page)`;
+    }
+    if (!tree.trim()) {
+      tree = args.filter === "interactive" ? "This page has no interactive elements to show." : "This page has nothing to show.";
+    }
+    const { imageWidth, imageHeight } = await viewOf(tabId);
+    return textResult(`${tree}\n\nViewport: ${imageWidth}x${imageHeight}`);
   },
 
-  async get_page_text(args) {
+  async get_page_text(args, control, request) {
     const { tabId } = args;
 
-    const resp = await sendContentMessage(tabId, { type: "getPageText" });
-    if (!resp?.result) return textResult("Error: Could not extract page text");
+    const resp = await sendContentMessage(tabId, { type: "getPageText" }, stepTimeout(request));
+    if (!resp?.result) return errorResult("Error: Could not extract page text");
 
+    let data;
     try {
-      const data = JSON.parse(resp.result);
-      return textResult(`Title: ${data.title}\nURL: ${data.url}\nSource: <${data.sourceTag}>\n\n${data.text}`);
+      data = JSON.parse(resp.result);
     } catch {
       return textResult(resp.result);
     }
+    let text = data.text;
+    if (data.fullLength > text.length) {
+      text += `\n… (cut at ${text.length} of ${data.fullLength} characters)`;
+    }
+    for (const { frame, resp: inner } of await askFrames(tabId, await shownFrames(tabId), { type: "getPageText" })) {
+      try {
+        const framed = JSON.parse(inner?.result);
+        if (framed.text) text += `\n\n--- frame ${frame.frameId} (${framed.url}) ---\n${framed.text}`;
+      } catch {}
+    }
+    return textResult(`Title: ${data.title}\nURL: ${data.url}\nSource: <${data.sourceTag}>\n\n${text}`);
   },
 
-  async find(args) {
+  async find(args, control, request) {
     const { query, tabId } = args;
 
-    const resp = await sendContentMessage(tabId, { type: "findElements", query });
-    const results = resp?.result || [];
+    const message = { type: "findElements", query };
+    const resp = await sendContentMessage(tabId, message, stepTimeout(request));
+    const inFrames = await askFrames(tabId, await shownFrames(tabId), message);
+    const { fit } = await viewOf(tabId);
+
+    // In the coordinates of the screenshot, wherever they were found. Each
+    // document ranks its own; across them, those with the most of the query's
+    // words that say which element it is come first (see findElements).
+    const answers = [{ frame: { x: 0, y: 0 }, resp }, ...inFrames].filter((a) => a.resp?.result?.found);
+    const tier = Math.max(0, ...answers.map((a) => a.resp.result.tier || 0));
+    const all = answers
+      .filter((a) => (a.resp.result.tier || 0) === tier)
+      .flatMap(({ frame, resp: answer }) => answer.result.found.map((r) => ({
+        ...r, coordinates: [Math.round((r.coordinates[0] + frame.x) * fit), Math.round((r.coordinates[1] + frame.y) * fit)],
+      })))
+      .sort((a, b) => (b.score || 0) - (a.score || 0) || (b.interactive ? 1 : 0) - (a.interactive ? 1 : 0));
+    const results = all.slice(0, 20);
 
     if (results.length === 0) {
       return textResult(`No elements found matching "${query}"`);
@@ -1329,36 +1617,39 @@ const toolHandlers = {
 
     let text = `Found ${results.length} element(s) matching "${query}":\n\n`;
     for (const r of results) {
-      const where = `at (${r.coordinates[0]}, ${r.coordinates[1]})`;
-      text += `[${r.ref}] ${r.role} "${r.name}" ${where}${r.offscreen ? " (off-screen: click it by ref, or scroll first)" : ""}\n`;
+      const at = `at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      text += `[${r.ref}] ${r.role} "${r.name}" ${at}${r.offscreen ? " (off-screen: click it by ref, or scroll first)" : ""}\n`;
     }
+    const more = all.length > results.length || resp?.result?.more || inFrames.some(({ resp: inner }) => inner?.result?.more);
+    if (more) text += "\nMore elements match; these are the best 20. Use a more specific query.\n";
 
     return textResult(text);
   },
 
-  async form_input(args) {
+  async form_input(args, control, request) {
     const { ref, value, tabId } = args;
 
-    const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
+    const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value }, stepTimeout(request), refFrame(ref));
     const result = resp?.result;
 
-    if (result?.error) return textResult(`Error: ${result.error}`);
+    if (result?.error) return errorResult(`Error: ${result.error}`);
+    if (!result) return errorResult("Error: the page gave no answer, so it's not known whether the value was set.");
     return textResult(`Set ${ref} to "${value}". Result: ${JSON.stringify(result)}`);
   },
 
-  async javascript_tool(args) {
+  async javascript_tool(args, control, request) {
     const { text, tabId } = args;
     const seconds = jsTimeoutSeconds(args.timeout);
-    const deadline = Date.now() + seconds * 1000;
+    const deadline = Math.min(Date.now() + seconds * 1000, request.deadline);
 
     let outcome;
     try {
-      outcome = await Promise.race([runJavascript(tabId, text, deadline), sleep(seconds * 1000).then(() => null)]);
+      outcome = await Promise.race([runJavascript(tabId, text, deadline), sleep(deadline - Date.now()).then(() => null)]);
     } catch (e) {
-      return textResult(`Error: ${withPermissionHelp(errorText(e))}`);
+      return errorResult(`Error: ${await withPermissionHelp(errorText(e))}`);
     }
     if (!outcome || outcome.timedOut) {
-      return textResult(
+      return errorResult(
         `Error: the script didn't finish within ${seconds}s. It may still be running in the page: Firefox can't stop it from here, so navigate or reload the tab if the page is stuck.`
       );
     }
@@ -1366,25 +1657,27 @@ const toolHandlers = {
   },
 
   async read_console_messages(args) {
-    const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
+    const { tabId, pattern, onlyErrors, clear } = args;
+    const limit = args.limit >= 1 ? args.limit : 100;
 
-    const res = await callPageHooks(tabId, { read: "logs", clear: !!clear });
-    let msgs = res?.logs || [];
+    const res = await callPageHooks(tabId, { read: "logs", report: false });
+    if (!res) return textResult("No console messages: Firefox doesn't let extensions script this page.");
+    if (res.busy) return errorResult("Error: the page didn't answer in time; it may be busy, e.g. with a script that's still running.");
 
-    if (onlyErrors) {
-      msgs = msgs.filter((m) => ["error", "exception"].includes(m.level));
+    // A page can write what its hooks recorded (see describeDialogs).
+    let logs = res.logs.slice(-MAX_LOGS_READ).map((m) => ({
+      id: m.id,
+      level: LOG_LEVELS.has(m.level) ? m.level : "log",
+      text: String(m.text ?? "").slice(0, MAX_LOG_TEXT),
+      url: String(m.url ?? "").slice(0, MAX_LOG_URL),
+    }));
+    if (onlyErrors) logs = logs.filter((m) => m.level === "error" || m.level === "exception");
+    if (typeof pattern === "string" && pattern) {
+      logs = await filterByPattern(logs, pattern);
+      if (!logs) return errorResult(`Error: the pattern took too long to match (it was stopped after ${PATTERN_TIMEOUT_MS / 1000} s). Use a simpler one.`);
     }
-
-    if (pattern) {
-      try {
-        const re = new RegExp(pattern, "i");
-        msgs = msgs.filter((m) => re.test(m.text) || re.test(m.level));
-      } catch {
-        msgs = msgs.filter((m) => m.text.includes(pattern));
-      }
-    }
-
-    msgs = msgs.slice(-limit);
+    const msgs = logs.slice(-limit);
+    if (clear && msgs.length) await callPageHooks(tabId, { clearLogs: msgs.map((m) => m.id), report: false });
 
     if (msgs.length === 0) {
       return textResult("No console messages matching the pattern.");
@@ -1399,7 +1692,8 @@ const toolHandlers = {
   },
 
   async read_network_requests(args) {
-    const { tabId, urlPattern, limit = 100, clear } = args;
+    const { tabId, urlPattern, clear } = args;
+    const limit = args.limit >= 1 ? args.limit : 100;
 
     let reqs = networkRequests.get(tabId) || [];
 
@@ -1417,11 +1711,12 @@ const toolHandlers = {
       return textResult("No network requests matching the pattern.");
     }
 
+    const status = (r) => {
+      if (r.status === -1) return `→ failed${r.error ? `: ${r.error}` : ""}`;
+      return r.status ? `→ ${r.status}` : "(pending)";
+    };
     const text = reqs
-      .map(
-        (r) =>
-          `${r.method} ${redactTokens(r.url)} ${r.status ? `→ ${r.status}` : "(pending)"}${r.mimeType ? ` [${r.mimeType}]` : ""}`
-      )
+      .map((r) => `${r.method} ${redactTokens(r.url)} ${status(r)}${r.mimeType ? ` [${r.mimeType}]` : ""}`)
       .join("\n");
 
     return textResult(`Network requests (${reqs.length}):\n${text}`);
@@ -1431,12 +1726,25 @@ const toolHandlers = {
     const { width, height } = args;
     if (kind === "shared") {
       // The window holds the user's other tabs too, which they didn't share.
-      return textResult(
+      return errorResult(
         "This tab is in one of the user's windows, which holds their other tabs too, so it keeps its size. To resize, ask the user to hand the tab over with tabs_request_handover: it moves into Claude's own window."
       );
     }
-    await chrome.windows.update(tab.windowId, { width, height });
-    return textResult(`Resized window to ${width}x${height}`);
+    // The user can move Claude's group into one of their windows: then the
+    // window holds their tabs too.
+    const others = (await chrome.tabs.query({ windowId: tab.windowId })).filter((t) => t.groupId !== tab.groupId);
+    if (others.length) {
+      return errorResult(
+        "Error: Claude's tab group is in a window that holds the user's own tabs too, so the window keeps its size. Ask the user to move Claude's group to a window of its own (or resize it themselves)."
+      );
+    }
+    // (Out of "maximized", or the size wouldn't change. The size it ends up
+    // with can differ: a window has a minimum, and only so much screen.)
+    await chrome.windows.update(tab.windowId, { state: "normal", width, height });
+    await sleep(100);
+    const now = await chrome.windows.get(tab.windowId);
+    const differs = now.width !== width || now.height !== height;
+    return textResult(`Resized window to ${now.width}x${now.height}${differs ? ` (${width}x${height} was asked for)` : ""}`);
   },
 
   async handle_dialog(args) {
@@ -1445,29 +1753,34 @@ const toolHandlers = {
     // The page itself, not its frames: an answer armed in every frame would
     // answer a confirm in each of them.
     const res = await callPageHooks(tabId, { nextAnswer, report: false }, 0);
-    if (!res) return textResult("Error: this page can't be scripted, so its dialogs can't be handled.");
+    if (!res) return errorResult("Error: this page can't be scripted, so its dialogs can't be handled.");
     const what = accept ? `accepted${promptText !== undefined ? ` with "${promptText}"` : ""}` : "cancelled";
-    return textResult(`The next confirm or prompt on this page will be ${what}. Alerts are always acknowledged.`);
+    if (res.busy) {
+      return errorResult(
+        `The page is busy and didn't answer. This takes effect once it's free: its next confirm or prompt will then be ${what}. Call handle_dialog again to change that.`
+      );
+    }
+    return textResult(`The next confirm or prompt on this page itself (not in a frame) will be ${what}. Alerts are always acknowledged.`);
   },
 
   async upload_image(args) {
-    return textResult("Image upload via file input is not supported in Firefox WebExtensions. Use drag & drop on the page instead.");
+    return errorResult("Uploading files isn't possible in Firefox WebExtensions, and a synthetic drag can't carry a file. Ask the user to upload it.");
   },
 
   async gif_creator(args) {
-    return textResult("GIF recording is not yet implemented in this extension.");
+    return errorResult("GIF recording isn't implemented in this extension.");
   },
 
   async shortcuts_list(args) {
-    return textResult("No shortcuts available. Shortcuts are not supported in this extension.");
+    return errorResult("Shortcuts aren't supported in this extension.");
   },
 
   async shortcuts_execute(args) {
-    return textResult("Shortcuts are not supported in this extension.");
+    return errorResult("Shortcuts aren't supported in this extension.");
   },
 
   async switch_browser(args) {
-    return textResult("Browser switching is not yet supported. The extension connects to whichever Firefox browser has it loaded.");
+    return errorResult("Switching browsers isn't supported. The extension connects to whichever Firefox has it loaded.");
   },
 
   async update_plan(args) {
@@ -1476,10 +1789,52 @@ const toolHandlers = {
     for (const step of approach) {
       text += `- ${step}\n`;
     }
-    text += "\nPlan auto-approved (no permission restrictions in this extension).";
+    text += "\nNoted. The user wasn't shown this: this extension has no approval step and no domain restrictions, so tell them in the conversation if they should see it.";
     return textResult(text);
   },
 };
+
+// The frame keys go to: the one last clicked in, while it's still there.
+async function keyFrame(tabId) {
+  const frameId = keyFrames.get(tabId) ?? 0;
+  if (!frameId) return 0;
+  const there = await sendContentMessage(tabId, { type: "listFrames" }, FRAME_TIMEOUT_MS, frameId).catch(() => null);
+  if (there) return frameId;
+  keyFrames.delete(tabId);
+  return 0;
+}
+
+// read_console_messages's pattern is matched in a worker (lib/pattern-worker.js),
+// which is stopped if it takes too long: nothing else can stop a regular
+// expression, and one can take forever, in the page or here alike. Resolves
+// the messages that match, or null if it took too long.
+const PATTERN_TIMEOUT_MS = 2000;
+const LOG_LEVELS = new Set(["log", "info", "warn", "error", "debug", "exception"]);
+const MAX_LOGS_READ = 5000;
+const MAX_LOG_TEXT = 4100;
+const MAX_LOG_URL = 2000;
+
+function filterByPattern(logs, pattern) {
+  return new Promise((resolve) => {
+    let worker;
+    const done = (matching) => {
+      clearTimeout(timer);
+      worker?.terminate();
+      resolve(matching);
+    };
+    const timer = setTimeout(() => done(null), PATTERN_TIMEOUT_MS);
+    const asText = () => done(logs.filter((m) => m.text.includes(pattern)));
+    try {
+      worker = new Worker(chrome.runtime.getURL("lib/pattern-worker.js"));
+    } catch {
+      asText();
+      return;
+    }
+    worker.onmessage = ({ data }) => done(logs.filter((m, i) => data[i]));
+    worker.onerror = asText;
+    worker.postMessage({ pattern, messages: logs.map(({ text, level }) => ({ text, level })) });
+  });
+}
 
 // Tools that act on one tab, which must be Claude's or shared with Claude.
 const TAB_TOOLS = new Set([
@@ -1499,8 +1854,11 @@ const PAGE_TOOLS = new Set([
 // time counts from when the request arrived.
 const TOOL_DEADLINE_MS = 55000;
 const TYPING_MARGIN_MS = 3000; // type and key stop this long before the deadline
+const MIN_BUDGET_MS = 1000; // a call resent with less than this isn't started
 
-async function handleToolRequest(id, tool, args, serverVersion, resent) {
+// timeLeft: how long the server still waits for this call (from 2.0.1 on);
+// a resent call has less than a new one.
+async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft) {
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
@@ -1508,7 +1866,10 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
   }
   // What a tool knows about its call: the server that sent it, when it must
   // be done by, and whether the user cancelled it (see cancelRequest).
-  const request = { serverVersion, deadline: Date.now() + TOOL_DEADLINE_MS, cancelled: false };
+  const budget = typeof timeLeft === "number"
+    ? Math.max(0, Math.min(TOOL_DEADLINE_MS, timeLeft - (60000 - TOOL_DEADLINE_MS)))
+    : TOOL_DEADLINE_MS;
+  const request = { serverVersion, deadline: Date.now() + budget, budget, cancelled: false };
   await stateReady;
 
   // A request the server sent again after the connection dropped (see
@@ -1524,30 +1885,42 @@ async function handleToolRequest(id, tool, args, serverVersion, resent) {
     }
   }
 
+  // Resent with no time left to speak of: started now, it would still be
+  // acting on the page after Claude was told the call failed.
+  if (budget < MIN_BUDGET_MS) {
+    sendError(id, `${tool} wasn't run: the connection dropped, and it came back with no time left for this call. If an earlier attempt may have reached the page, check whether it took effect before repeating it.`);
+    return;
+  }
+
   // Running from here on, before anything else is awaited: an update waits
   // for it, and a resend arriving meanwhile doesn't start it a second time.
+  // (It still counts as running until its answer is sent: an update that
+  // waits for it mustn't reload in between.)
   runningRequests.set(id, request);
   toolCallsRunning++;
-  let outcome;
   try {
+    let outcome;
+    try {
+      if (journaled) {
+        journal.set(id, { tool, state: "started", at: Date.now() });
+        await saveJournal();
+      }
+      outcome = { result: await runTool(tool, handler, args, request) };
+    } catch (err) {
+      outcome = { error: `${tool} failed: ${await withPermissionHelp(err.message)}` };
+    } finally {
+      runningRequests.delete(id);
+    }
     if (journaled) {
-      journal.set(id, { tool, state: "started", at: Date.now() });
+      journal.set(id, { tool, state: "done", at: Date.now(), ...keptOutcome(tool, args, outcome) });
       await saveJournal();
     }
-    outcome = { result: await runTool(tool, handler, args, request) };
-  } catch (err) {
-    outcome = { error: `${tool} failed: ${withPermissionHelp(err.message)}` };
+    if (outcome.error) sendError(id, outcome.error);
+    else sendResponse(id, outcome.result);
   } finally {
-    runningRequests.delete(id);
     toolCallsRunning--;
+    reloadIfIdle();
   }
-  if (journaled) {
-    journal.set(id, { tool, state: "done", at: Date.now(), ...keptOutcome(tool, args, outcome) });
-    await saveJournal();
-  }
-  if (outcome.error) sendError(id, outcome.error);
-  else sendResponse(id, outcome.result);
-  reloadIfIdle();
 }
 
 // The user cancelled the call in Claude. Tools that go step by step (typing,
@@ -1563,31 +1936,46 @@ function cancelRequest(id) {
 
 async function runTool(tool, handler, args, request) {
   let finish = null;
+  // Why a tool can't work in the tab as it is now, if there's a reason.
+  const refused = (control) => {
+    if (!control.tab) {
+      return errorResult(`Tab ${args.tabId} doesn't exist anymore. Use tabs_context_mcp to see the tabs you can use.`);
+    }
+    if (!control.kind) {
+      return errorResult(
+        `Tab ${args.tabId} isn't in Claude's tab group and the user hasn't shared it. Use tabs_context_mcp to see the tabs you can use, or tabs_request_access to ask the user to share one of theirs.`
+      );
+    }
+    // A tab can still show an extension page (dragged into the group, or
+    // opened by the user): only navigating away is allowed there.
+    if (PAGE_TOOLS.has(tool) && tool !== "navigate" && /^moz-extension:/i.test(control.tab.url || "")) {
+      return errorResult(`Tab ${args.tabId} shows an extension page, which Claude can't use. Navigate it to a web page first.`);
+    }
+    return null;
+  };
   try {
     let control = null;
     if (TAB_TOOLS.has(tool)) {
       control = await tabControl(args.tabId);
-      if (!control.tab) {
-        return textResult(`Tab ${args.tabId} doesn't exist anymore. Use tabs_context_mcp to see the tabs you can use.`);
+      const no = refused(control);
+      if (no) return no;
+      if (PAGE_TOOLS.has(tool)) {
+        finish = await startPageWork(args.tabId, control.kind);
+        // That waits seconds for a busy page. A lot can change meanwhile, and
+        // nothing has happened yet: this is the moment to stop.
+        control = await tabControl(args.tabId);
+        const noLonger = refused(control);
+        if (noLonger) return noLonger;
+        const reason = stopReason(args.tabId, request);
+        if (reason) return errorResult(`Error: ${reason}, so this wasn't done.`);
       }
-      if (!control.kind) {
-        return textResult(
-          `Tab ${args.tabId} isn't in Claude's tab group and the user hasn't shared it. Use tabs_context_mcp to see the tabs you can use, or tabs_request_access to ask the user to share one of theirs.`
-        );
-      }
-      // A tab can still show an extension page (dragged into the group, or
-      // opened by the user): only navigating away is allowed there.
-      if (PAGE_TOOLS.has(tool) && tool !== "navigate" && /^moz-extension:/i.test(control.tab.url || "")) {
-        return textResult(`Tab ${args.tabId} shows an extension page, which Claude can't use. Navigate it to a web page first.`);
-      }
-      if (PAGE_TOOLS.has(tool)) finish = await startPageWork(args.tabId, control.kind);
     }
     // A tool that's still going at the deadline is answered for anyway; its
     // messages to the page expire with it (see sendContentMessage).
     let timer;
     const overtime = new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error(
-        `it was still running after ${TOOL_DEADLINE_MS / 1000} s. It may have been done partly or fully: check whether it took effect before repeating it, and ask the user if you can't tell.`
+        `it was still running after ${Math.round(request.budget / 1000)} s. It may have been done partly or fully: check whether it took effect before repeating it, and ask the user if you can't tell.`
       )), Math.max(0, request.deadline - Date.now()));
     });
     let result;
@@ -1640,12 +2028,18 @@ function isRepeatable(tool, args) {
 }
 
 // What's kept of a finished call, to answer a resend with: not what Claude
-// typed, put in a form or gave a prompt (a password, say), nor a result too
-// large to keep.
+// typed, pressed, put in a form or gave a prompt (a password, say), nor a
+// picture of the page, nor a result too large to keep.
 function keptOutcome(tool, args, outcome) {
   // (handle_dialog's answer can carry the text given to a prompt.)
-  if (tool === "form_input" || tool === "handle_dialog" || (tool === "computer" && args.action === "type")) return {};
-  return JSON.stringify(outcome).length <= JOURNAL_RESULT_MAX ? outcome : {};
+  if (tool === "form_input" || tool === "handle_dialog") return {};
+  if (tool === "computer" && (args.action === "type" || args.action === "key")) return {};
+  // Kept as it would be sent: redacted (it's on disk, if only briefly).
+  const textOnly = (result) => (Array.isArray(result?.content)
+    ? { ...result, content: result.content.filter((item) => item?.type !== "image") }
+    : result);
+  const kept = outcome.error ? { error: redactTokens(outcome.error) } : { result: redactResult(textOnly(outcome.result)) };
+  return JSON.stringify(kept).length <= JOURNAL_RESULT_MAX ? kept : {};
 }
 
 function pruneJournal() {
@@ -1718,9 +2112,12 @@ function jsTimeoutSeconds(value) {
 }
 
 // Resolves to { ok: packed result }, { thrown: error text } or { timedOut }.
-async function runJavascript(tabId, code, deadline) {
-  let outcome = await evalInPage(tabId, code);
-  if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, code);
+async function runJavascript(tabId, text, deadline) {
+  // (A hashbang only parses at the very start of a script: none of what's run
+  // below starts with the code.)
+  const code = text.replace(/^#!.*/, "");
+  let outcome = await evalInPage(tabId, code, deadline);
+  if (outcome.needsFunctionBody) outcome = await evalBodiesInPage(tabId, code, outcome.syntaxError, deadline);
   if (!outcome.csp) return outcome;
 
   // The page's Content Security Policy blocks eval(). The userScripts
@@ -1733,13 +2130,17 @@ async function runJavascript(tabId, code, deadline) {
 
 // eval() in the page's own world (indirect, so it runs at global scope like a
 // console), so page variables are visible. Pages whose CSP forbids eval
-// (reddit, HN, ...) make it fail with { csp }. Code that uses top-level
-// await or return comes back as { needsFunctionBody }, without having run.
-async function evalInPage(tabId, code) {
+// (reddit, HN, ...) make it fail with { csp }. Code that doesn't parse as a
+// script (top-level await or return, say) comes back as { needsFunctionBody,
+// syntaxError }, without having run. A page that takes longer than the deadline
+// to get to this (it may be loading) is too late for it: Claude was told by
+// then that the script didn't run in time.
+async function evalInPage(tabId, code, deadline) {
   const [res] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (code, packSource, needsBodySource) => {
+    func: async (code, bareAwait, deadline, packSource) => {
+      if (Date.now() > deadline) return { timedOut: true };
       const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
       let pack;
       try {
@@ -1747,13 +2148,21 @@ async function evalInPage(tabId, code) {
       } catch (e) {
         return { csp: describe(e) };
       }
+      if (bareAwait) return { needsFunctionBody: true };
+      // Whether it parses is found out by parsing it behind a `throw`: the
+      // code can't run from there, whatever it is. An error thrown while it
+      // runs can't be told from that afterwards (an eval() inside it can
+      // throw a SyntaxError), and running it again as a function body would
+      // do everything twice.
+      try {
+        (0, eval)(`throw 0;\n${code}`); // eslint-disable-line no-eval
+      } catch (e) {
+        if (e !== 0) return { needsFunctionBody: true, syntaxError: describe(e) };
+      }
       let value;
       try {
         value = (0, eval)(code); // eslint-disable-line no-eval
       } catch (e) {
-        if (e instanceof SyntaxError && new RegExp(needsBodySource, "i").test(e.message)) {
-          return { needsFunctionBody: true };
-        }
         return { thrown: describe(e) };
       }
       try {
@@ -1762,7 +2171,7 @@ async function evalInPage(tabId, code) {
         return { thrown: describe(e) };
       }
     },
-    args: [code, packValue.toString(), NEEDS_FUNCTION_BODY.source],
+    args: [code, awaitsAtTopLevel(code), deadline, packValue.toString()],
   });
   if (res?.error) return { thrown: errorText(res.error) };
   return res?.result ?? { thrown: "The script produced no result." };
@@ -1770,45 +2179,47 @@ async function evalInPage(tabId, code) {
 
 // Runs the first candidate body for `code` (see lib/js-source.js) that
 // parses as an async function body. The page builds them one at a time from
-// the offsets, rather than receiving them all.
-async function evalBodiesInPage(tabId, code) {
+// the offsets, rather than receiving them all. If none does, syntaxError
+// says why the code didn't parse as a script.
+async function evalBodiesInPage(tabId, code, syntaxError, deadline) {
+  const { starts, end } = statementStarts(code);
   const [res] = await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (code, starts, bodyAtSource, packSource) => {
+    func: async (code, starts, end, syntaxError, deadline, bodyAtSource, packSource) => {
+      if (Date.now() > deadline) return { timedOut: true };
       const describe = (e) => (e && e.name ? `${e.name}: ${e.message}` : String(e));
       const pack = (0, eval)(`(${packSource})`); // eslint-disable-line no-eval
       const bodyAt = (0, eval)(`(${bodyAtSource})`); // eslint-disable-line no-eval
+      const AsyncFunction = (async () => {}).constructor;
       const bodies = function* () {
         for (const at of starts) {
-          const body = bodyAt(code, at);
+          const body = bodyAt(code, at, end);
           if (body !== null) yield body;
         }
         yield code;
       };
       let parseError = null;
       for (const body of bodies()) {
-        let pending;
+        let run;
         try {
           // Parsing happens before anything runs: a body that doesn't parse
-          // has no effects.
-          pending = (0, eval)(`(async () => {\n${body}\n})()`); // eslint-disable-line no-eval
+          // has no effects. It's parsed as a body, on its own: in a wrapper
+          // written around it as text, a stray "})" could close the wrapper.
+          run = new AsyncFunction(body);
         } catch (e) {
-          if (e instanceof SyntaxError) {
-            parseError = e;
-            continue;
-          }
-          return { thrown: describe(e) };
+          parseError = e;
+          continue;
         }
         try {
-          return { ok: pack(await pending) };
+          return { ok: pack(await run()) };
         } catch (e) {
           return { thrown: describe(e) };
         }
       }
-      return { thrown: describe(parseError) };
+      return { thrown: syntaxError ?? describe(parseError) };
     },
-    args: [code, statementStarts(code), returnBodyAt.toString(), packValue.toString()],
+    args: [code, starts, end, syntaxError ?? null, deadline, returnBodyAt.toString(), packValue.toString()],
   });
   if (res?.error) return { thrown: errorText(res.error) };
   return res?.result ?? { thrown: "The script produced no result." };
@@ -1862,7 +2273,7 @@ async function runAsUserScript(tabId, code, deadline) {
 
 // Credentials are hidden (lib/redact.js) and long output is cut.
 function formatJavascriptOutcome(outcome) {
-  if (outcome.thrown !== undefined) return textResult(`Error: ${redactErrorText(outcome.thrown)}`);
+  if (outcome.thrown !== undefined) return errorResult(`Error: ${redactErrorText(outcome.thrown)}`);
   const packed = outcome.ok;
   if (!packed || packed.undefined) return textResult("undefined");
   const value = redactValue(packed.value);
@@ -1933,15 +2344,22 @@ async function moveTabsToClaudeNow(tabIds) {
     }
   } catch (err) {
     // E.g. a private window's tab and Claude's group in a normal window:
-    // leave the tabs as they were.
+    // leave the tabs as they were, also if they had moved already.
     for (const id of tabIds) {
+      const origin = tabOrigins.get(id);
+      await chrome.tabs.move(id, { windowId: origin.windowId, index: origin.index }).catch(() => {});
       tabOrigins.delete(id);
       if (pinned.includes(id)) await chrome.tabs.update(id, { pinned: true }).catch(() => {});
     }
     await saveTabOrigins();
     throw err;
   }
-  for (const id of tabIds) sharedTabs.delete(id);
+  // Claude's own before no longer shared, so they're never neither (a tool
+  // working in one would take that for the user taking it back).
+  for (const id of tabIds) {
+    ownTabs.add(id);
+    sharedTabs.delete(id);
+  }
   await saveSharedTabs();
   return Promise.all(tabIds.map((id) => chrome.tabs.get(id)));
 }
@@ -2006,11 +2424,22 @@ async function userWindowFor(tab) {
   return null;
 }
 
+// Tabs on their way out of Claude's group, shared already: in the group, a
+// shared tab otherwise counts as one the user dragged in.
+const movingOut = new Set();
+
 async function moveTabsToUser(tabIds) {
   // Shared first, so the tab never looks uncontrolled while it leaves the group.
-  for (const id of tabIds) sharedTabs.add(id);
+  for (const id of tabIds) {
+    movingOut.add(id);
+    sharedTabs.add(id);
+  }
   await saveSharedTabs();
-  await chrome.tabs.ungroup(tabIds);
+  try {
+    await chrome.tabs.ungroup(tabIds);
+  } finally {
+    for (const id of tabIds) movingOut.delete(id);
+  }
   let focusWindowId = null;
   for (const id of tabIds) {
     const tab = await chrome.tabs.get(id);
@@ -2190,10 +2619,15 @@ chrome.menus.onClicked.addListener(async (info, tab) => {
 const EXTENSION_NAME = "Claude MCP in Fayar kitsune";
 const SITE_ACCESS = { origins: ["<all_urls>"] };
 
-function withPermissionHelp(message) {
-  return /Missing (host|activeTab) permission/i.test(message)
-    ? `${message}. Firefox hasn't given ${EXTENSION_NAME} access to websites: click its toolbar button and allow "Access to all websites".`
-    : message;
+// Firefox says "Missing host permission" for any page it won't let extensions
+// script, whatever access they have: its own pages, error pages, a page that's
+// still on its way. Only without website access is that the thing to fix.
+async function withPermissionHelp(message) {
+  if (!/Missing (host|activeTab) permission/i.test(message)) return message;
+  if (await chrome.permissions.contains(SITE_ACCESS)) {
+    return `${message}. This page can't be scripted: it's a Firefox page, addons.mozilla.org or an error page, or it was still loading. Navigate to a web page, or try again.`;
+  }
+  return `${message}. Firefox hasn't given ${EXTENSION_NAME} access to websites: click its toolbar button and allow "Access to all websites".`;
 }
 
 async function openSetupPage() {
@@ -2313,6 +2747,12 @@ async function restoreState() {
     await findClaudeGroup();
     await syncOwnTabs();
   } catch {}
+  // A tab Claude lost while this background script wasn't running (dragged
+  // out of the group, say) still has its page answering for Claude: release
+  // it now.
+  for (const id of [...startedTabs]) {
+    if (!isControlledNow(id)) releasePage(id);
+  }
 }
 
 const stateReady = restoreState();

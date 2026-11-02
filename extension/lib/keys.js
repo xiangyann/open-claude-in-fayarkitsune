@@ -1,12 +1,13 @@
 // Keyboard data for synthetic key events (US layout, Firefox's legacy
 // keyCode values). Synthetic events don't type, move focus or submit forms
-// by themselves; they let pages that listen for keys see them.
+// by themselves; they let pages that listen for keys see them, and content.js
+// does what a browser would do for the common keys.
 
 // Modifiers by the names the `key` and `modifiers` arguments accept:
 // [the modifier's bit in input messages, its own key, code, keyCode].
 const MODIFIERS = {};
 for (const [names, bit, key, code, keyCode] of [
-  [["alt"], 1, "Alt", "AltLeft", 18],
+  [["alt", "option", "opt"], 1, "Alt", "AltLeft", 18],
   [["ctrl", "control"], 2, "Control", "ControlLeft", 17],
   [["meta", "cmd", "command", "win", "windows"], 4, "Meta", "MetaLeft", 91],
   [["shift"], 8, "Shift", "ShiftLeft", 16],
@@ -119,8 +120,11 @@ function parseKeyCombo(combo) {
   if (named) return { ...named, modifiers };
 
   if ([...main].length === 1) {
+    // ctrl+K is the K key with ctrl: it doesn't add shift the way a capital
+    // typed on its own does.
+    const held = modifiers && !(modifiers & SHIFT_BIT) && /^[A-Z]$/.test(main) ? main.toLowerCase() : main;
     // shift+a means "A", shift+1 "!" and shift+/ "?", as on a real keyboard.
-    const ch = modifiers & SHIFT_BIT ? shiftedChar(main) : main;
+    const ch = modifiers & SHIFT_BIT ? shiftedChar(held) : held;
     const info = keyForChar(ch);
     // A character typed with shift ("+", "!", "A") reports shift as held.
     if (info) return { key: info.key, code: info.code, keyCode: info.keyCode, modifiers: info.shift ? modifiers | SHIFT_BIT : modifiers };

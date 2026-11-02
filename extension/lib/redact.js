@@ -5,13 +5,16 @@
 // boundary, since a script can still send them wherever the page can.
 
 const SECRET_NAME_WORDS = new Set([
-  "password", "passwords", "passwd", "passphrase", "pwd", "secret", "secrets",
-  "token", "tokens", "cookie", "cookies", "credential", "credentials", "auth",
+  "password", "passwords", "passwd", "passphrase", "passcode", "pass", "pwd", "secret", "secrets",
+  "token", "tokens", "cookie", "cookies", "credential", "credentials", "auth", "authenticate",
   "authorization", "bearer", "jwt", "csrf", "xsrf", "session", "sessionid", "sid",
-  "apikey", "apikeys", "otp",
+  "apikey", "apikeys", "otp", "signature",
   // Common session and anti-forgery cookie names, written as one word.
-  "sessid", "phpsessid", "jsessionid", "csrftoken", "xsrftoken",
+  "sessid", "phpsessid", "jsessionid", "csrftoken", "xsrftoken", "sapisid", "apisid",
 ]);
+// Too common on their own as names of other things, but a secret when they're
+// a URL's parameter: ?key=, ?sig=, the ?code= of an OAuth login.
+const SECRET_URL_PARAMETERS = new Set(["key", "sig", "code"]);
 const SECRET_NAME_PAIRS = [
   ["api", "key"], ["private", "key"], ["access", "key"], ["secret", "key"],
   ["api", "keys"], ["private", "keys"], ["access", "keys"], ["secret", "keys"],
@@ -24,11 +27,13 @@ const COUNTING_WORDS = new Set([
   "timeout", "expires", "expiry", "at", "time", "version",
 ]);
 
+// (Digits at the end of a word don't count: password1, password2, token1.)
 function nameWords(name) {
   return String(name)
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .toLowerCase()
     .split(/[^a-z0-9]+/)
+    .map((word) => word.replace(/\d+$/, ""))
     .filter(Boolean);
 }
 
@@ -53,8 +58,29 @@ function isSecretValue(name, value) {
 // A cookie name is an HTTP token; a value has no spaces, quotes, commas,
 // semicolons or backslashes unless it's quoted.
 const COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=(?:"[^"]*"|[^\s",;\\]*)$/;
-const JWT_ANYWHERE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g;
 const BEARER_ANYWHERE = /\b(Bearer)\s+[A-Za-z0-9\-._~+/]{12,}=*/gi;
+
+// JSON Web Tokens anywhere in a text: eyJ…, a dot, and two more parts of at
+// least 6 characters. Found part by part, not with one regular expression:
+// a page can fill a text with "-eyJ-eyJ-eyJ…", and one that starts over at
+// each of those takes minutes on a megabyte, with the whole extension stuck.
+function hideJwts(text) {
+  return text.replace(/[A-Za-z0-9_.-]{23,}/g, (run) => {
+    const parts = run.split(".");
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+      const start = /(?:^|-)eyJ[A-Za-z0-9_-]{6}/.exec(parts[i]);
+      if (start && parts[i + 1]?.length >= 6 && parts[i + 2]?.length >= 6) {
+        const before = parts[i].slice(0, start.index + start[0].indexOf("eyJ"));
+        out.push(`${before}[hidden: token]`);
+        i += 2;
+      } else {
+        out.push(parts[i]);
+      }
+    }
+    return out.join(".");
+  });
+}
 
 // Any value up to the next ";": browsers accept spaces, commas, quotes and
 // JSON in cookie values, and one such cookie mustn't expose all the others.
@@ -122,35 +148,64 @@ function redactErrorText(text) {
 // inside other text): the value may run to the end of the text.
 const JSON_STRING_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)"((?:[^"\\]|\\.)*)(?:"|$)/g;
 const JSON_NUMBER_PAIR = /"((?:[^"\\\n]|\\.){1,200})"(\s*:\s*)(-?\d+(?:\.\d+)?)(?![\d.])/g;
+// The same inside a JSON string: {\"token\":\"…\"}.
+const ESCAPED_JSON_PAIR = /\\"([^"\\\n]{1,200})\\"(\s*:\s*)\\"((?:[^"\\]|\\[^"])*)\\"/g;
 // name=value in a URL's query, fragment or path parameters (;jsessionid=),
-// in a cookie string, or in text (API_KEY=…). A value stops at the next
-// separator, so a secret after a nested "?" is found too.
-const NAME_VALUE = /(^|[?&#;,\s])([^=&#?;,\s"'<>]{1,200})=([^&#?;,\s"'<>]+)/g;
+// in a cookie string, or in text (API_KEY=…, password = "…"). A value stops
+// at the next separator, so a secret after a nested "?" is found too. No
+// backslashes: one may be half of a \" that closes a JSON string, which must
+// stay as it is (other code parses that JSON).
+const NAME_VALUE = /(^|[?&#;,\s])([^=&#?;,\s"'<>\\]{1,200})([ \t]*=[ \t]*)(?!=)(\\"[^"\\\n]*\\"|"[^"\n]*"|'[^'\n]*'|[^&#?;,\s"'<>\\]+)/g;
 // A "name: value" header line: Authorization, Set-Cookie, X-CSRF-Token, …
 const HEADER_LINE = /^([ \t]*)([A-Za-z][\w-]{0,100})(:[ \t]*)(\S[^\r\n]*)$/gm;
+// The same in quotes (curl -H "Authorization: Basic …") or in a list.
+const QUOTED_HEADER = /(^[ \t]*[-*][ \t]+|["'])([A-Za-z][\w-]{0,100})(:[ \t]*)([^"'\r\n]+)/gm;
+// <input name="csrf_token" value="…">, <meta name="csrf-token" content="…">
+const HTML_NAME_VALUE = /(\bname=["'])([^"'<>]{1,200})(["'][^<>]{0,200}?\b(?:value|content)=["'])([^"'<>]*)/gi;
+// https://user:password@host/
+const URL_PASSWORD = /(\/\/[^\s/:@]{1,200}:)[^\s/@]{1,200}@/g;
 
 // Secrets embedded in longer text, e.g. a page's HTML, a console message, a
 // URL, or JSON too long to have reached here whole.
 function redactTokens(s) {
-  return String(s)
-    .replace(JWT_ANYWHERE, "[hidden: token]")
+  return hideJwts(String(s))
     .replace(BEARER_ANYWHERE, "$1 [hidden: token]")
+    .replace(URL_PASSWORD, "$1[hidden]@")
     .replace(JSON_STRING_PAIR, (pair, name, colon, value) =>
       isSecretValue(name, value) ? `"${name}"${colon}"[hidden: value of ${name}]"` : pair
     )
     .replace(JSON_NUMBER_PAIR, (pair, name, colon, number) =>
       isSecretValue(name, Number(number)) ? `"${name}"${colon}"[hidden: value of ${name}]"` : pair
     )
+    .replace(ESCAPED_JSON_PAIR, (pair, name, colon, value) =>
+      isSecretValue(name, value) ? `\\"${name}\\"${colon}\\"[hidden: value of ${name}]\\"` : pair
+    )
     .replace(HEADER_LINE, (line, indent, name, colon, value) =>
       isSecretName(name) && !value.startsWith("[hidden") ? `${indent}${name}${colon}[hidden]` : line
     )
-    .replace(NAME_VALUE, (pair, sep, name, value) =>
-      isSecretName(name) && value !== "[hidden]" ? `${sep}${name}=[hidden]` : pair
-    );
+    .replace(QUOTED_HEADER, (line, before, name, colon, value) =>
+      isSecretName(name) && !value.startsWith("[hidden") ? `${before}${name}${colon}[hidden]` : line
+    )
+    .replace(HTML_NAME_VALUE, (pair, before, name, between, value) =>
+      isSecretName(name) && value ? `${before}${name}${between}[hidden]` : pair
+    )
+    .replace(NAME_VALUE, (pair, sep, name, equals, value) => {
+      const secret = isSecretName(name) || ((sep === "?" || sep === "&") && SECRET_URL_PARAMETERS.has(name.toLowerCase()));
+      return secret && !/^["'\\]*\[hidden/.test(value) ? `${sep}${name}${equals}[hidden]` : pair;
+    });
 }
 
 function hidden(name) {
   return `[hidden: value of "${name}"]`;
+}
+
+// A list under a secret name ({ tokens: ["…"] }): its strings and numbers go,
+// and objects in it are searched like any other.
+function hideList(name, list, depth) {
+  return list.map((item) => {
+    if (Array.isArray(item) && depth <= 32) return hideList(name, item, depth + 1);
+    return isSecretValue(name, item) ? hidden(name) : redactValue(item, depth + 1);
+  });
 }
 
 // Set as an own property: a key like "__proto__" mustn't become a prototype.
@@ -168,20 +223,27 @@ function redactValue(value, depth = 0) {
     const pairs = value.length > 0 &&
       value.every((item) => Array.isArray(item) && item.length === 2 && typeof item[0] === "string");
     if (pairs) {
-      return value.map(([name, item]) =>
-        isSecretValue(name, item) ? [name, hidden(name)] : [name, redactValue(item, depth + 1)]
-      );
+      return value.map(([name, item]) => {
+        if (Array.isArray(item) && isSecretName(name)) return [name, hideList(name, item, depth + 1)];
+        return isSecretValue(name, item) ? [name, hidden(name)] : [name, redactValue(item, depth + 1)];
+      });
     }
     return value.map((item) => redactValue(item, depth + 1));
   }
   // { name: "sessionid", value: "…" }, as from cookieStore.getAll().
-  const label = typeof value.name === "string" ? value.name : typeof value.key === "string" ? value.key : null;
+  const label = [value.name, value.key, value.Name, value.Key].find((v) => typeof v === "string") ?? null;
   const out = {};
   for (const [name, item] of Object.entries(value)) {
     // Hide the secret itself; objects under such names are searched instead,
     // so { session: { user, token } } still shows the user.
-    const secret = isSecretValue(name, item) || (name === "value" && label !== null && isSecretValue(label, item));
-    setProperty(out, name, secret ? hidden(name === "value" ? label : name) : redactValue(item, depth + 1));
+    const labelled = (name === "value" || name === "Value") && label !== null;
+    const under = labelled ? label : name;
+    if (Array.isArray(item) && isSecretName(under)) {
+      setProperty(out, name, hideList(under, item, depth + 1));
+      continue;
+    }
+    const secret = isSecretValue(name, item) || (labelled && isSecretValue(label, item));
+    setProperty(out, name, secret ? hidden(under) : redactValue(item, depth + 1));
   }
   return out;
 }

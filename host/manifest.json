@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "open-claude-in-fayarkitsune",
   "display_name": "Claude MCP in Fayar kitsune",
-  "version": "2.0.1-dev.2",
+  "version": "2.0.1-dev.3",
   "description": "Browser automation in Firefox through the Claude MCP in Fayar kitsune extension.",
   "long_description": "MCP server for the Claude MCP in Fayar kitsune Firefox extension. Install the extension in Firefox; it connects to this server over a WebSocket on 127.0.0.1:18765. Nothing else to set up: no native messaging host, no Node.js install, no registry keys.",
   "author": {
@@ -76,7 +76,7 @@
     },
     {
       "name": "gif_creator",
-      "description": "Record and export a GIF of browser actions"
+      "description": "Not available: GIF recording"
     },
     {
       "name": "javascript_tool",
@@ -100,23 +100,23 @@
     },
     {
       "name": "shortcuts_list",
-      "description": "List shortcuts and workflows"
+      "description": "Not available: shortcuts"
     },
     {
       "name": "shortcuts_execute",
-      "description": "Run a shortcut or workflow"
+      "description": "Not available: shortcuts"
     },
     {
       "name": "switch_browser",
-      "description": "Switch which Firefox is automated"
+      "description": "Not available: switching browsers"
     },
     {
       "name": "update_plan",
-      "description": "Present a plan with domains for approval"
+      "description": "Note a plan (there is no approval step)"
     },
     {
       "name": "upload_image",
-      "description": "Upload a screenshot to a file input or drop target"
+      "description": "Not available: uploading files"
     }
   ],
   "compatibility": {
