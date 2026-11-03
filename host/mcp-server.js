@@ -175,8 +175,25 @@ function cleanupPidfile() {
   } catch {}
 }
 
+let shuttingDown = false;
+
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   if (mode === "primary") cleanupPidfile();
+  // Calls still running in the browser, this session's and those it
+  // forwarded for others: no one will get their answers, so they're stopped
+  // like a cancel rather than left acting on the page while the session that
+  // takes over looks at it. (A client's calls stop when its connection to
+  // this server closes.) The messages get a moment to leave before the
+  // connection is cut.
+  const running = mode === "primary" && extensionConnected() ? [...pendingRequests.keys(), ...clientRequestMap.keys()] : [];
+  for (const id of running) extensionConn.send({ type: "tool_cancel", id });
+  if (running.length) setTimeout(finishShutdown, 200);
+  else finishShutdown();
+}
+
+function finishShutdown() {
   if (extensionConn) extensionConn.close();
   if (primarySocket && !primarySocket.destroyed) primarySocket.destroy();
   for (const [, sock] of clientSockets) {
@@ -288,12 +305,12 @@ function detachExtension(conn) {
   const forwarded = sentOnIt(clientRequestMap);
   if (inFlight.length === 0 && forwarded.length === 0) return;
   // Give the extension a few seconds to reconnect, then resend. The
-  // extension may have run it already: from 2.0.1 on it remembers what it
+  // extension may have run it already: from 2.1.0 on it remembers what it
   // ran and doesn't run an action twice (see handleToolRequest there), and
   // says which browser it is (extension_hello). A request is only resent to
   // the same browser (another Firefox profile may have connected meanwhile),
   // and never to an extension that didn't say which browser it is: one
-  // before 2.0.1 keeps no such record and would run the action again.
+  // before 2.1.0 keeps no such record and would run the action again.
   // With it goes the time left before this server gives up on the call.
   const disconnected = `Browser extension disconnected. ${UNKNOWN_OUTCOME}`;
   const canResend = (entry) =>
@@ -488,7 +505,7 @@ function setupClientConnection(socket, initialBuffer) {
           // Forward to the extension with a prefixed ID, and the version of
           // the client's server: its tools are the ones Claude sees there
           // (a client before 2.0.0 doesn't say it: "").
-          // (With this server's own prefix: a client before 2.0.1 numbers its
+          // (With this server's own prefix: a client before 2.1.0 numbers its
           // requests from 1 again, also after another session took over.)
           const prefixedId = `c${REQUEST_ID_PREFIX}-${clientId}_${msg.id}`;
           const serverVersion = typeof msg.serverVersion === "string" ? msg.serverVersion : "";
@@ -735,10 +752,7 @@ async function requestHandover({ tabIds, reason, confirmed }, extra) {
         isError: true,
       };
     }
-    described = ids.map((id) => {
-      const tab = shared.find((t) => t.tabId === id);
-      return `"${tab.title}" (${tab.url})`;
-    });
+    described = ids.map((id) => namePage(shared.find((t) => t.tabId === id)));
   } catch {}
 
   const askedInConversation = ids.every(
@@ -756,7 +770,7 @@ async function requestHandover({ tabIds, reason, confirmed }, extra) {
     );
   };
 
-  if (!server.server.getClientCapabilities()?.elicitation) {
+  if (!server.server.getClientCapabilities()?.elicitation?.form) {
     return askInConversation("This app can't show a confirmation prompt.");
   }
 
@@ -804,6 +818,20 @@ async function describeTab(tabId, signal) {
   }
 }
 
+// How a tab is named in a prompt: by its site, which the page can't choose,
+// then its title, which it can. The title is shortened and loses quotes and
+// brackets, so it can't pass for an address or more of the prompt.
+function namePage(tab) {
+  let site = tab.url;
+  try {
+    const origin = new URL(tab.url).origin;
+    if (origin !== "null") site = origin;
+  } catch {}
+  const title = String(tab.title || "").replace(/["'`“”‘’()[\]{}<>]/g, "").replace(/\s+/g, " ").trim();
+  if (!title) return site;
+  return `${site} (page title: ${title.length > 60 ? `${title.slice(0, 60)}…` : title})`;
+}
+
 // --- Uploading local files ---
 // file_upload reads files on this computer and puts them into a page, which
 // sends them to a website: the user says yes to each upload first, in the
@@ -833,11 +861,16 @@ function isNetworkPath(file) {
 
 // Reads a file for an upload, checked again now (it may have changed while
 // the user was asked): still a regular file, and within the limit.
-async function readUpload(file, limit) {
+// `agreed`: the file's stat when the user was asked. What's read must still
+// be that file: not a link put in its place since, which could lead to
+// another file or a network share.
+async function readUpload(file, limit, agreed) {
+  if ((await fs.promises.lstat(file)).isSymbolicLink()) throw new Error(`${file} was replaced by a link.`);
   const handle = await fs.promises.open(file, "r");
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error(`${file} isn't a file anymore.`);
+    if (stat.dev !== agreed.dev || stat.ino !== agreed.ino) throw new Error(`${file} was replaced by another file.`);
     if (stat.size > limit) throw new Error(`${file} has grown past the upload limit.`);
     const buffer = Buffer.alloc(stat.size);
     const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
@@ -853,6 +886,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   // What's shown to the user and read is where a path really leads: not a
   // harmless-looking name that links to another file.
   const files = [];
+  const stats = new Map(); // file -> its stat now
   let total = 0;
   for (const given of new Set(paths)) {
     if (!path.isAbsolute(given)) return failed(`"${given}" isn't an absolute path.`);
@@ -869,6 +903,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
     if (!stat.isFile()) return failed(`${given} isn't a file.`);
     if (files.includes(file)) continue;
     files.push(file);
+    stats.set(file, stat);
     total += stat.size;
   }
   if (total > UPLOAD_MAX_BYTES) {
@@ -880,13 +915,18 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   // input belongs to: it can be in a frame from another site than the tab's.
   const checked = await callTool("upload_files", { tabId, ref, check: true, count: files.length }, extra);
   if (checked.isError) return checked;
+  // Without that answer the user can't be told where the files would go.
   let frameOrigin = null;
   try {
-    frameOrigin = JSON.parse(checked.content?.[0]?.text || "{}").origin || null;
-  } catch {}
+    const answer = JSON.parse(checked.content?.[0]?.text || "{}");
+    if (answer.ok !== true) throw new Error();
+    frameOrigin = answer.origin || null;
+  } catch {
+    return failed("The file input couldn't be checked; nothing was uploaded. Try again.");
+  }
 
   const tab = await describeTab(tabId, signal);
-  let page = tab ? `"${tab.title}" (${tab.url})` : `tab ${tabId}`;
+  let page = tab ? namePage(tab) : `tab ${tabId}`;
   let tabOrigin = null;
   try {
     tabOrigin = tab && new URL(tab.url).origin;
@@ -900,7 +940,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
     try {
       let left = UPLOAD_MAX_BYTES;
       for (const file of files) {
-        const bytes = await readUpload(file, left);
+        const bytes = await readUpload(file, left, stats.get(file));
         left -= bytes.length;
         data.push({
           name: path.basename(file),
@@ -921,7 +961,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   // Asked in the conversation only where the app can't show a prompt. Where
   // it can, a prompt that fails or isn't answered in time means no:
   // otherwise Claude could go on to confirm the upload itself.
-  if (!server.server.getClientCapabilities()?.elicitation) {
+  if (!server.server.getClientCapabilities()?.elicitation?.form) {
     uploadsAskedInConversation.set(asked, Date.now());
     return textResult(
       `This app can't show a confirmation prompt. Ask the user in the conversation whether to upload ${files.join(", ")} to ${page}. If they agree, call file_upload again with the same arguments and confirmed: true.`
@@ -991,10 +1031,10 @@ function saveImages(result) {
   const id = `${/ID: (screenshot_\d+)/.exec(text)?.[1] ?? `zoom_${Date.now()}`}_${randomUUID().slice(0, 8)}`;
   let note;
   try {
-    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true, mode: 0o700 });
     const saved = images.map((image, i) => {
       const file = path.join(SCREENSHOT_DIR, `${id}${i ? `_${i}` : ""}.${image.mimeType === "image/png" ? "png" : "jpg"}`);
-      fs.writeFileSync(file, Buffer.from(image.data, "base64"), { flag: "wx" });
+      fs.writeFileSync(file, Buffer.from(image.data, "base64"), { flag: "wx", mode: 0o600 });
       return file;
     });
     note = `Saved to ${saved.join(", ")}`;
@@ -1149,10 +1189,10 @@ server.tool(
       "left_click_drag", "zoom", "scroll_to", "hover"
     ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools, or the page to a position (coordinate) in CSS pixels.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for tooltips and dropdown menus that listen for the mouse. CSS :hover styles don\'t change: only the real mouse can do that.'),
     tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates, in the pixels of a screenshot of the tab (find's coordinates are too; ones computed with javascript_tool are not, when the screenshot says the viewport is larger than the image). Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
+    coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates, in the pixels of a screenshot of the tab (find's coordinates are too; ones computed with javascript_tool are not, when the screenshot says the viewport is larger than the image). Required for `left_click`, `right_click`, `double_click`, `triple_click`, `scroll` and `hover` unless `ref` is given. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
-    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions.'),
+    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). For `scroll_to` (or give `coordinate`). Can be used as alternative to `coordinate` for clicks, `hover` and `scroll`.'),
     region: z.array(z.number()).min(4).max(4).optional().describe("(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in screenshot pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."),
     repeat: z.number().min(1).max(100).optional().describe("Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times."),
     scroll_direction: z.enum(["up", "down", "left", "right"]).optional().describe("The direction to scroll. Required for `scroll`."),

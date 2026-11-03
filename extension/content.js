@@ -1487,6 +1487,11 @@
       sendResponse({ error: "expired" });
       return;
     }
+    if (msg.type === "released") {
+      releasedAt = Date.now();
+      sendResponse({});
+      return;
+    }
     if (msg.type === "glow") {
       if (msg.mode !== "hide") hiddenForCaptureUntil = 0;
       if (msg.mode === "remove") releasedAt = Date.now();
@@ -1740,8 +1745,10 @@
         }
       }
       // inserted: the text went into a field, or the page took the key
-      // itself (an editor that cancels keydown and inserts on its own).
-      let inserted = true;
+      // itself in one (an editor that cancels keydown and inserts on its
+      // own). handled: the page took it with no text field focused (an app
+      // that takes keys itself, or a shortcut).
+      let inserted = insert || isEditable(field);
       let submitted = false;
       if (insert) {
         const target = focusedElement();
@@ -1759,7 +1766,7 @@
       }
       if (key) dispatchKey(focusedElement(), "keyup", key, key.shift ? 8 : 0);
       const left = text !== "\t" && isEditable(field) && !isEditable(focusedElement());
-      sendResponse({ inserted, submitted, left });
+      sendResponse({ inserted, submitted, left, handled: !inserted && !insert, editable: isEditable(focusedElement()) });
       return true;
     }
 
