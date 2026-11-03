@@ -92,6 +92,18 @@ function connectToServer() {
   // onerror is always followed by onclose
   ws.onclose = () => {
     if (serverSocket === ws) serverSocket = null;
+    // Calls still running have lost the server that waits for them. One that
+    // comes back in time sends the actions among them again, and they go on
+    // (see handleToolRequest). Those it doesn't are stopped like a cancel:
+    // no one gets their answers (the session may have quit), and they
+    // mustn't go on acting on a page Claude was told they failed on.
+    const lostAt = Date.now();
+    for (const request of runningRequests.values()) request.lostAt ||= lostAt;
+    setTimeout(() => {
+      for (const request of runningRequests.values()) {
+        if (request.lostAt && Date.now() - request.lostAt >= ORPHANED_AFTER_MS) request.cancelled = true;
+      }
+    }, ORPHANED_AFTER_MS);
     clearTimeout(server.timer);
     server.settled = false;
     updateBadge();
@@ -199,8 +211,9 @@ function debugEvent(kind, tabId, text) {
   }
 }
 
-// A call's arguments, for the debug log, without what Claude typed or entered.
-const PRIVATE_ARGUMENTS = { computer: ["text"], form_input: ["value"], handle_dialog: ["promptText"], upload_files: ["files"] };
+// A call's arguments, for the debug log, without what Claude typed or entered
+// (a script can set a field's value too).
+const PRIVATE_ARGUMENTS = { computer: ["text"], form_input: ["value"], handle_dialog: ["promptText"], upload_files: ["files"], javascript_tool: ["text"] };
 function describeArguments(tool, args) {
   const shown = { ...args };
   for (const name of PRIVATE_ARGUMENTS[tool] || []) {
@@ -621,11 +634,23 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS
     // extension was): inject it and send again. Any other failure, e.g. the
     // page navigating away mid-message, may come after the action happened.
     if (!/Receiving end does not exist|Could not establish connection/i.test(err?.message || "")) throw err;
+    // No longer than the message may take: a frame that's stuck is left
+    // out, like one that doesn't answer.
+    let timer;
     try {
-      await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content.js"], injectImmediately: true });
+      await Promise.race([
+        chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content.js"], injectImmediately: true }),
+        new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(
+            `The page didn't respond within ${Math.round(timeoutMs / 1000)} s: it may be busy, e.g. with a script that's still running.`
+          )), Math.max(0, deadline - Date.now()));
+        }),
+      ]);
     } catch (injectError) {
       injectError.unreachable = true; // nothing was sent to the page
       throw injectError;
+    } finally {
+      clearTimeout(timer);
     }
     return send();
   }
@@ -828,6 +853,8 @@ async function callPageHooks(tabId, settings, frameId) {
 function releasePage(tabId) {
   hookedTabs.delete(tabId);
   setGlow(tabId, "remove");
+  // Frames too: humanized input in one stops before pressing (see content.js).
+  chrome.tabs.sendMessage(tabId, { type: "released" }).catch(() => {});
   callPageHooks(tabId, { answerUntil: 0, nextAnswer: null, recording: false, forget: true });
 }
 
@@ -897,7 +924,7 @@ async function startPageWork(tabId, kind) {
   lastWorkAt.set(tabId, Date.now());
   workingTabs.set(tabId, (workingTabs.get(tabId) || 0) + 1);
   const before = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
-  setGlow(tabId, "show");
+  if (isControlledNow(tabId)) setGlow(tabId, "show");
   const keepGlowing = setInterval(() => {
     if (isControlledNow(tabId)) setGlow(tabId, "show");
   }, 2000);
@@ -1093,7 +1120,7 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
       capturing.set(tabId, left);
     } else {
       capturing.delete(tabId);
-      setGlow(tabId, "show");
+      if (isControlledNow(tabId)) setGlow(tabId, "show");
     }
   }
 
@@ -1406,12 +1433,12 @@ const toolHandlers = {
         const previous = lastScreenshots.get(tabId);
         const { base64, imageId, view: shot } = await takeScreenshot(tabId, request);
         // (Not after a resend: Claude may never have got the one before.)
-        if (args.if_changed && previous && !request.resent && screenshotStore.get(previous) === base64) {
+        if (args.if_changed && previous?.session === request.session && !request.resent && screenshotStore.get(previous.imageId) === base64) {
           screenshotStore.delete(imageId);
-          return textResult(`Unchanged: the tab looks exactly as in screenshot ${previous}, so the image was left out.`);
+          return textResult(`Unchanged: the tab looks exactly as in ${previous.imageId}, so the image was left out.`);
         }
         // Only one Claude gets: not one taken after the call ran out of time.
-        if (Date.now() < request.deadline) lastScreenshots.set(tabId, imageId);
+        if (Date.now() < request.deadline) lastScreenshots.set(tabId, { session: request.session, imageId });
         const size = shot.fit < 1
           ? `${shot.imageWidth}x${shot.imageHeight}, jpeg, of a ${shot.width}x${shot.height} viewport; use this image's pixels as coordinates`
           : `${shot.width}x${shot.height}, jpeg`;
@@ -1468,6 +1495,7 @@ const toolHandlers = {
           return errorResult("Error: text is required for type action");
         const frameId = await keyFrame(tabId);
         let inserted = 0;
+        let handled = 0; // taken by the page's own key handlers, with no text field focused
         let typed = 0;
         let submitted = false;
         const chars = [...args.text.replace(/\r\n?/g, "\n")];
@@ -1503,7 +1531,17 @@ const toolHandlers = {
           }
           typed++;
           if (resp?.inserted) inserted++;
+          if (resp?.handled) handled++;
           submitted ||= !!resp?.submitted;
+          // The first key went into no text field, and none has the focus:
+          // the rest would only set off the page's shortcuts (one-key ones,
+          // on some sites; a handler that took the key may be one).
+          if (typed === 1 && chars.length > 1 && !resp?.inserted && resp?.editable === false) {
+            const went = resp?.handled ? "the page's own key handlers took it (a shortcut, maybe)" : "it went to the page";
+            return errorResult(
+              `Sent the first key of "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}", but no text field had focus, so ${went}, and typing stopped. Click the field first (or use the key action to send keys to the page itself).`
+            );
+          }
           if (typed < chars.length && (resp?.submitted || resp?.left)) {
             return stopped(resp.submitted ? "Enter submitted the form" : "the focus left the field");
           }
@@ -1520,9 +1558,14 @@ const toolHandlers = {
           if (!submitted) changeNote = " (the page didn't answer afterwards, so the field may not have had its change event)";
         }
         const shown = `"${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
-        if (inserted === 0) {
+        if (inserted === 0 && handled === 0) {
           return errorResult(
             `Sent the keys for ${shown}, but no text field had focus, so no text was inserted. Click the field first.`
+          );
+        }
+        if (handled) {
+          return textResult(
+            `Sent the keys for ${shown}; ${handled} of the ${chars.length} went to the page's own key handlers, with no text field focused (an app that takes keys itself, or its shortcuts). Check the page.`
           );
         }
         if (inserted < chars.length) {
@@ -1572,8 +1615,10 @@ const toolHandlers = {
                 key, code, keyCode, modifiers: keyMod,
               }, stepTimeout(request), frameId);
             } catch (err) {
-              // Enter can take the page away: nothing's left to release it in.
-              if (submitted) break;
+              // Enter can take the page away: nothing's left to release it
+              // in, or to press the rest in.
+              if (submitted && pressed === total) break;
+              if (submitted) return stopped("Enter submitted the form, and the page went away");
               return stopped(`the page stopped responding while that key was being released (${err.message})`);
             }
             await sleep(humanize ? typingPause(keyStr, humanize) : 30);
@@ -1745,8 +1790,8 @@ const toolHandlers = {
     const previous = lastTrees.get(tabId);
     const whole = !/\n\.\.\. \(truncated/.test(tree);
     // Compared only with a read Claude got (see screenshot's if_changed).
-    if (Date.now() < request.deadline) lastTrees.set(tabId, whole ? { sameRead, tree } : null);
-    if (args.delta && whole && !request.resent && previous?.sameRead === sameRead) {
+    if (Date.now() < request.deadline) lastTrees.set(tabId, whole ? { session: request.session, sameRead, tree } : null);
+    if (args.delta && whole && !request.resent && previous?.session === request.session && previous.sameRead === sameRead) {
       const changes = treeChanges(previous.tree, tree);
       if (changes !== null) return textResult(`${changes}${viewport}`);
     }
@@ -2045,9 +2090,10 @@ const toolHandlers = {
 };
 
 // The last screenshot of each tab, for screenshot's if_changed, and the last
-// read_page of each, for its delta.
-const lastScreenshots = new Map(); // tabId -> imageId
-const lastTrees = new Map(); // tabId -> { sameRead, tree }
+// read_page of each, for its delta. Several Claude sessions can use a tab:
+// each compares only with what it got itself (see sessionOf).
+const lastScreenshots = new Map(); // tabId -> { session, imageId }
+const lastTrees = new Map(); // tabId -> { session, sameRead, tree }
 
 // What changed from one read_page to the next, line by line: "- " lines are
 // gone, "+ " lines are new, "@@ line N @@" says where in the new tree. null
@@ -2279,8 +2325,18 @@ const PAGE_TOOLS = new Set([
 const TOOL_DEADLINE_MS = 55000;
 const TYPING_MARGIN_MS = 3000; // type and key stop this long before the deadline
 const MIN_BUDGET_MS = 1000; // a call resent with less than this isn't started
+// A server resends a call 5 s after the connection dropped; one not resent
+// by this long after is stopped (see connectToServer).
+const ORPHANED_AFTER_MS = 10000;
 
-// timeLeft: how long the server still waits for this call (from 2.0.1 on);
+// Which Claude session a request comes from: its id is the session's
+// server's prefix and a number, and for a session another one forwards,
+// that one's prefix and the session's own in front ("c<prefix>-<n>_").
+function sessionOf(id) {
+  return String(id).replace(/-\d+$/, "");
+}
+
+// timeLeft: how long the server still waits for this call (from 2.1.0 on);
 // a resent call has less than a new one.
 async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft) {
   const handler = toolHandlers[tool];
@@ -2293,15 +2349,18 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
   const budget = typeof timeLeft === "number"
     ? Math.max(0, Math.min(TOOL_DEADLINE_MS, timeLeft - (60000 - TOOL_DEADLINE_MS)))
     : TOOL_DEADLINE_MS;
-  const request = { serverVersion, deadline: Date.now() + budget, budget, cancelled: false, resent };
+  const request = { serverVersion, session: sessionOf(id), deadline: Date.now() + budget, budget, cancelled: false, resent };
   await stateReady;
 
   // A request the server sent again after the connection dropped (see
   // "Not running a request twice"). Only those are looked up: servers
-  // before 2.0.1 start their ids over when they restart.
+  // before 2.1.0 start their ids over when they restart.
   const journaled = !isRepeatable(tool, args);
   if (journaled && resent) {
-    if (runningRequests.has(id)) return; // still running here: that run answers
+    if (runningRequests.has(id)) {
+      runningRequests.get(id).lostAt = 0; // its server is back (see connectToServer)
+      return; // still running here: that run answers
+    }
     const seen = journal.get(id);
     if (seen) {
       answerFromJournal(id, tool, args, seen);
@@ -2463,14 +2522,16 @@ const runningRequests = new Map(); // request id -> its request (see handleToolR
 
 function isRepeatable(tool, args) {
   if (REPEATABLE_UNLESS_CLEARING.has(tool)) return !args.clear;
+  // (Its answer names the site the user is asked about: it must be there.)
+  if (tool === "upload_files") return args.check === true;
   return REPEATABLE_TOOLS.has(tool) || (tool === "computer" && REPEATABLE_ACTIONS.has(args.action));
 }
 
 // Calls whose results repeat what Claude typed, pressed, put in a form or
 // gave a prompt (a password, say). (handle_dialog's answer can carry the
-// text given to a prompt.)
+// text given to a prompt; a script's result, a field's value.)
 function hidesInput(tool, args) {
-  if (tool === "form_input" || tool === "handle_dialog" || tool === "upload_files") return true;
+  if (tool === "form_input" || tool === "handle_dialog" || tool === "upload_files" || tool === "javascript_tool") return true;
   return tool === "computer" && (args.action === "type" || args.action === "key");
 }
 

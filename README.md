@@ -333,7 +333,7 @@ There are two so far: `humanize` and `humanize_speed` (see [Human-like input](#h
 - how each screenshot was taken
 - pages that didn't answer
 
-Claude can use it to check that an action did what it meant, or to see where time went. The list keeps the last 2,000 events, of which one call returns up to 1,000, and starts over when the extension restarts. Text Claude typed, form values, answers to dialog prompts and uploaded files are left out.
+Claude can use it to check that an action did what it meant, or to see where time went. The list keeps the last 2,000 events, of which one call returns up to 1,000, and starts over when the extension restarts. Text Claude typed, form values, `javascript_tool` scripts and their results, answers to dialog prompts and uploaded files are left out.
 
 ### Clicking by ref
 
@@ -349,7 +349,7 @@ Console messages, uncaught errors and unhandled promise rejections are captured 
 
 ### Interrupted calls
 
-If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, up to three times, and not to an extension older than 2.0.1, which can't tell whether it already ran it). A call sent again only gets the time left of its original 60 seconds. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
+If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, up to three times, and not to an extension older than 2.1.0, which can't tell whether it already ran it). A call sent again only gets the time left of its original 60 seconds. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
 
 If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back, and so does the end of a Claude session that quits with a call still running. A call sent again with less than a few seconds left isn't run at all.
 
@@ -376,7 +376,7 @@ Versions are set in one go with `node scripts/set-version.mjs <version>`. It upd
   - Then run `node scripts/add-update.mjs path/to/signed.xpi` and commit the updated `updates.json` to `main`. That's what makes installed copies update.
 - **How Firefox numbers pre-releases:** Firefox only allows plain numbers as an add-on's version, so the manifest of a dev build or release candidate (`2.0.0-dev.3`, `2.0.0-rc.1`) says `2.0.0`. The full version is in `extension/lib/version.js`, which the extension shows and compares with the server's version.
   - **Temporary add-on:** Firefox doesn't compare versions; it replaces the installed copy until Firefox restarts.
-  - **Unsigned install** (Developer Edition, Nightly or ESR): it counts as `2.0.0`, so Firefox won't update it to the signed `2.0.0`, which has the same number. Install the signed release by hand; later releases (`2.0.1` on) update it as usual.
+  - **Unsigned install** (Developer Edition, Nightly or ESR): it counts as `2.0.0`, so Firefox won't update it to the signed `2.0.0`, which has the same number. Install the signed release by hand; later releases (`2.1.0` on) update it as usual.
 - **Linting:** use `npx web-ext lint -s extension --self-hosted`. Without `--self-hosted`, the linter flags `update_url`, which only add-ons listed on addons.mozilla.org can't have.
 - **1.x:** fixes for the 1.x line go to the `release/1.x` branch as `1.2.0-hotfixN` (the extension's manifest says `1.2.0.N`). They aren't signed or released: 1.2.0 is the last signed 1.x build, and anyone staying on 1.x builds and signs their own copy.
 
@@ -423,7 +423,7 @@ The MCP server is running but the extension hasn't connected. The extension retr
 
 ### Tools fail immediately after reconnect
 
-Stale MCP server processes from previous sessions may be holding the port. From 2.0.1 on, a server also exits by itself within 30 seconds once the process that started it is gone, even if its input stays open (which can happen on Windows). Claude Desktop and `claude mcp add … -- node …` start it directly; a launcher in between, such as `npx` or `cmd /c`, can outlive Claude and keep it running. Older servers may not, so check for them:
+Stale MCP server processes from previous sessions may be holding the port. From 2.1.0 on, a server also exits by itself within 30 seconds once the process that started it is gone, even if its input stays open (which can happen on Windows). Claude Desktop and `claude mcp add … -- node …` start it directly; a launcher in between, such as `npx` or `cmd /c`, can outlive Claude and keep it running. Older servers may not, so check for them:
 
 ```bash
 pkill -f "node.*mcp-server"
