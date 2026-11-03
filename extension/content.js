@@ -167,6 +167,10 @@
     return false;
   }
 
+  // A file input is often hidden behind a styled button; it's still listed,
+  // for upload_image and file_upload.
+  const isFileInput = (el) => el.localName === "input" && el.type === "file";
+
   // --- Visibility check ---
   function isVisible(el) {
     if (el.offsetParent === null && el.tagName.toLowerCase() !== "body" && getComputedStyle(el).position !== "fixed") return false;
@@ -223,7 +227,7 @@
         (filter === "all" && (role || name)) ||
         (filter === "interactive" && interactive);
 
-      const shown = shouldShow && visible;
+      const shown = shouldShow && (visible || isFileInput(el));
       if (shown && depth > maxDepth) {
         tooDeep = true;
         return;
@@ -251,6 +255,7 @@
         if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
         if (el.getAttribute("aria-selected")) line += ` selected=${el.getAttribute("aria-selected")}`;
         if (el.disabled === true) line += " disabled";
+        if (!visible) line += " hidden";
 
         // Select options
         if (tag === "select") {
@@ -412,7 +417,8 @@
         const text = ownText(el);
         // Attributes, not properties (see getAccessibleName).
         const attrs = ["placeholder", "aria-label", "title", "type"].map((a) => el.getAttribute(a) || "");
-        const searchable = `${role} ${name} ${text} ${attrs.join(" ")} ${tag}`.toLowerCase();
+        const hiddenFile = isFileInput(el) && !isVisible(el) ? " hidden" : "";
+        const searchable = `${role} ${name} ${text} ${attrs.join(" ")} ${tag}${hiddenFile}`.toLowerCase();
 
         const hasNeeded = needed.filter((w) => has(searchable, w)).length;
         if (!hasNeeded) continue;
@@ -436,7 +442,8 @@
 
     const found = [];
     for (const { el, role, name, text, tag, interactive, score } of ranked) {
-      if (!isVisible(el)) continue;
+      const hidden = !isVisible(el);
+      if (hidden && !isFileInput(el)) continue;
       if (found.length === MAX_FOUND) return { found, more: true, tier: best };
       const ref = getOrAssignRef(el);
       const rect = el.getBoundingClientRect();
@@ -446,7 +453,8 @@
         role: role || tag,
         name: name || text.substring(0, 80),
         coordinates: center,
-        offscreen: !inViewport(...center),
+        offscreen: !hidden && !inViewport(...center),
+        hidden,
         score,
         interactive,
       });
@@ -473,14 +481,14 @@
   // Find the actual input/textarea/select inside an element: in its shadow
   // root, among its own children (which may be slotted into that root), or in
   // the shadow roots of those.
-  function findInputInside(el) {
-    if (["input", "textarea", "select"].includes(el.localName)) return el;
+  function findInputInside(el, selector = "input, textarea, select") {
+    if (el.matches(selector)) return el;
     for (const root of [el.shadowRoot, el]) {
       if (!root) continue;
-      const inner = root.querySelector("input, textarea, select");
+      const inner = root.querySelector(selector);
       if (inner) return inner;
       for (const child of root.querySelectorAll("*")) {
-        const deep = child.shadowRoot?.querySelector("input, textarea, select");
+        const deep = child.shadowRoot?.querySelector(selector);
         if (deep) return deep;
       }
     }
@@ -531,7 +539,7 @@
       if (target.checked !== shouldCheck) return { error: `The page kept this ${type} ${target.checked ? "checked" : "unchecked"}.` };
       return { success: true, checked: target.checked };
     } else if (tag === "input" || tag === "textarea") {
-      if (type === "file") return { error: "A file input can't be set from here: ask the user to choose the file." };
+      if (type === "file") return { error: "A file input takes files from file_upload (files on this computer) or upload_image (a screenshot), not form_input." };
       if (target.readOnly) return { error: `This <${tag}> is read-only.` };
       const before = target.value;
       setNativeValue(target, wanted);
@@ -690,8 +698,23 @@
   }
 
   // --- Helper for synthetic events ---
+  // The short waits between events. In a tab the user isn't looking at,
+  // Firefox runs a page's timers about once a second, which would stretch a
+  // drag or a humanized move to many seconds; there, the wait is counted out
+  // on a message channel instead (keeping the page responsive, but a core
+  // busy while it lasts).
   function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+    if (!document.hidden) return new Promise((r) => setTimeout(r, ms));
+    const until = performance.now() + ms;
+    return new Promise((resolve) => {
+      const { port1, port2 } = new MessageChannel();
+      port1.onmessage = () => {
+        if (performance.now() < until) return port2.postMessage(null);
+        port1.close();
+        resolve();
+      };
+      port2.postMessage(null);
+    });
   }
 
   // --- Links that open a new tab ---
@@ -1185,6 +1208,83 @@
     fireBoth(el, "up", init);
   }
 
+  // --- Human-like mouse movement (the humanize setting) ---
+  // The mouse goes to its point along a curve, slowing near the end, taking
+  // longer the farther it goes (Fitts's law), and waits a moment before it
+  // presses. Where it acts doesn't change, only the way there.
+  let mouseAt = null; // where the synthetic mouse last was in this document
+  const HUMAN_PACE = { fast: 0.6, natural: 1, relaxed: 1.6 };
+
+  function randomBetween(low, high) {
+    return low + Math.random() * (high - low);
+  }
+
+  function humanPause(speed, low, high) {
+    return sleep(randomBetween(low, high) * (HUMAN_PACE[speed] || 1));
+  }
+
+  // Humanized input takes time after its message arrived. It's planned to be
+  // done, and answered, before the background stops waiting (msg.deadline,
+  // less the margin), and it stops before pressing anything once that's too
+  // late, or once Claude no longer has this tab (its glow was removed).
+  let releasedAt = 0;
+  class InputStopped extends Error {}
+  function timeFor(msg) {
+    return typeof msg?.deadline === "number" ? msg.deadline - CONTENT_DEADLINE_MARGIN_MS - Date.now() : Infinity;
+  }
+  function goOn(msg, since, needs = 0) {
+    if (releasedAt >= since || timeFor(msg) < needs) throw new InputStopped();
+  }
+  const failure = (e) => (e instanceof InputStopped ? { error: "expired" } : { error: `${e?.name || "Error"}: ${e?.message || e}` });
+
+  // `within`: how long the way there may take at most; `since`: when the
+  // action began (it stops if the tab was lost since).
+  async function travelTo(x, y, modifiers, speed, buttons = 0, within = Infinity, since = Date.now()) {
+    const pace = HUMAN_PACE[speed] || 1;
+    const from = mouseAt || { x: x + randomBetween(-300, 300), y: y + randomBetween(-200, 200) };
+    mouseAt = { x, y };
+    const dx = x - from.x;
+    const dy = y - from.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance < 3) return;
+    const duration = Math.min(Math.min(900, 120 + 110 * Math.log2(1 + distance / 20)) * pace, Math.max(0, within));
+    // Two control points off the straight line, on the same side.
+    const bend = randomBetween(-0.25, 0.25) * Math.min(distance, 400);
+    const [nx, ny] = [-dy / distance, dx / distance];
+    const c1 = [from.x + dx * 0.3 + nx * bend, from.y + dy * 0.3 + ny * bend];
+    const c2 = [from.x + dx * 0.75 + nx * bend * 0.4, from.y + dy * 0.75 + ny * bend * 0.4];
+    // Timed by the clock, not by a count of steps: in a tab the user isn't
+    // looking at, Firefox runs a page's timers at most once a second, so the
+    // way there has fewer points but takes as long.
+    const start = performance.now();
+    for (let s = 0; s < 1; ) {
+      await sleep(16);
+      if (releasedAt >= since) throw new InputStopped();
+      s = duration ? Math.min(1, (performance.now() - start) / duration) : 1;
+      const t = s < 0.5 ? 2 * s * s : 1 - (2 - 2 * s) ** 2 / 2;
+      const u = 1 - t;
+      const px = u ** 3 * from.x + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t ** 3 * x;
+      const py = u ** 3 * from.y + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t ** 3 * y;
+      moveMouseTo(elementAtPoint(px, py) || document.documentElement, mouseInit(px, py, modifiers, { buttons }));
+      pointAt(px, py);
+    }
+  }
+
+  // --- Files (upload_image, file_upload) ---
+  // Files given as { name, type, data (base64) }, in a DataTransfer: what a
+  // file input takes. (Not for a drop: a page doesn't see the files of a
+  // DataTransfer this script made, only of one it made itself.)
+  function filesTransfer(files) {
+    const transfer = new DataTransfer();
+    for (const { name, type, data } of files) {
+      const binary = atob(data);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      transfer.items.add(new File([bytes], name, { type }));
+    }
+    return transfer;
+  }
+
   // A drag of an element with draggable=true: the browser's own drag events.
   // `points` are the steps of the way. Returns whether the drop was accepted.
   async function dragAndDrop(source, points, modifiers) {
@@ -1202,6 +1302,7 @@
       }
       fire(source, "drag", point);
       accepted = !fire(over, "dragover", point);
+      pointAt(...point);
       await sleep(20);
     }
     const last = points[points.length - 1];
@@ -1317,18 +1418,42 @@
           padding: 6px 11px; border-radius: 99px;
           box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
         }
+        .cursor {
+          position: fixed; left: 0; top: 0; width: 22px; height: 22px; display: none; pointer-events: none;
+          filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+          transition: left 0.18s ease-out, top 0.18s ease-out;
+        }
         @keyframes breathe { 50% { box-shadow: inset 0 0 0 2px rgba(var(--glow), 0.55), inset 0 0 14px 2px rgba(var(--glow), 0.25); } }
-        @media (prefers-reduced-motion: reduce) { .frame { animation: none; } }
+        @media (prefers-reduced-motion: reduce) { .frame { animation: none; } .cursor { transition: none; } }
       </style>
       <div class="frame"></div>
+      <svg class="cursor" viewBox="0 0 22 22"><path d="M2 2 L2 18 L6.5 13.8 L9.6 20.6 L12.6 19.2 L9.6 12.6 L15.6 12.6 Z" fill="rgb(217, 119, 87)" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>
       <div class="label">Claude is using this tab</div>`;
+    glowCursor = root.querySelector(".cursor");
     return host;
   }
+
+  // Shows where Claude's mouse is, for the user watching: a pointer with its
+  // tip at the point, which fades with the glow and is hidden in screenshots
+  // like it. (Only the page itself shows it: a frame's points are passed down
+  // from the page, which shows them where they are.)
+  let glowCursor = null;
+  function pointAt(x, y) {
+    if (window !== window.top) return;
+    showGlow();
+    glowCursor.style.display = "block";
+    glowCursor.style.left = `${x - 2}px`;
+    glowCursor.style.top = `${y - 2}px`;
+  }
+
+  // Until when a screenshot keeps it hidden: a mouse still on its way (or a
+  // click) doesn't show it in the picture. Ends when the screenshot's done.
+  let hiddenForCaptureUntil = 0;
 
   function showGlow() {
     if (!glowHost) glowHost = buildGlow();
     if (!glowHost.isConnected) document.documentElement.appendChild(glowHost);
-    glowHost.style.setProperty("visibility", "visible", "important");
+    if (Date.now() >= hiddenForCaptureUntil) glowHost.style.setProperty("visibility", "visible", "important");
     clearTimeout(glowTimer);
     glowTimer = setTimeout(removeGlow, GLOW_LINGER_MS);
   }
@@ -1339,10 +1464,13 @@
   }
 
   // Hidden (not removed) while a screenshot is taken; resolves once the page
-  // has painted without it.
+  // has painted without it. A tab the user isn't looking at isn't painted
+  // until it's captured, so there's nothing to wait for.
   function hideGlowForCapture() {
+    hiddenForCaptureUntil = Date.now() + 10000;
     if (!glowHost?.isConnected) return Promise.resolve();
     glowHost.style.setProperty("visibility", "hidden", "important");
+    if (document.hidden) return Promise.resolve();
     return new Promise((resolve) => {
       const done = () => resolve();
       requestAnimationFrame(() => requestAnimationFrame(done));
@@ -1351,7 +1479,7 @@
   }
 
   // --- Message handler ---
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener(function listener(msg, sender, sendResponse) {
     // Arrived after the background stopped waiting (the page was busy): the
     // tool already reported it as not done, so it mustn't happen now. A
     // second's margin, so that what's done here is answered before then.
@@ -1360,6 +1488,8 @@
       return;
     }
     if (msg.type === "glow") {
+      if (msg.mode !== "hide") hiddenForCaptureUntil = 0;
+      if (msg.mode === "remove") releasedAt = Date.now();
       if (msg.mode === "show") showGlow();
       else if (msg.mode === "remove") removeGlow();
       else if (msg.mode === "hide") {
@@ -1422,6 +1552,9 @@
         return true;
       }
       const frame = frameOf(el);
+      // Humanized, the pointer travels there (travelTo) instead of appearing
+      // at once, unless the point is in a frame, whose page can't show it.
+      if (!msg.humanize || frame !== null) pointAt(x, y);
       if (frame !== null) {
         sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, x, y) } });
         return true;
@@ -1429,31 +1562,56 @@
       const buttonMap = { left: 0, middle: 1, right: 2 };
       const btn = buttonMap[button ?? "left"] ?? 0;
       const btns = btn === 0 ? 1 : btn === 1 ? 4 : 2;
-      moveMouseTo(el, mouseInit(x, y, modifiers));
+      const speed = msg.humanize;
       const presses = button === "left" || button === undefined ? clickCount || 1 : 1;
-      const newTab = watchForNewTabLink();
-      for (let press = 1; press <= presses; press++) {
-        const init = mouseInit(x, y, modifiers, { button: btn, detail: press });
-        const pressed = pressMouse(el, { ...init, buttons: btns });
-        // A page that cancels mousedown (an editor's toolbar button) keeps
-        // the focus and the selection as they were, as with a real click.
-        if (pressed && press === 1) focusForClick(el);
-        if (pressed && btn === 0) {
-          try {
-            selectForClick(el, x, y, press);
-          } catch {
-            // Only a detail of the click: not on every kind of element.
-          }
+      (async () => {
+        let target = el;
+        if (speed) {
+          const since = Date.now();
+          // Time kept for the pauses around the presses, at their longest.
+          const pauses = (120 + presses * 240) * (HUMAN_PACE[speed] || 1);
+          await travelTo(x, y, modifiers, speed, 0, timeFor(msg) - pauses, since);
+          await humanPause(speed, 40, 120);
+          goOn(msg, since, presses * 240 * (HUMAN_PACE[speed] || 1));
+          // What's there now: the page may have changed under the mouse.
+          target = elementAtPoint(x, y) || el;
+        } else {
+          moveMouseTo(el, mouseInit(x, y, modifiers));
+          mouseAt = { x, y };
         }
-        releaseMouse(el, init);
-        if (btn === 0) el.dispatchEvent(new MouseEvent("click", init));
-      }
-      const init = mouseInit(x, y, modifiers, { button: btn });
-      if (presses >= 2) el.dispatchEvent(new MouseEvent("dblclick", { ...init, detail: 2 }));
-      if (btn === 2) el.dispatchEvent(new MouseEvent("contextmenu", init));
-      if (btn === 1) el.dispatchEvent(new MouseEvent("auxclick", { ...init, detail: 1 }));
-      const url = newTab.stop();
-      sendResponse(url ? { openInNewTab: url } : {});
+        const newTab = watchForNewTabLink();
+        for (let press = 1; press <= presses; press++) {
+          const init = mouseInit(x, y, modifiers, { button: btn, detail: press });
+          const pressed = pressMouse(target, { ...init, buttons: btns });
+          // A page that cancels mousedown (an editor's toolbar button) keeps
+          // the focus and the selection as they were, as with a real click.
+          if (pressed && press === 1) focusForClick(target);
+          if (pressed && btn === 0) {
+            try {
+              selectForClick(target, x, y, press);
+            } catch {
+              // Only a detail of the click: not on every kind of element.
+            }
+          }
+          if (speed) await humanPause(speed, 50, 110);
+          releaseMouse(target, init);
+          if (btn === 0) target.dispatchEvent(new MouseEvent("click", init));
+          if (speed && press < presses) await humanPause(speed, 60, 130);
+        }
+        const init = mouseInit(x, y, modifiers, { button: btn });
+        if (presses >= 2) target.dispatchEvent(new MouseEvent("dblclick", { ...init, detail: 2 }));
+        if (btn === 2) target.dispatchEvent(new MouseEvent("contextmenu", init));
+        if (btn === 1) target.dispatchEvent(new MouseEvent("auxclick", { ...init, detail: 1 }));
+        const url = newTab.stop();
+        // Nothing under the point but the page itself: likely not what was
+        // meant, though the page did get a click.
+        const missed = target === document.documentElement || target === document.body;
+        sendResponse({
+          hit: describeElement(target),
+          ...(url ? { openInNewTab: url } : {}),
+          ...(missed ? { missed: target.localName } : {}),
+        });
+      })().catch((e) => sendResponse(failure(e)));
       return true;
     }
 
@@ -1464,12 +1622,75 @@
         return true;
       }
       const frame = frameOf(el);
+      if (!msg.humanize || frame !== null) pointAt(msg.x, msg.y);
       if (frame !== null) {
         sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, msg.x, msg.y) } });
         return true;
       }
+      if (msg.humanize) {
+        travelTo(msg.x, msg.y, msg.modifiers, msg.humanize, 0, timeFor(msg) - 100)
+          .then(() => sendResponse({ hit: describeElement(elementAtPoint(msg.x, msg.y) || el) }))
+          .catch((e) => sendResponse(failure(e)));
+        return true;
+      }
       moveMouseTo(el, mouseInit(msg.x, msg.y, msg.modifiers));
-      sendResponse({});
+      mouseAt = { x: msg.x, y: msg.y };
+      sendResponse({ hit: describeElement(el) });
+      return true;
+    }
+
+    // upload_image and file_upload: files for a file input.
+    if (msg.type === "setFiles") {
+      const el = resolveRef(msg.ref);
+      if (!el || !el.isConnected) {
+        sendResponse({ error: `Element ${msg.ref} is no longer on the page. Use read_page or find again.` });
+        return true;
+      }
+      const input = findInputInside(el, 'input[type="file"]');
+      if (!input) {
+        sendResponse({ error: `${msg.ref} isn't a file input (<input type="file">), and has none inside.` });
+        return true;
+      }
+      if (input.matches(":disabled")) {
+        sendResponse({ error: "This file input is disabled." });
+        return true;
+      }
+      if ((msg.check ? msg.count : msg.files.length) > 1 && !input.multiple) {
+        sendResponse({ error: "This file input takes one file only." });
+        return true;
+      }
+      // file_upload checks the input before the user is asked.
+      if (msg.check) {
+        sendResponse({ result: { ok: true, origin: location.origin } });
+        return true;
+      }
+      try {
+        input.files = filesTransfer(msg.files).files;
+      } catch (e) {
+        sendResponse({ error: `${e?.name || "Error"}: ${e?.message || e}` });
+        return true;
+      }
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      sendResponse({ result: { names: Array.from(input.files, (file) => file.name) } });
+      return true;
+    }
+
+    // upload_image with a point: where files are to be dropped, as from the
+    // desktop. The drop itself is made in the page's own world (dropInPage).
+    if (msg.type === "dropFiles") {
+      const el = elementAtPoint(msg.x, msg.y);
+      if (!el) {
+        sendResponse({ outside: true });
+        return true;
+      }
+      pointAt(msg.x, msg.y);
+      const frame = frameOf(el);
+      if (frame !== null) {
+        sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, msg.x, msg.y) } });
+        return true;
+      }
+      sendResponse({ x: msg.x, y: msg.y, hit: describeElement(el) });
       return true;
     }
 
@@ -1554,6 +1775,14 @@
         sendResponse({ intoFrame: { frameId: frame, ...pointInFrame(el, msg.x, msg.y) } });
         return true;
       }
+      if (msg.humanize && !msg.travelled) {
+        // The mouse goes there first; then this message is handled again.
+        travelTo(msg.x, msg.y, msg.modifiers, msg.humanize, 0, timeFor(msg) - 200)
+          .then(() => listener({ ...msg, travelled: true }, sender, sendResponse))
+          .catch((e) => sendResponse(failure(e)));
+        return true;
+      }
+      mouseAt = { x: msg.x, y: msg.y };
       const notCanceled = el.dispatchEvent(new WheelEvent("wheel", {
         bubbles: true, cancelable: true, composed: true, view: window,
         clientX: msg.x, clientY: msg.y,
@@ -1587,7 +1816,7 @@
         unlocked = true;
         moved = scrollNearest();
       }
-      sendResponse({ moved, unlocked, handledByPage: !notCanceled && !unlocked });
+      sendResponse({ moved, unlocked, handledByPage: !notCanceled && !unlocked, hit: describeElement(el) });
       return true;
     }
 
@@ -1616,6 +1845,7 @@
           sendResponse({ outside: true });
           return;
         }
+        if (!msg.humanize) pointAt(startX, startY);
         // All of it inside one frame: for that frame. (Across frames, it stays
         // here: this document's <iframe> element gets the events.)
         const frame = frameOf(start);
@@ -1627,8 +1857,17 @@
         }
         const getEl = (x, y) => elementAtPoint(x, y) || document.documentElement;
         const init = (x, y, buttons, extra) => mouseInit(x, y, modifiers, { buttons, ...extra });
-        moveMouseTo(start, init(startX, startY, 0));
+        const speed = msg.humanize;
+        const since = Date.now();
+        if (speed) {
+          // Half the time left to get to the start, the rest for the drag.
+          await travelTo(startX, startY, modifiers, speed, 0, (timeFor(msg) - 600) / 2, since);
+        } else {
+          moveMouseTo(start, init(startX, startY, 0));
+        }
         await sleep(50);
+        // Once pressed, the drag goes to its end (and the button up).
+        if (speed) goOn(msg, since, 400);
         const pressed = pressMouse(start, init(startX, startY, 1, { detail: 1 }));
         await sleep(50);
         const steps = 10;
@@ -1640,20 +1879,25 @@
         let dropped = null;
         if (source) {
           dropped = await dragAndDrop(source, points, modifiers);
+        } else if (speed) {
+          await travelTo(endX, endY, modifiers, speed, 1, timeFor(msg) - 300, Infinity);
+          await humanPause(speed, 40, 100);
         } else {
           for (const [mx, my] of points) {
             moveMouseTo(getEl(mx, my), init(mx, my, 1));
+            pointAt(mx, my);
             await sleep(20);
           }
         }
+        mouseAt = { x: endX, y: endY };
         // (After a browser drag, dragend is the end of it.)
         if (!source) {
           const end = getEl(endX, endY);
           releaseMouse(end, init(endX, endY, 0, { detail: 1 }));
           if (end === start) end.dispatchEvent(new MouseEvent("click", init(endX, endY, 0, { detail: 1 })));
         }
-        sendResponse({ dropped });
-      })().catch((e) => sendResponse({ error: `${e?.name || "Error"}: ${e?.message || e}` }));
+        sendResponse({ dropped, hit: `${describeElement(start)} to ${describeElement(getEl(endX, endY))}` });
+      })().catch((e) => sendResponse(failure(e)));
       return true;
     }
 

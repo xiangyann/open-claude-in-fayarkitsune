@@ -197,6 +197,21 @@ process.on("SIGHUP", shutdown);
 process.stdin.on("end", shutdown);
 process.stdin.resume();
 
+// The end of stdin is how a server learns its Claude session is gone, but it
+// can fail to come: on Windows, another process holding a copy of the pipe
+// keeps it open. So the process that started this one is also looked for now
+// and then. (Only this server stops: the browser extension connects to the
+// next Claude session's server.)
+const PARENT_CHECK_MS = 30000;
+const parentPid = process.ppid;
+setInterval(() => {
+  try {
+    process.kill(parentPid, 0); // only checks it's there
+  } catch (err) {
+    if (err.code === "ESRCH") shutdown();
+  }
+}, PARENT_CHECK_MS).unref();
+
 // --- Primary mode: handle incoming TCP connections ---
 
 function handleResponse(msg) {
@@ -776,12 +791,234 @@ async function requestHandover({ tabIds, reason, confirmed }, extra) {
   return callTool("tabs_handover", { tabIds: ids }, extra);
 }
 
+// A tab's title and URL, for a question to the user, or null.
+async function describeTab(tabId, signal) {
+  try {
+    const context = await sendToExtension("tabs_context_mcp", {}, signal);
+    const firstLine = context.content[0].text.split("\n")[0];
+    const { availableTabs = [] } = firstLine.startsWith("{") ? JSON.parse(firstLine) : {};
+    const tab = availableTabs.find((t) => t.tabId === tabId);
+    return tab ? { title: tab.title, url: tab.url } : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- Uploading local files ---
+// file_upload reads files on this computer and puts them into a page, which
+// sends them to a website: the user says yes to each upload first, in the
+// app's own prompt as for a handover (or in the conversation, where the app
+// has no prompt). The files go to the extension as data, which gives them to
+// the page's file input.
+const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+const uploadsAskedInConversation = new Map(); // what was asked -> when
+const MIME_TYPES = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+  ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
+  ".pdf": "application/pdf", ".txt": "text/plain", ".csv": "text/csv", ".json": "application/json",
+  ".html": "text/html", ".htm": "text/html", ".xml": "application/xml", ".md": "text/markdown",
+  ".zip": "application/zip", ".doc": "application/msword", ".xls": "application/vnd.ms-excel",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".mp3": "audio/mpeg", ".wav": "audio/wav", ".mp4": "video/mp4", ".webm": "video/webm",
+};
+
+// A path on this computer, not on a network share: opening \\host\share
+// (or //host/share) would connect to that host, and on Windows send it the
+// user's credentials, before the user was even asked.
+function isNetworkPath(file) {
+  return /^[\\/]{2}/.test(file);
+}
+
+// Reads a file for an upload, checked again now (it may have changed while
+// the user was asked): still a regular file, and within the limit.
+async function readUpload(file, limit) {
+  const handle = await fs.promises.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`${file} isn't a file anymore.`);
+    if (stat.size > limit) throw new Error(`${file} has grown past the upload limit.`);
+    const buffer = Buffer.alloc(stat.size);
+    const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
+  const signal = extra?.signal;
+  const failed = (text) => ({ ...textResult(`Error: ${text}`), isError: true });
+  // What's shown to the user and read is where a path really leads: not a
+  // harmless-looking name that links to another file.
+  const files = [];
+  let total = 0;
+  for (const given of new Set(paths)) {
+    if (!path.isAbsolute(given)) return failed(`"${given}" isn't an absolute path.`);
+    if (isNetworkPath(given)) return failed(`${given} is on a network share; only files on this computer can be uploaded.`);
+    let file;
+    let stat;
+    try {
+      file = await fs.promises.realpath(given);
+      if (isNetworkPath(file)) return failed(`${given} leads to a network share; only files on this computer can be uploaded.`);
+      stat = await fs.promises.stat(file);
+    } catch {
+      return failed(`${given} doesn't exist, or can't be read.`);
+    }
+    if (!stat.isFile()) return failed(`${given} isn't a file.`);
+    if (files.includes(file)) continue;
+    files.push(file);
+    total += stat.size;
+  }
+  if (total > UPLOAD_MAX_BYTES) {
+    return failed(`The files come to ${Math.ceil(total / 1048576)} MB; at most ${UPLOAD_MAX_BYTES / 1048576} MB go in one call.`);
+  }
+
+  // Not a file input (or one that takes a single file): said before the user
+  // is asked, not after they agreed. The answer also says which site the
+  // input belongs to: it can be in a frame from another site than the tab's.
+  const checked = await callTool("upload_files", { tabId, ref, check: true, count: files.length }, extra);
+  if (checked.isError) return checked;
+  let frameOrigin = null;
+  try {
+    frameOrigin = JSON.parse(checked.content?.[0]?.text || "{}").origin || null;
+  } catch {}
+
+  const tab = await describeTab(tabId, signal);
+  let page = tab ? `"${tab.title}" (${tab.url})` : `tab ${tabId}`;
+  let tabOrigin = null;
+  try {
+    tabOrigin = tab && new URL(tab.url).origin;
+  } catch {}
+  if (frameOrigin && frameOrigin !== tabOrigin) page = `a frame from ${frameOrigin} on ${page}`;
+  const asked = JSON.stringify([tabId, ref, files]);
+  const askedInConversation = Date.now() - (uploadsAskedInConversation.get(asked) ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS;
+  if (signal?.aborted) return failed("Cancelled; nothing was uploaded.");
+  const upload = async () => {
+    const data = [];
+    try {
+      let left = UPLOAD_MAX_BYTES;
+      for (const file of files) {
+        const bytes = await readUpload(file, left);
+        left -= bytes.length;
+        data.push({
+          name: path.basename(file),
+          type: MIME_TYPES[path.extname(file).toLowerCase()] || "application/octet-stream",
+          data: bytes.toString("base64"),
+        });
+      }
+    } catch (err) {
+      return failed(`${err.message} Nothing was uploaded.`);
+    }
+    if (signal?.aborted) return failed("Cancelled; nothing was uploaded.");
+    return callTool("upload_files", { tabId, ref, files: data }, extra);
+  };
+  if (confirmed && askedInConversation) {
+    uploadsAskedInConversation.delete(asked);
+    return upload();
+  }
+  // Asked in the conversation only where the app can't show a prompt. Where
+  // it can, a prompt that fails or isn't answered in time means no:
+  // otherwise Claude could go on to confirm the upload itself.
+  if (!server.server.getClientCapabilities()?.elicitation) {
+    uploadsAskedInConversation.set(asked, Date.now());
+    return textResult(
+      `This app can't show a confirmation prompt. Ask the user in the conversation whether to upload ${files.join(", ")} to ${page}. If they agree, call file_upload again with the same arguments and confirmed: true.`
+    );
+  }
+  let answer;
+  try {
+    answer = await server.server.elicitInput(
+      {
+        message:
+          `Claude wants to upload ${files.length === 1 ? "a file" : `${files.length} files`} from this computer to ${page}:\n` +
+          files.map((file) => `• ${file}`).join("\n") +
+          "\n\nThe page can send them anywhere, like any file you upload yourself.",
+        requestedSchema: {
+          type: "object",
+          properties: { upload: { type: "boolean", title: "Upload them", default: false } },
+          required: ["upload"],
+        },
+      },
+      { timeout: HANDOVER_ANSWER_TIMEOUT_MS, signal }
+    );
+  } catch (err) {
+    if (signal?.aborted) return failed("Cancelled; nothing was uploaded.");
+    return failed(`The confirmation prompt didn't get an answer (${err.message}), so nothing was uploaded.`);
+  }
+  if (signal?.aborted) return failed("Cancelled; nothing was uploaded.");
+  if (answer.action !== "accept") return textResult("The user chose not to upload the files.");
+  if (!answer.content?.upload) {
+    return textResult('The user answered the prompt without ticking "Upload them", so nothing was uploaded.');
+  }
+  return upload();
+}
+
+// tabs_close_mcp with several tabs: one at a time, then one list of the tabs.
+async function closeTabs({ tabId, tabIds }, extra) {
+  const ids = [...new Set([...(tabIds || []), ...(tabId === undefined ? [] : [tabId])])];
+  if (!ids.length) return { ...textResult("Error: give tabId or tabIds."), isError: true };
+  if (ids.length === 1) return callTool("tabs_close_mcp", { tabId: ids[0] }, extra);
+  const closed = [];
+  const problems = [];
+  for (const id of ids) {
+    const result = await callTool("tabs_close_mcp", { tabId: id }, extra);
+    if (result.isError) problems.push(`Tab ${id}: ${result.content?.[0]?.text?.replace(/^Error: /, "")}`);
+    else closed.push(id);
+  }
+  const context = await callTool("tabs_context_mcp", {}, extra);
+  const summary = [
+    closed.length ? `Closed tabs ${closed.join(", ")}.` : "No tab was closed.",
+    ...problems,
+  ].join("\n");
+  return {
+    content: [{ type: "text", text: `${summary}\n\n${context.content?.[0]?.text ?? ""}` }, ...(context.content || []).slice(1)],
+    ...(closed.length ? {} : { isError: true }),
+  };
+}
+
+// screenshot and zoom with save_to_disk: the images are written to a folder
+// on this computer as well, and the result says where.
+const SCREENSHOT_DIR = path.join(os.homedir(), ".config", "open-claude-in-fayarkitsune", "screenshots");
+
+function saveImages(result) {
+  const images = (result?.content || []).filter((item) => item.type === "image");
+  if (result?.isError || !images.length) return result;
+  const text = result.content.find((item) => item.type === "text")?.text || "";
+  // Unique, so that pictures two sessions take in the same millisecond
+  // don't land in one file.
+  const id = `${/ID: (screenshot_\d+)/.exec(text)?.[1] ?? `zoom_${Date.now()}`}_${randomUUID().slice(0, 8)}`;
+  let note;
+  try {
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    const saved = images.map((image, i) => {
+      const file = path.join(SCREENSHOT_DIR, `${id}${i ? `_${i}` : ""}.${image.mimeType === "image/png" ? "png" : "jpg"}`);
+      fs.writeFileSync(file, Buffer.from(image.data, "base64"), { flag: "wx" });
+      return file;
+    });
+    note = `Saved to ${saved.join(", ")}`;
+  } catch (err) {
+    note = `Not saved to disk: ${err.message}`;
+  }
+  return { ...result, content: [...result.content, { type: "text", text: note }] };
+}
+
 // --- MCP Server and its tools ---
 
-const server = new McpServer({
-  name: "open-claude-in-fayarkitsune",
-  version: SERVER_VERSION,
-});
+// Shown to Claude with the tools (MCP server instructions).
+const SERVER_INSTRUCTIONS = [
+  "Human-like input: when the user asks you to act like a human, e.g. for \"human input\", \"human behaviour\", \"like a real person\", \"humanize\", \"don't look like a bot\" or \"move the mouse naturally\", turn on the humanize setting before acting: set_config with key \"humanize\" and value true. Set it for the tab you work in (tabId), unless the user wants it everywhere or from now on (no tabId: it stays set until changed). humanize_speed sets the pace: \"fast\", \"natural\" (the default) or \"relaxed\".",
+  "With humanize on, the mouse travels to each point along a curved path at a human pace, which the user sees as an orange cursor on the page, and keys come with a typing rhythm. So do the task the way a person would, with the computer tool: click fields and buttons, type, press keys and scroll, rather than setting values with form_input or javascript_tool, which skip the mouse and keyboard. Events are still synthetic (isTrusted is false). Set humanize back to null when the user no longer wants it.",
+].join("\n\n");
+
+const server = new McpServer(
+  {
+    name: "open-claude-in-fayarkitsune",
+    version: SERVER_VERSION,
+  },
+  { instructions: SERVER_INSTRUCTIONS }
+);
 
 // The first request a server sends has id 0, and the SDK's client ignores a
 // cancellation for id 0 (it reads the id as missing). A ping takes that id, so
@@ -830,11 +1067,22 @@ server.tool(
 
 server.tool(
   "tabs_close_mcp",
-  "Close a tab in the MCP tab group, or a tab the user shared with you. To stop using a shared tab but leave it open, use tabs_release instead.",
+  "Close tabs in the MCP tab group, or tabs the user shared with you: they're removed from the browser. (Navigating a tab to about:blank doesn't close it.) To stop using a shared tab but leave it open, use tabs_release instead.",
   {
-    tabId: z.number().describe("ID of the tab to close. Must be a tab in the MCP tab group, or one the user shared."),
+    tabId: z.number().optional().describe("ID of the tab to close. Must be a tab in the MCP tab group, or one the user shared."),
+    tabIds: z.array(z.number()).optional().describe("Several tabs to close in one call, instead of tabId."),
   },
-  async (args, extra) => callTool("tabs_close_mcp", args, extra)
+  async (args, extra) => closeTabs(args, extra)
+);
+
+server.tool(
+  "set_tab_focus",
+  "Show the user a tab: make it the selected tab in its window, and optionally bring that window in front of their other windows. No other tool needs this (screenshots and input work in tabs the user isn't looking at), so use it only when they should look: they asked to be shown something, you need them to decide or confirm something there, or you're done with what they're waiting to see. In a tab the user shared, this switches their window to it. Routine progress doesn't warrant it.",
+  {
+    tabId: z.number().describe("Tab to show. Must be a tab in the MCP tab group, or one the user shared."),
+    focus_window: z.boolean().optional().describe("Also bring the window in front of the user's other windows, interrupting what they're doing. Default false: the tab is selected quietly, for when they next look."),
+  },
+  async (args, extra) => callTool("set_tab_focus", args, extra)
 );
 
 server.tool(
@@ -849,7 +1097,7 @@ server.tool(
 
 server.tool(
   "tabs_request_handover",
-  "Ask the user to hand tabs they shared with you over to Claude: they move out of the user's window into the MCP tab group, in Claude's own window. Use it when you need a shared tab to yourself, e.g. to resize its window, or to work in it for a while without switching the tab the user is looking at (screenshots have to show the tab). The user is asked to confirm in this app's own prompt; if the app can't show one, the result tells you to ask them in the conversation and call again with confirmed: true.",
+  "Ask the user to hand tabs they shared with you over to Claude: they move out of the user's window into the MCP tab group, in Claude's own window. Use it when you need a shared tab to yourself, e.g. to resize its window, or to work in it for a while without the user using it at the same time. The user is asked to confirm in this app's own prompt; if the app can't show one, the result tells you to ask them in the conversation and call again with confirmed: true.",
   {
     tabIds: z.array(z.number()).min(1).describe("IDs of tabs the user shared with you."),
     reason: z.string().optional().describe("One short sentence, shown to the user, on why you need them in Claude's window."),
@@ -885,6 +1133,7 @@ server.tool(
   {
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
     tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group, or one the user shared with you. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    wait: z.enum(["load", "networkidle"]).optional().describe('"load" (default): until the page has loaded. "networkidle": also until it has made no requests for half a second (at most 15 seconds more), for apps that load their content after the page.'),
   },
   async (args, extra) => callTool("navigate", args, extra)
 );
@@ -910,8 +1159,13 @@ server.tool(
     scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all). Page shortcuts work; what Firefox itself does for a key, like copying, pasting or its own shortcuts, doesn\'t happen, and the result says so. Keys go to a frame after you click in it.'),
+    if_changed: z.boolean().optional().describe("For `screenshot`: true to leave the image out when the tab looks exactly as in your last screenshot of it; the result then names that screenshot. Saves tokens when waiting for a page to change."),
+    save_to_disk: z.boolean().optional().describe("For `screenshot` and `zoom`: true to also write the image to a file on this computer, under ~/.config/open-claude-in-fayarkitsune/screenshots/, and say where."),
   },
-  async (args, extra) => callTool("computer", args, extra)
+  async (args, extra) => {
+    const result = await callTool("computer", args, extra);
+    return args.save_to_disk && (args.action === "screenshot" || args.action === "zoom") ? saveImages(result) : result;
+  }
 );
 
 // 5. find
@@ -1018,6 +1272,7 @@ server.tool(
     depth: z.number().optional().describe("Maximum depth of the tree shown (default: 15). Use a smaller depth if output is too large."),
     ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
     max_chars: z.number().optional().describe("Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."),
+    delta: z.boolean().optional().describe("true to get only what changed since your last read_page of this tab with the same options and URL: lines starting \"- \" are gone, \"+ \" are new, \"@@ line N @@\" says where in the new tree; \"Unchanged\" when nothing changed. Refs in lines that didn't change still work. Use it only while that last output is still in your context. The full tree comes instead the first time, after a navigation, or when most of it changed."),
   },
   async (args, extra) => callTool("read_page", args, extra)
 );
@@ -1078,15 +1333,61 @@ server.tool(
 // 18. upload_image
 server.tool(
   "upload_image",
-  "Not available in this extension: Firefox WebExtensions can't put a file into a file input or a drop target, and every call returns an error. Ask the user to upload the file.",
+  "Upload a screenshot taken earlier (the computer tool's screenshot action, by the ID its result gives) to a file input, or drop it on a page element. Give either ref (a file input from read_page or find, hidden ones too) or coordinate (a drop target, in screenshot pixels). Don't click a file input instead: that opens a file picker you can't see.",
   {
-    imageId: z.string().describe("ID of a previously captured screenshot (from the computer tool's screenshot action) or a user-uploaded image"),
+    imageId: z.string().describe("ID of a screenshot taken earlier with the computer tool (its 10 most recent are kept)."),
     tabId: z.number().describe("Tab ID where the target element is located. This is where the image will be uploaded to."),
-    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Use this for file inputs (especially hidden ones) or specific elements. Provide either ref or coordinate, not both.'),
-    coordinate: z.array(z.number()).optional().describe("Viewport coordinates [x, y] for drag & drop to a visible location. Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both."),
-    filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
+    ref: z.string().optional().describe('Element reference ID of a file input from read_page or find tools (e.g., "ref_1"). Provide either ref or coordinate, not both.'),
+    coordinate: z.array(z.number()).optional().describe("[x, y] in screenshot pixels, for a drop target (a page that takes files dropped on it). Provide either ref or coordinate, not both."),
+    filename: z.string().optional().describe('Optional filename for the uploaded file (default: "screenshot.jpg")'),
   },
   async (args, extra) => callTool("upload_image", args, extra)
+);
+
+server.tool(
+  "file_upload",
+  "Upload files from this computer (by absolute path) to a file input on the page: find the <input type=\"file\"> with read_page or find and pass its ref. Don't click a file input instead: that opens a file picker you can't see. The user is asked first, in this app's prompt; if the app can't show one, the result tells you to ask them in the conversation and call again with confirmed: true. At most 10 MB in one call.",
+  {
+    paths: z.array(z.string()).min(1).describe("Absolute paths of the files to upload, on this computer."),
+    ref: z.string().describe('Element reference ID of the file input from read_page or find tools (e.g., "ref_1").'),
+    tabId: z.number().describe("Tab ID where the file input is. Must be a tab in the current group, or one the user shared with you."),
+    confirmed: z.boolean().optional().describe("Only when this tool told you to ask in the conversation: true once the user agreed there."),
+  },
+  async (args, extra) => requestFileUpload(args, extra)
+);
+
+server.tool(
+  "debug",
+  "Read what the extension actually did, as one timestamped list: tool calls with their arguments (what was typed is left out), how long they took, where each click, hover and scroll went (which element, which frame), how screenshots were taken, and pages that didn't answer. It holds what results leave out, so use it to check an action had the effect you meant, or to see where time went. It says how far back it reaches and how much was dropped.",
+  {
+    limit: z.number().optional().describe("How many of the latest matching events to show (default 100, at most 1000)."),
+    kind: z.enum(["tool", "input", "screenshot", "page"]).optional().describe('Only this kind: "tool" (calls and their outcome), "input" (where clicks, keys and scrolls went), "screenshot" (how one was taken), "page" (frames and pages that didn\'t answer).'),
+    filter: z.string().optional().describe("Only events containing this text."),
+    tabId: z.number().optional().describe("Only events for this tab."),
+    since_ms: z.number().optional().describe("Only events from the last this many milliseconds, e.g. 5000 for what the last action did."),
+    clear: z.boolean().optional().describe("Empty the list after reading it."),
+  },
+  async (args, extra) => callTool("debug", args, extra)
+);
+
+server.tool(
+  "get_config",
+  "Read the extension's settings: what applies to every tab, what was set for single tabs, and the list of settings with what each one does (read it before changing one). With tabId, also what applies to that tab.",
+  {
+    tabId: z.number().optional().describe("Also show the settings that apply to this tab."),
+  },
+  async (args, extra) => callTool("get_config", args, extra)
+);
+
+server.tool(
+  "set_config",
+  "Change one of the extension's settings (get_config lists them). Without tabId it changes what applies to every tab; with tabId, only that tab, until it's closed. value null removes the setting, back to the default. Settings for every tab stay set until changed. When the user asks for human input or human behaviour (acting like a person, not a bot), set humanize to true and use the computer tool's mouse and keyboard actions.",
+  {
+    key: z.string().describe('The setting, as get_config names it (e.g. "humanize").'),
+    value: z.union([z.boolean(), z.number(), z.string(), z.null()]).describe("Its new value, or null to remove it."),
+    tabId: z.number().optional().describe("Only for this tab."),
+  },
+  async (args, extra) => callTool("set_config", args, extra)
 );
 
 // --- Start MCP server ---

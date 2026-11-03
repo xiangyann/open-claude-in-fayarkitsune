@@ -182,6 +182,64 @@ function addNote(result, note) {
   else result.content.push({ type: "text", text: note });
 }
 
+// --- What the extension did (the debug tool) ---
+// A list of what happened, with when: tool calls and how they ended, where
+// input went, how screenshots were taken, pages that didn't answer. Only in
+// memory, and only so long. What Claude typed, put in a form or gave a prompt
+// isn't kept, and text goes through the same redaction as results.
+const DEBUG_MAX_EVENTS = 2000;
+const debugLog = [];
+let debugDropped = 0;
+
+function debugEvent(kind, tabId, text) {
+  debugLog.push({ at: Date.now(), kind, tabId: tabId ?? null, text: redactTokens(String(text)).slice(0, 600) });
+  if (debugLog.length > DEBUG_MAX_EVENTS) {
+    debugLog.shift();
+    debugDropped++;
+  }
+}
+
+// A call's arguments, for the debug log, without what Claude typed or entered.
+const PRIVATE_ARGUMENTS = { computer: ["text"], form_input: ["value"], handle_dialog: ["promptText"], upload_files: ["files"] };
+function describeArguments(tool, args) {
+  const shown = { ...args };
+  for (const name of PRIVATE_ARGUMENTS[tool] || []) {
+    if (name in shown) shown[name] = "(left out)";
+  }
+  if (typeof shown.text === "string" && shown.text.length > 300) shown.text = `${shown.text.slice(0, 300)}…`;
+  return JSON.stringify(shown);
+}
+
+// --- Settings (get_config and set_config) ---
+// For every tab (kept in storage.local), and for one tab (in storage.session,
+// dropped when the tab closes).
+const SETTINGS = {
+  humanize: {
+    type: "boolean",
+    default: false,
+    about: "Move the mouse to where it acts along a curved path, at a human pace (the user sees it as an orange cursor), and type and press keys with a human rhythm, instead of all at once. Slower; for when the user asks for human input or behaviour, and for sites that tell scripted input apart by its timing (it doesn't change that the events are synthetic).",
+  },
+  humanize_speed: {
+    type: "string",
+    values: ["fast", "natural", "relaxed"],
+    default: "natural",
+    about: "How fast humanized input is.",
+  },
+};
+const CONFIG_STORAGE_KEY = "config";
+const TAB_CONFIG_STORAGE_KEY = "tabConfig";
+let configForAll = {};
+const configForTabs = new Map(); // tabId -> its own settings
+
+function settingsFor(tabId) {
+  const defaults = Object.fromEntries(Object.entries(SETTINGS).map(([key, setting]) => [key, setting.default]));
+  return { ...defaults, ...configForAll, ...(configForTabs.get(tabId) || {}) };
+}
+
+function saveTabConfig() {
+  chrome.storage.session.set({ [TAB_CONFIG_STORAGE_KEY]: [...configForTabs] }).catch(() => {});
+}
+
 // --- Claude's tabs ---
 // Claude works in tabs of its own, kept in a tab group named "Claude" (in a
 // window of its own, unless the user moves the group), and in tabs the user
@@ -422,6 +480,9 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   hookedTabs.delete(tabId);
   keyFrames.delete(tabId);
   knownViews.delete(tabId);
+  lastScreenshots.delete(tabId);
+  lastTrees.delete(tabId);
+  if (configForTabs.delete(tabId)) saveTabConfig();
   ownTabs.delete(tabId);
   if (sharedTabs.delete(tabId)) saveSharedTabs();
   if (tabOrigins.delete(tabId)) saveTabOrigins();
@@ -479,6 +540,22 @@ chrome.webRequest.onCompleted.addListener(
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
+);
+
+// A redirect ends this part of the request: the next part comes as a new
+// request with the same id.
+chrome.webRequest.onBeforeRedirect.addListener(
+  (details) => {
+    const reqs = networkRequests.get(details.tabId);
+    if (!reqs) return;
+    for (let i = reqs.length - 1; i >= 0; i--) {
+      if (reqs[i].requestId === details.requestId && reqs[i].status === 0) {
+        reqs[i].status = details.statusCode;
+        break;
+      }
+    }
+  },
+  { urls: ["<all_urls>"] }
 );
 
 chrome.webRequest.onErrorOccurred.addListener(
@@ -588,6 +665,45 @@ function refFrame(ref) {
   return Number(/^ref_f(\d+)_/.exec(ref || "")?.[1] ?? 0);
 }
 
+// A message for the page about acting on it. It isn't sent once the call
+// shouldn't act anymore (the tab can stop being Claude's, or the call stop
+// being wanted, between one step and the next), and gets no longer than the
+// call has left.
+function pageMessage(tabId, request, message, frameId = 0) {
+  const reason = stopReason(tabId, request);
+  if (reason) {
+    const err = new Error(`${reason}, so this wasn't done`);
+    err.notDone = true;
+    return Promise.reject(err);
+  }
+  return sendContentMessage(tabId, message, stepTimeout(request), frameId);
+}
+
+// A mouse message goes to the page. If its point is in a frame, the page says
+// so, and it goes on to that frame. Answers with the frame it ended in.
+async function pointMessage(tabId, request, message, frameId = 0) {
+  let target = frameId;
+  let sent = message;
+  for (let hops = 0; hops < MAX_FRAME_DEPTH; hops++) {
+    let resp;
+    try {
+      resp = await pageMessage(tabId, request, sent, target);
+    } catch (err) {
+      if (!err.unreachable) throw err;
+      return { error: `That point is inside a frame Claude can't reach (${err.message}).` };
+    }
+    if (!resp?.intoFrame) {
+      if (resp?.hit) debugEvent("input", tabId, `${message.type} in frame ${target}: ${resp.hit}`);
+      return { ...resp, frameId: target };
+    }
+    const { frameId: inner, ...points } = resp.intoFrame;
+    debugEvent("input", tabId, `${message.type}: into frame ${inner}`);
+    target = inner;
+    sent = { ...message, ...points };
+  }
+  return { error: "That point is inside frames nested too deep to reach." };
+}
+
 // Asks each frame of a page, in parallel. Those that fail or don't answer in
 // time are left out.
 function askFrames(tabId, frames, message) {
@@ -687,6 +803,7 @@ async function callPageHooks(tabId, settings, frameId) {
     return null;
   }
   const busy = page === null;
+  if (busy) debugEvent("page", tabId, `the page didn't answer its hooks within ${PAGE_HOOKS_TIMEOUT_MS / 1000} s`);
   if (settings?.answerUntil > 0) hookedTabs.add(tabId);
   const records = [page, frames].flatMap((r) => (Array.isArray(r) ? r : [])).map((res) => res?.result).filter(Boolean);
   if (!records.length && !busy) return null;
@@ -762,6 +879,18 @@ function describeDialogs(dialogs, dropped = 0) {
   return `The page opened dialogs:\n${lines.join("\n")}\nUse handle_dialog to choose how the next confirm or prompt is answered.`;
 }
 
+// In Claude's own window, the tab Claude works in is the one shown: Firefox
+// slows down the pages of tabs that aren't (timers, animations), which a
+// screenshot taken in place (tabs.captureTab) would show as half done. Not
+// in a window that holds the user's tabs too (they moved Claude's group
+// there): that's theirs to switch.
+async function showInClaudesWindow(tab) {
+  const tabs = await chrome.tabs.query({ windowId: tab.windowId }).catch(() => []);
+  if (tabs.length && tabs.every((t) => t.groupId === tab.groupId)) {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+  }
+}
+
 // Tools that work inside a tab's page get the glow, page hooks, and a report
 // of any dialogs the page opened.
 async function startPageWork(tabId, kind) {
@@ -818,7 +947,8 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 });
 
 // --- Screenshot helper ---
-// Firefox uses tabs.captureVisibleTab() — the tab must be active in its window.
+// Firefox draws the tab with tabs.captureTab(), whether or not it's the one
+// its window shows; failing that, it's made active for tabs.captureVisibleTab().
 // It renders at scale × the page's zoom: a scale of 1/zoom keeps image pixels
 // equal to CSS pixels, so coordinates read off a screenshot match the ones
 // clicks use, on HiDPI screens and zoomed pages alike. An image larger than
@@ -882,6 +1012,8 @@ async function takeScreenshot(tabId, request, options = {}) {
   return inWindowQueue(windowId, (turn) => takeScreenshotNow(tabId, request, options, turn));
 }
 
+let lastScreenshotNumber = 0;
+
 async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { over: false }) {
   // It may have waited its turn: is the tab still Claude's to show, and does
   // the call still want it? And is it still this screenshot's turn?
@@ -891,16 +1023,26 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
     if (reason) throw new Error(reason);
   };
   stillClaudes();
-  const tab = await chrome.tabs.get(tabId);
-
-  // Activate the tab so captureVisibleTab captures the right content
-  if (!tab.active) {
-    stillClaudes();
-    await chrome.tabs.update(tabId, { active: true });
-    await sleep(100);
-  }
 
   let view;
+  const optionsFor = (quality) => {
+    const options = { format: "jpeg", quality, scale: (scale ?? view.fit) / view.zoom };
+    if (rect) options.rect = rect;
+    return options;
+  };
+
+  // Firefox can draw a tab its window isn't showing (tabs.captureTab), so the
+  // window stays on whatever tab the user has there.
+  const captureInPlace = async (quality) => {
+    view = await viewOf(tabId);
+    stillClaudes();
+    const dataUrl = await chrome.tabs.captureTab(tabId, optionsFor(quality));
+    if (!isControlledNow(tabId)) throw new Error("the user took this tab back");
+    return dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+  };
+
+  // Where it can't (a tab never shown since it loaded has no size to draw
+  // at), the tab is made the active one and the window's visible tab is taken.
   const capture = async (quality) => {
     // Still this tab, and still in the window it's captured from? The user
     // can switch tabs, or move the tab to another window: then the window
@@ -917,11 +1059,9 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
         throw new Error("another tab kept becoming the active one in this window; try again");
       }
     }
-    view = await viewOf(tabId); // only known for sure of the active tab
+    view = await viewOf(tabId);
     stillClaudes();
-    const options = { format: "jpeg", quality, scale: (scale ?? view.fit) / view.zoom };
-    if (rect) options.rect = rect;
-    const dataUrl = await chrome.tabs.captureVisibleTab(now.windowId, options);
+    const dataUrl = await chrome.tabs.captureVisibleTab(now.windowId, optionsFor(quality));
     const after = await chrome.tabs.get(tabId);
     if (!after.active || after.windowId !== now.windowId || !isControlledNow(tabId)) {
       throw new Error("the tab was switched away or moved during the screenshot; try again");
@@ -936,8 +1076,17 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
   let base64;
   try {
     await Promise.race([chrome.tabs.sendMessage(tabId, { type: "glow", mode: "hide" }, { frameId: 0 }).catch(() => {}), sleep(1000)]);
-    base64 = await capture(55);
-    if (base64.length > 500000) base64 = await capture(30);
+    let take = captureInPlace;
+    try {
+      base64 = await take(55);
+    } catch (err) {
+      if (turn.over || stopReason(tabId, request)) throw err;
+      debugEvent("screenshot", tabId, `captureTab failed (${err.message}); made the tab active for captureVisibleTab`);
+      take = capture;
+      base64 = await take(55);
+    }
+    debugEvent("screenshot", tabId, `${take === capture ? "captureVisibleTab" : "captureTab"}: viewport ${view.width}x${view.height}, zoom ${view.zoom}, image scale ${view.fit.toFixed(3)}${rect ? `, region ${JSON.stringify(rect)}` : ""}`);
+    if (base64.length > 500000) base64 = await take(30);
   } finally {
     const left = capturing.get(tabId) - 1;
     if (left > 0) {
@@ -948,7 +1097,9 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
     }
   }
 
-  const imageId = `screenshot_${Date.now()}`;
+  // Unique, also for screenshots of two windows taken in the same millisecond.
+  lastScreenshotNumber = Math.max(Date.now(), lastScreenshotNumber + 1);
+  const imageId = `screenshot_${lastScreenshotNumber}`;
   screenshotStore.set(imageId, base64);
   const keys = Array.from(screenshotStore.keys());
   while (keys.length > 10) screenshotStore.delete(keys.shift());
@@ -1080,7 +1231,37 @@ const toolHandlers = {
     return textResult(`Released tab ${args.tabId}: it's the user's again, and you can't use it anymore.`);
   },
 
-  async navigate(args, control) {
+  async set_tab_focus(args, { tab }) {
+    await chrome.tabs.update(args.tabId, { active: true });
+    if (args.focus_window) await chrome.windows.update(tab.windowId, { focused: true });
+    return textResult(
+      `Tab ${args.tabId} is now the selected tab in its window${args.focus_window ? ", which is in front of the user's other windows" : ""}.`
+    );
+  },
+
+  async upload_image(args, control, request) {
+    const data = screenshotStore.get(args.imageId);
+    if (!data) {
+      return errorResult(`Error: there's no screenshot ${args.imageId} (only the 10 most recent are kept). Take a new one.`);
+    }
+    return putFiles(args, [{ name: args.filename || "screenshot.jpg", type: "image/jpeg", data }], request);
+  },
+
+  // file_upload's files, read by the MCP server once the user agreed. With
+  // check, whether the ref is a file input that takes `count` files, before
+  // the user is asked.
+  async upload_files(args, control, request) {
+    if (args.check) {
+      const resp = await pageMessage(args.tabId, request, { type: "setFiles", ref: args.ref, check: true, count: args.count }, refFrame(args.ref));
+      if (resp?.error) return errorResult(`Error: ${resp.error}`);
+      if (!resp?.result) return errorResult("Error: the page gave no answer.");
+      // (Read by the server: which site gets the files.)
+      return textResult(JSON.stringify({ ok: true, origin: resp.result.origin }));
+    }
+    return putFiles(args, Array.isArray(args.files) ? args.files : [], request);
+  },
+
+  async navigate(args, control, request) {
     const { url, tabId } = args;
 
     let targetUrl = null;
@@ -1153,15 +1334,23 @@ const toolHandlers = {
 
     await loaded;
 
-    const tab = await chrome.tabs.get(tabId);
+    let tab = await chrome.tabs.get(tabId);
     if (targetUrl === null && tab.url === urlBefore && tab.status === "complete") {
       return errorResult(`Nothing happened: this tab has no page to go ${url} to, or that page didn't load. It still shows ${tab.url}.`);
     }
+    let busyNote = "";
+    if (args.wait === "networkidle") {
+      const waited = await networkIdle(tabId, request);
+      if (waited !== true) {
+        busyNote = ` (it was still making requests after ${Math.round(waited / 1000)} s more; what it shows may not be complete)`;
+      }
+    }
+    tab = await chrome.tabs.get(tabId);
     const group = await findClaudeGroup();
     const tabs = group && tab.groupId === group.id ? await tabsInGroup(group) : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text =
-      `Navigated to ${tab.url}${loading}.\n## Pages\n` +
+      `Navigated to ${tab.url}${loading}${busyNote}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
 
     return textResult(text);
@@ -1173,36 +1362,12 @@ const toolHandlers = {
     // Everything that acts on the page goes through here. The tab can stop
     // being Claude's, or the call stop being wanted, between one step and the
     // next; a message gets no longer than the call has left.
-    const inPage = (message, frameId = 0) => {
-      const reason = stopReason(tabId, request);
-      if (reason) {
-        const err = new Error(`${reason}, so this wasn't done`);
-        err.notDone = true;
-        throw err;
-      }
-      return sendContentMessage(tabId, message, stepTimeout(request), frameId);
-    };
-
-    // A mouse message goes to the page. If its point is in a frame, the page
-    // says so, and it goes on to that frame. Answers with the frame it ended in.
-    const atPoint = async (message, frameId = 0) => {
-      let target = frameId;
-      let sent = message;
-      for (let hops = 0; hops < MAX_FRAME_DEPTH; hops++) {
-        let resp;
-        try {
-          resp = await inPage(sent, target);
-        } catch (err) {
-          if (!err.unreachable) throw err;
-          return { error: `That point is inside a frame Claude can't reach (${err.message}).` };
-        }
-        if (!resp?.intoFrame) return { ...resp, frameId: target };
-        const { frameId: inner, ...points } = resp.intoFrame;
-        target = inner;
-        sent = { ...message, ...points };
-      }
-      return { error: "That point is inside frames nested too deep to reach." };
-    };
+    const inPage = (message, frameId = 0) => pageMessage(tabId, request, message, frameId);
+    // Mouse messages carry the humanize setting: the page moves the mouse
+    // there itself, at a human pace.
+    const settings = settingsFor(tabId);
+    const humanize = settings.humanize ? settings.humanize_speed : null;
+    const atPoint = (message, frameId = 0) => pointMessage(tabId, request, { ...message, humanize }, frameId);
 
     // Coordinates Claude gives are in screenshot pixels. (Usually CSS pixels:
     // see viewOf.)
@@ -1238,7 +1403,15 @@ const toolHandlers = {
 
     switch (action) {
       case "screenshot": {
+        const previous = lastScreenshots.get(tabId);
         const { base64, imageId, view: shot } = await takeScreenshot(tabId, request);
+        // (Not after a resend: Claude may never have got the one before.)
+        if (args.if_changed && previous && !request.resent && screenshotStore.get(previous) === base64) {
+          screenshotStore.delete(imageId);
+          return textResult(`Unchanged: the tab looks exactly as in screenshot ${previous}, so the image was left out.`);
+        }
+        // Only one Claude gets: not one taken after the call ran out of time.
+        if (Date.now() < request.deadline) lastScreenshots.set(tabId, imageId);
         const size = shot.fit < 1
           ? `${shot.imageWidth}x${shot.imageHeight}, jpeg, of a ${shot.width}x${shot.height} viewport; use this image's pixels as coordinates`
           : `${shot.width}x${shot.height}, jpeg`;
@@ -1271,7 +1444,10 @@ const toolHandlers = {
           const { tab, where } = await openLinkInNewTab(tabId, kind, resp.openInNewTab);
           opened = `. The link opens in a new tab: tab ${tab.id} (${resp.openInNewTab}), ${where}`;
         }
-        return textResult(`${verb} ${at}${refNote}${opened}`);
+        const missed = resp.missed
+          ? `. Nothing was there but the page itself (<${resp.missed}>): if you meant an element, check its position in a new screenshot`
+          : "";
+        return textResult(`${verb} ${at}${refNote}${opened}${missed}`);
       }
 
       case "hover": {
@@ -1331,7 +1507,7 @@ const toolHandlers = {
           if (typed < chars.length && (resp?.submitted || resp?.left)) {
             return stopped(resp.submitted ? "Enter submitted the form" : "the focus left the field");
           }
-          await sleep(10);
+          await sleep(humanize ? typingPause(char, humanize) : 10);
         }
         // Fields announce a finished edit with one change event, as when the
         // user moves on.
@@ -1400,7 +1576,7 @@ const toolHandlers = {
               if (submitted) break;
               return stopped(`the page stopped responding while that key was being released (${err.message})`);
             }
-            await sleep(30);
+            await sleep(humanize ? typingPause(keyStr, humanize) : 30);
           }
         }
         // A field changed by keys gets its change event, as after typing.
@@ -1562,7 +1738,19 @@ const toolHandlers = {
       tree = args.filter === "interactive" ? "This page has no interactive elements to show." : "This page has nothing to show.";
     }
     const { imageWidth, imageHeight } = await viewOf(tabId);
-    return textResult(`${tree}\n\nViewport: ${imageWidth}x${imageHeight}`);
+    const viewport = `\n\nViewport: ${imageWidth}x${imageHeight}`;
+    // Only what changed, if that was asked for and makes sense: the same page
+    // and options as last time, neither of them cut short.
+    const sameRead = JSON.stringify([control.tab.url, args.filter, args.depth, args.max_chars, args.ref_id]);
+    const previous = lastTrees.get(tabId);
+    const whole = !/\n\.\.\. \(truncated/.test(tree);
+    // Compared only with a read Claude got (see screenshot's if_changed).
+    if (Date.now() < request.deadline) lastTrees.set(tabId, whole ? { sameRead, tree } : null);
+    if (args.delta && whole && !request.resent && previous?.sameRead === sameRead) {
+      const changes = treeChanges(previous.tree, tree);
+      if (changes !== null) return textResult(`${changes}${viewport}`);
+    }
+    return textResult(`${tree}${viewport}`);
   },
 
   async get_page_text(args, control, request) {
@@ -1617,7 +1805,7 @@ const toolHandlers = {
 
     let text = `Found ${results.length} element(s) matching "${query}":\n\n`;
     for (const r of results) {
-      const at = `at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      const at = r.hidden ? "(hidden: give its ref to upload_image or file_upload)" : `at (${r.coordinates[0]}, ${r.coordinates[1]})`;
       text += `[${r.ref}] ${r.role} "${r.name}" ${at}${r.offscreen ? " (off-screen: click it by ref, or scroll first)" : ""}\n`;
     }
     const more = all.length > results.length || resp?.result?.more || inFrames.some(({ resp: inner }) => inner?.result?.more);
@@ -1763,10 +1951,6 @@ const toolHandlers = {
     return textResult(`The next confirm or prompt on this page itself (not in a frame) will be ${what}. Alerts are always acknowledged.`);
   },
 
-  async upload_image(args) {
-    return errorResult("Uploading files isn't possible in Firefox WebExtensions, and a synthetic drag can't carry a file. Ask the user to upload it.");
-  },
-
   async gif_creator(args) {
     return errorResult("GIF recording isn't implemented in this extension.");
   },
@@ -1792,7 +1976,246 @@ const toolHandlers = {
     text += "\nNoted. The user wasn't shown this: this extension has no approval step and no domain restrictions, so tell them in the conversation if they should see it.";
     return textResult(text);
   },
+
+  async debug(args) {
+    const limit = Math.min(Math.max(1, args.limit || 100), 1000);
+    const since = typeof args.since_ms === "number" ? Date.now() - args.since_ms : -Infinity;
+    const filter = typeof args.filter === "string" ? args.filter.toLowerCase() : "";
+    const matching = debugLog.filter((e) =>
+      e.at >= since &&
+      (!args.kind || e.kind === args.kind) &&
+      (args.tabId === undefined || e.tabId === args.tabId) &&
+      (!filter || e.text.toLowerCase().includes(filter))
+    );
+    const shown = matching.slice(-limit);
+    const reach = debugLog.length ? `${Math.round((Date.now() - debugLog[0].at) / 1000)} s` : "nothing yet";
+    const head = `${shown.length} of ${matching.length} matching events. The list goes back ${reach}` +
+      `${debugDropped ? `; ${debugDropped} older events were dropped` : ""}, and starts over when the extension restarts.`;
+    const lines = shown.map((e) => {
+      const ago = ((Date.now() - e.at) / 1000).toFixed(1);
+      return `-${ago}s [${e.kind}]${e.tabId !== null ? ` tab ${e.tabId}` : ""}: ${e.text}`;
+    });
+    if (args.clear) {
+      debugLog.length = 0;
+      debugDropped = 0;
+    }
+    return textResult([head, ...lines].join("\n"));
+  },
+
+  async get_config(args) {
+    const lines = ["Settings for every tab:", JSON.stringify(configForAll)];
+    if (configForTabs.size) {
+      lines.push("Set for single tabs:", JSON.stringify(Object.fromEntries(configForTabs)));
+    }
+    if (args.tabId !== undefined) lines.push(`What applies to tab ${args.tabId}:`, JSON.stringify(settingsFor(args.tabId)));
+    lines.push("The settings:");
+    for (const [key, setting] of Object.entries(SETTINGS)) {
+      const values = setting.values ? `one of ${setting.values.map((v) => `"${v}"`).join(", ")}` : setting.type;
+      lines.push(`- ${key} (${values}, default ${JSON.stringify(setting.default)}): ${setting.about}`);
+    }
+    return textResult(lines.join("\n"));
+  },
+
+  async set_config(args) {
+    if (args.tabId !== undefined && !(await chrome.tabs.get(args.tabId).catch(() => null))) {
+      return errorResult(`Error: there's no tab ${args.tabId}. Use tabs_context_mcp to see the tabs.`);
+    }
+    const setting = SETTINGS[args.key];
+    if (!setting) return errorResult(`Error: there's no setting "${args.key}". The settings: ${Object.keys(SETTINGS).join(", ")}.`);
+    const { value } = args;
+    if (value !== null && (typeof value !== setting.type || (setting.values && !setting.values.includes(value)))) {
+      return errorResult(`Error: ${args.key} takes ${setting.values ? setting.values.map((v) => `"${v}"`).join(", ") : `a ${setting.type}`}, or null.`);
+    }
+    if (args.tabId !== undefined) {
+      const own = { ...(configForTabs.get(args.tabId) || {}) };
+      if (value === null) delete own[args.key];
+      else own[args.key] = value;
+      if (Object.keys(own).length) configForTabs.set(args.tabId, own);
+      else configForTabs.delete(args.tabId);
+      saveTabConfig();
+    } else {
+      configForAll = { ...configForAll };
+      if (value === null) delete configForAll[args.key];
+      else configForAll[args.key] = value;
+      await chrome.storage.local.set({ [CONFIG_STORAGE_KEY]: configForAll }).catch(() => {});
+    }
+    const where = args.tabId !== undefined ? `tab ${args.tabId}` : "every tab";
+    return textResult(`${args.key} is ${value === null ? `back to its default for ${where}` : `${JSON.stringify(value)} for ${where}`}. Now applying${args.tabId !== undefined ? ` to tab ${args.tabId}` : " by default"}: ${JSON.stringify(settingsFor(args.tabId))}`);
+  },
 };
+
+// The last screenshot of each tab, for screenshot's if_changed, and the last
+// read_page of each, for its delta.
+const lastScreenshots = new Map(); // tabId -> imageId
+const lastTrees = new Map(); // tabId -> { sameRead, tree }
+
+// What changed from one read_page to the next, line by line: "- " lines are
+// gone, "+ " lines are new, "@@ line N @@" says where in the new tree. null
+// when most of it changed, or it's too large to compare: then the whole tree
+// says more.
+const MAX_TREE_COMPARE = 4000000; // lines × lines compared at most
+
+function treeChanges(before, after) {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--;
+    endB--;
+  }
+  if (start === endA && start === endB) return "Unchanged since your last read_page of this tab.";
+  const n = endA - start;
+  const m = endB - start;
+  if (n * m > MAX_TREE_COMPARE) return null;
+  // The longest common subsequence of the lines that differ, table filled
+  // from the end.
+  const width = m + 1;
+  const common = new Uint32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      common[i * width + j] = a[start + i] === b[start + j]
+        ? common[(i + 1) * width + j + 1] + 1
+        : Math.max(common[(i + 1) * width + j], common[i * width + j + 1]);
+    }
+  }
+  const out = [];
+  let changed = 0;
+  let hunkOpen = false;
+  let i = 0;
+  let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && a[start + i] === b[start + j]) {
+      hunkOpen = false;
+      i++;
+      j++;
+      continue;
+    }
+    if (!hunkOpen) {
+      out.push(`@@ line ${start + j + 1} @@`);
+      hunkOpen = true;
+    }
+    if (j < m && (i === n || common[i * width + j + 1] >= common[(i + 1) * width + j])) {
+      out.push(`+ ${b[start + j]}`);
+      j++;
+    } else {
+      out.push(`- ${a[start + i]}`);
+      i++;
+    }
+    changed++;
+  }
+  if (changed > b.length / 2) return null;
+  return `Changes since your last read_page of this tab:\n${out.join("\n")}`;
+}
+
+// navigate's wait: "networkidle": no request still going for half a second.
+// Requests running longer than LONG_REQUEST_MS (long polling, streams) don't
+// count, and neither do WebSockets.
+const NETWORK_QUIET_MS = 500;
+const NETWORK_IDLE_MAX_MS = 15000;
+const LONG_REQUEST_MS = 10000;
+
+// True once it's quiet, or how long it waited (ms) when it stopped waiting:
+// at the limit, or when the call ends (cancelled, out of time, tab lost).
+async function networkIdle(tabId, request) {
+  const began = Date.now();
+  const until = Math.min(began + NETWORK_IDLE_MAX_MS, request.deadline - 2000);
+  let quietSince = began;
+  while (Date.now() < until && !stopReason(tabId, request)) {
+    const now = Date.now();
+    const busy = (networkRequests.get(tabId) || []).some(
+      (r) => r.status === 0 && r.type !== "websocket" && now - r.timestamp < LONG_REQUEST_MS
+    );
+    if (busy) quietSince = now;
+    else if (now - quietSince >= NETWORK_QUIET_MS) return true;
+    await sleep(100);
+  }
+  return Date.now() - began;
+}
+
+const DROP_MARGIN_MS = 1000;
+
+// A drop of files at a point in a frame (in its CSS pixels), made in the
+// page's own world: a page only sees the files of a DataTransfer it made
+// itself (Firefox leaves out those a content script put in one). Too late
+// once the call has given up on it.
+async function dropInPage(tabId, frameId, x, y, files, request) {
+  const reason = stopReason(tabId, request);
+  if (reason) return { error: `${reason}, so nothing was dropped` };
+  const timeout = stepTimeout(request);
+  const run = chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    world: "MAIN",
+    func: (x, y, files, deadline) => {
+      if (Date.now() > deadline) return { error: "the page was too busy to take the drop in time" };
+      let el = document.elementFromPoint(x, y);
+      while (el?.shadowRoot) {
+        const inner = el.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === el) break;
+        el = inner;
+      }
+      if (!el) return { error: "there's nothing at that point to drop on" };
+      const dataTransfer = new DataTransfer();
+      for (const { name, type, data } of files) {
+        const binary = atob(data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        dataTransfer.items.add(new File([bytes], name, { type }));
+      }
+      const init = {
+        bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: x, clientY: y, screenX: (window.mozInnerScreenX ?? window.screenX) + x, screenY: (window.mozInnerScreenY ?? window.screenY) + y,
+        dataTransfer,
+      };
+      const fire = (type) => el.dispatchEvent(new DragEvent(type, init));
+      fire("dragenter");
+      const dropped = !fire("dragover");
+      fire(dropped ? "drop" : "dragleave");
+      return { dropped };
+    },
+    args: [x, y, files, Date.now() + timeout - DROP_MARGIN_MS],
+  }).then(([res]) => res?.result ?? { error: res?.error ? errorText(res.error) : "the page gave no answer" }, (err) => ({ error: err.message }));
+  return Promise.race([run, sleep(timeout).then(() => ({ error: "the page didn't take the drop in time" }))]);
+}
+
+// upload_image and file_upload: files given to a file input (by ref) or
+// dropped on a page element (at a point, in screenshot pixels).
+async function putFiles(args, files, request) {
+  const { tabId } = args;
+  if (!files.length) return errorResult("Error: there are no files to upload.");
+  if (args.ref && !args.coordinate) {
+    const resp = await pageMessage(tabId, request, { type: "setFiles", ref: args.ref, files }, refFrame(args.ref));
+    if (resp?.error) return errorResult(`Error: ${resp.error}`);
+    if (!resp?.result) return errorResult("Error: the page gave no answer, so it's not known whether the files were set.");
+    return textResult(`Put ${resp.result.names.join(", ")} in the file input ${args.ref}.`);
+  }
+  if (Array.isArray(args.coordinate) && args.coordinate.length === 2) {
+    const { fit } = await viewOf(tabId);
+    const [x, y] = args.coordinate.map((v) => (fit === 1 ? v : Math.round(v / fit)));
+    const at = await pointMessage(tabId, request, { type: "dropFiles", x, y });
+    if (at.outside) return errorResult(`Error: (${args.coordinate.join(", ")}) is outside the visible area of the page.`);
+    if (at.error) return errorResult(`Error: ${at.error}`);
+    const resp = await dropInPage(tabId, at.frameId, at.x, at.y, files, request);
+    if (resp.error) return errorResult(`Error: ${resp.error}`);
+    if (!resp.dropped) return errorResult(`Error: nothing at (${args.coordinate.join(", ")}) takes files dropped on it (the page didn't accept the drop).`);
+    return textResult(`Dropped ${files.map((f) => f.name).join(", ")} at (${args.coordinate.join(", ")}).`);
+  }
+  return errorResult("Error: give ref (a file input) or coordinate (where to drop it).");
+}
+
+// The pause after a typed character or a pressed key, with humanize on: a
+// human rhythm, slower after a space or punctuation, now and then a pause.
+const TYPING_PACE = { fast: 45, natural: 95, relaxed: 165 };
+
+function typingPause(typed, speed) {
+  const base = TYPING_PACE[speed] || TYPING_PACE.natural;
+  let pause = base * (0.55 + Math.random() * 0.9);
+  if (/^[\s.,;:!?]$/.test(typed)) pause += base * Math.random() * 1.5;
+  if (Math.random() < 0.04) pause += base * (2 + Math.random() * 4);
+  return Math.round(pause);
+}
 
 // The frame keys go to: the one last clicked in, while it's still there.
 async function keyFrame(tabId) {
@@ -1841,11 +2264,12 @@ const TAB_TOOLS = new Set([
   "navigate", "computer", "read_page", "get_page_text", "find", "form_input",
   "javascript_tool", "read_console_messages", "read_network_requests",
   "resize_window", "handle_dialog", "tabs_close_mcp", "tabs_release",
+  "set_tab_focus", "upload_image", "upload_files",
 ]);
 // Of those, the ones that work inside the page.
 const PAGE_TOOLS = new Set([
   "navigate", "computer", "read_page", "get_page_text", "find", "form_input",
-  "javascript_tool", "read_console_messages", "handle_dialog",
+  "javascript_tool", "read_console_messages", "handle_dialog", "upload_image", "upload_files",
 ]);
 
 // --- Tool dispatch ---
@@ -1869,7 +2293,7 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
   const budget = typeof timeLeft === "number"
     ? Math.max(0, Math.min(TOOL_DEADLINE_MS, timeLeft - (60000 - TOOL_DEADLINE_MS)))
     : TOOL_DEADLINE_MS;
-  const request = { serverVersion, deadline: Date.now() + budget, budget, cancelled: false };
+  const request = { serverVersion, deadline: Date.now() + budget, budget, cancelled: false, resent };
   await stateReady;
 
   // A request the server sent again after the connection dropped (see
@@ -1898,6 +2322,8 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
   // waits for it mustn't reload in between.)
   runningRequests.set(id, request);
   toolCallsRunning++;
+  const started = Date.now();
+  if (tool !== "debug") debugEvent("tool", args.tabId, `${tool} ${describeArguments(tool, args)}${resent ? " (sent again)" : ""}`);
   try {
     let outcome;
     try {
@@ -1914,6 +2340,14 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
     if (journaled) {
       journal.set(id, { tool, state: "done", at: Date.now(), ...keptOutcome(tool, args, outcome) });
       await saveJournal();
+    }
+    if (tool !== "debug") {
+      const summary = outcome.error ?? outcome.result?.content?.find((item) => item?.type === "text")?.text ?? "";
+      const verdict = outcome.error || outcome.result?.isError ? "failed" : "done";
+      // Not the result where it repeats what was typed, pressed, entered in
+      // a form or given a prompt (see PRIVATE_ARGUMENTS).
+      const shown = hidesInput(tool, args) ? "" : `: ${summary.split("\n")[0].slice(0, 200)}`;
+      debugEvent("tool", args.tabId, `${tool} ${verdict} in ${Date.now() - started} ms${shown}`);
     }
     if (outcome.error) sendError(id, outcome.error);
     else sendResponse(id, outcome.result);
@@ -1968,6 +2402,7 @@ async function runTool(tool, handler, args, request) {
         if (noLonger) return noLonger;
         const reason = stopReason(args.tabId, request);
         if (reason) return errorResult(`Error: ${reason}, so this wasn't done.`);
+        if (control.kind === "own" && !control.tab.active) await showInClaudesWindow(control.tab);
       }
     }
     // A tool that's still going at the deadline is answered for anyway; its
@@ -2010,7 +2445,11 @@ async function runTool(tool, handler, args, request) {
 // running it again would answer the next one too.)
 const REPEATABLE_TOOLS = new Set([
   "tabs_context_mcp", "read_page", "get_page_text", "find", "resize_window", "update_plan",
-  "upload_image", "gif_creator", "shortcuts_list", "shortcuts_execute", "switch_browser",
+  "gif_creator", "shortcuts_list", "shortcuts_execute", "switch_browser", "set_tab_focus",
+  "get_config", "set_config",
+  // (Even when it empties the log: run again, it shows what came since. Not
+  // journaled, the log it returns isn't kept on disk.)
+  "debug",
 ]);
 const REPEATABLE_ACTIONS = new Set(["screenshot", "zoom", "wait", "hover", "scroll_to"]);
 // Reading what was recorded repeats fine, unless the first read cleared it.
@@ -2027,13 +2466,19 @@ function isRepeatable(tool, args) {
   return REPEATABLE_TOOLS.has(tool) || (tool === "computer" && REPEATABLE_ACTIONS.has(args.action));
 }
 
+// Calls whose results repeat what Claude typed, pressed, put in a form or
+// gave a prompt (a password, say). (handle_dialog's answer can carry the
+// text given to a prompt.)
+function hidesInput(tool, args) {
+  if (tool === "form_input" || tool === "handle_dialog" || tool === "upload_files") return true;
+  return tool === "computer" && (args.action === "type" || args.action === "key");
+}
+
 // What's kept of a finished call, to answer a resend with: not what Claude
-// typed, pressed, put in a form or gave a prompt (a password, say), nor a
-// picture of the page, nor a result too large to keep.
+// typed, pressed, put in a form or gave a prompt, nor a picture of the page,
+// nor a result too large to keep.
 function keptOutcome(tool, args, outcome) {
-  // (handle_dialog's answer can carry the text given to a prompt.)
-  if (tool === "form_input" || tool === "handle_dialog") return {};
-  if (tool === "computer" && (args.action === "type" || args.action === "key")) return {};
+  if (hidesInput(tool, args)) return {};
   // Kept as it would be sent: redacted (it's on disk, if only briefly).
   const textOnly = (result) => (Array.isArray(result?.content)
     ? { ...result, content: result.content.filter((item) => item?.type !== "image") }
@@ -2684,10 +3129,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // The format of what's kept in storage.local: claudeGroupId (number),
 // tabOrigins ([tabId, { windowId, index, pinned? }] pairs), lastUserWindowId
 // (number), requestJournal ([requestId, { tool, state, at, result?,
-// error? }] pairs) and browserId (string). Bump it when that changes. Data
-// in any other format is discarded rather than migrated: all of it rebuilds
-// itself (the group is found by name, a tab without a home goes to the
-// last-used window). That includes 1.1.x's mcpWindowId: its window isn't
+// error? }] pairs), browserId (string) and config ({ setting: value }, see
+// SETTINGS; a setting it doesn't know is ignored). Bump it when that changes.
+// Data in any other format is discarded rather than migrated: all of it
+// rebuilds itself (the group is found by name, a tab without a home goes to
+// the last-used window; settings go back to their defaults). That includes 1.1.x's mcpWindowId: its window isn't
 // adopted, because after a Firefox restart the id can belong to one of the
 // user's windows.
 // storage.session needs no version: Firefox clears it whenever the
@@ -2736,6 +3182,12 @@ async function restoreState() {
     const { [BROWSER_ID_STORAGE_KEY]: stored } = await chrome.storage.local.get(BROWSER_ID_STORAGE_KEY);
     browserId = typeof stored === "string" ? stored : crypto.randomUUID();
     if (browserId !== stored) await chrome.storage.local.set({ [BROWSER_ID_STORAGE_KEY]: browserId });
+  } catch {}
+  try {
+    const { [CONFIG_STORAGE_KEY]: stored } = await chrome.storage.local.get(CONFIG_STORAGE_KEY);
+    if (stored && typeof stored === "object") configForAll = stored;
+    const { [TAB_CONFIG_STORAGE_KEY]: tabs = [] } = await chrome.storage.session.get(TAB_CONFIG_STORAGE_KEY);
+    for (const [id, own] of tabs) configForTabs.set(id, own);
   } catch {}
   try {
     const { [JOURNAL_STORAGE_KEY]: entries = [] } = await chrome.storage.local.get(JOURNAL_STORAGE_KEY);
