@@ -1533,12 +1533,13 @@ const toolHandlers = {
           if (resp?.inserted) inserted++;
           if (resp?.handled) handled++;
           submitted ||= !!resp?.submitted;
-          // Nothing took the first key and no text field has the focus: the
-          // rest would only set off the page's shortcuts (one-key ones, on
-          // some sites).
-          if (typed === 1 && chars.length > 1 && !resp?.inserted && !resp?.handled && resp?.editable === false) {
+          // The first key went into no text field, and none has the focus:
+          // the rest would only set off the page's shortcuts (one-key ones,
+          // on some sites; a handler that took the key may be one).
+          if (typed === 1 && chars.length > 1 && !resp?.inserted && resp?.editable === false) {
+            const went = resp?.handled ? "the page's own key handlers took it (a shortcut, maybe)" : "it went to the page";
             return errorResult(
-              `Sent the first key of "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}", but no text field had focus, so it went to the page, and typing stopped. Click the field first (or use the key action to send keys to the page itself).`
+              `Sent the first key of "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}", but no text field had focus, so ${went}, and typing stopped. Click the field first (or use the key action to send keys to the page itself).`
             );
           }
           if (typed < chars.length && (resp?.submitted || resp?.left)) {

@@ -770,7 +770,7 @@ async function requestHandover({ tabIds, reason, confirmed }, extra) {
     );
   };
 
-  if (!server.server.getClientCapabilities()?.elicitation?.form) {
+  if (!canShowForm()) {
     return askInConversation("This app can't show a confirmation prompt.");
   }
 
@@ -818,6 +818,14 @@ async function describeTab(tabId, signal) {
   }
 }
 
+// Whether the app can show a prompt with a form (elicitation): one that
+// says `elicitation: {}` can (the MCP specification's older form), as can
+// one that says `form`; one that can only open web addresses can't.
+function canShowForm() {
+  const elicitation = server.server.getClientCapabilities()?.elicitation;
+  return Boolean(elicitation && (elicitation.form || !elicitation.url));
+}
+
 // How a tab is named in a prompt: by its site, which the page can't choose,
 // then its title, which it can. The title is shortened and loses quotes and
 // brackets, so it can't pass for an address or more of the prompt.
@@ -839,7 +847,7 @@ function namePage(tab) {
 // has no prompt). The files go to the extension as data, which gives them to
 // the page's file input.
 const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
-const uploadsAskedInConversation = new Map(); // what was asked -> when
+const uploadsAskedInConversation = new Map(); // what was asked -> { at, stats } (when, and the files then)
 const MIME_TYPES = {
   ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
   ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
@@ -933,14 +941,16 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   } catch {}
   if (frameOrigin && frameOrigin !== tabOrigin) page = `a frame from ${frameOrigin} on ${page}`;
   const asked = JSON.stringify([tabId, ref, files]);
-  const askedInConversation = Date.now() - (uploadsAskedInConversation.get(asked) ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS;
+  const earlier = uploadsAskedInConversation.get(asked);
+  const askedInConversation = Date.now() - (earlier?.at ?? -Infinity) < HANDOVER_CONVERSATION_WINDOW_MS;
   if (signal?.aborted) return failed("Cancelled; nothing was uploaded.");
-  const upload = async () => {
+  // `agreed`: the files as they were when the user was asked.
+  const upload = async (agreed) => {
     const data = [];
     try {
       let left = UPLOAD_MAX_BYTES;
       for (const file of files) {
-        const bytes = await readUpload(file, left, stats.get(file));
+        const bytes = await readUpload(file, left, agreed.get(file));
         left -= bytes.length;
         data.push({
           name: path.basename(file),
@@ -956,13 +966,13 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   };
   if (confirmed && askedInConversation) {
     uploadsAskedInConversation.delete(asked);
-    return upload();
+    return upload(earlier.stats);
   }
   // Asked in the conversation only where the app can't show a prompt. Where
   // it can, a prompt that fails or isn't answered in time means no:
   // otherwise Claude could go on to confirm the upload itself.
-  if (!server.server.getClientCapabilities()?.elicitation?.form) {
-    uploadsAskedInConversation.set(asked, Date.now());
+  if (!canShowForm()) {
+    uploadsAskedInConversation.set(asked, { at: Date.now(), stats });
     return textResult(
       `This app can't show a confirmation prompt. Ask the user in the conversation whether to upload ${files.join(", ")} to ${page}. If they agree, call file_upload again with the same arguments and confirmed: true.`
     );
@@ -992,7 +1002,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   if (!answer.content?.upload) {
     return textResult('The user answered the prompt without ticking "Upload them", so nothing was uploaded.');
   }
-  return upload();
+  return upload(stats);
 }
 
 // tabs_close_mcp with several tabs: one at a time, then one list of the tabs.
