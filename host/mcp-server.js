@@ -313,7 +313,9 @@ function detachExtension(conn) {
   // before 2.1.0 keeps no such record and would run the action again.
   // With it goes the time left before this server gives up on the call.
   const disconnected = `Browser extension disconnected. ${UNKNOWN_OUTCOME}`;
+  // (Not while this session is quitting: its calls were cancelled.)
   const canResend = (entry) =>
+    !shuttingDown &&
     extensionConnected() &&
     Boolean(conn.browserId) &&
     conn.browserId === extensionConn.browserId &&
@@ -501,7 +503,9 @@ function setupClientConnection(socket, initialBuffer) {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
-        if (msg.type === "tool_request" && msg.id) {
+        if (msg.type === "tool_request" && msg.id && shuttingDown) {
+          socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "The Claude session connected to the browser is closing; try again in a few seconds." }) + "\n");
+        } else if (msg.type === "tool_request" && msg.id) {
           // Forward to the extension with a prefixed ID, and the version of
           // the client's server: its tools are the ones Claude sees there
           // (a client before 2.0.0 doesn't say it: "").
@@ -731,7 +735,7 @@ const handoverAskedInConversation = new Map(); // tabId -> time asked
 // extra: the call's context; its signal aborts when the user cancels the
 // call, and then nothing is moved, not even on a later "yes".
 async function requestHandover({ tabIds, reason, confirmed }, extra) {
-  const ids = [...new Set(tabIds)];
+  let ids = [...new Set(tabIds)];
   const signal = extra?.signal;
   const cancelled = () => ({ ...textResult("Cancelled; the tabs weren't moved."), isError: true });
 
@@ -743,7 +747,9 @@ async function requestHandover({ tabIds, reason, confirmed }, extra) {
     // The first line is JSON, unless there are no tabs at all (no group,
     // nothing shared): then nothing is shared either.
     const firstLine = context.content[0].text.split("\n")[0];
-    const { availableTabs = [] } = firstLine.startsWith("{") ? JSON.parse(firstLine) : {};
+    const { availableTabs = [], reopened = {} } = firstLine.startsWith("{") ? JSON.parse(firstLine) : {};
+    // A tab another add-on reopened goes by its new id (see the extension).
+    ids = [...new Set(ids.map((id) => reopened[id] ?? id))];
     const shared = availableTabs.filter((t) => t.sharedByUser);
     const notShared = ids.filter((id) => !shared.some((t) => t.tabId === id));
     if (notShared.length) {
@@ -876,19 +882,34 @@ async function readUpload(file, limit, agreed) {
   if ((await fs.promises.lstat(file)).isSymbolicLink()) throw new Error(`${file} was replaced by a link.`);
   const handle = await fs.promises.open(file, "r");
   try {
-    const stat = await handle.stat();
+    // (bigint: an NTFS file id doesn't fit in a plain number.)
+    const stat = await handle.stat({ bigint: true });
     if (!stat.isFile()) throw new Error(`${file} isn't a file anymore.`);
     if (stat.dev !== agreed.dev || stat.ino !== agreed.ino) throw new Error(`${file} was replaced by another file.`);
-    if (stat.size > limit) throw new Error(`${file} has grown past the upload limit.`);
-    const buffer = Buffer.alloc(stat.size);
-    const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
+    const size = Number(stat.size);
+    if (size > limit) throw new Error(`${file} has grown past the upload limit.`);
+    const buffer = Buffer.alloc(size);
+    const { bytesRead } = await handle.read(buffer, 0, size, 0);
     return buffer.subarray(0, bytesRead);
   } finally {
     await handle.close();
   }
 }
 
-async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
+// Dialogs the page showed are reported after the file input check's answer
+// (see addNote in the extension): they go with whatever the call ends with.
+async function requestFileUpload(args, extra) {
+  const seen = { dialogs: "" };
+  const result = await askToUpload(args, extra, seen);
+  if (!seen.dialogs || !Array.isArray(result?.content)) return result;
+  const last = result.content.at(-1);
+  const content = last?.type === "text"
+    ? [...result.content.slice(0, -1), { ...last, text: `${last.text.replace(/\n+$/, "")}\n\n${seen.dialogs}` }]
+    : [...result.content, { type: "text", text: seen.dialogs }];
+  return { ...result, content };
+}
+
+async function askToUpload({ paths, ref, tabId, confirmed }, extra, seen) {
   const signal = extra?.signal;
   const failed = (text) => ({ ...textResult(`Error: ${text}`), isError: true });
   // What's shown to the user and read is where a path really leads: not a
@@ -904,7 +925,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
     try {
       file = await fs.promises.realpath(given);
       if (isNetworkPath(file)) return failed(`${given} leads to a network share; only files on this computer can be uploaded.`);
-      stat = await fs.promises.stat(file);
+      stat = await fs.promises.stat(file, { bigint: true });
     } catch {
       return failed(`${given} doesn't exist, or can't be read.`);
     }
@@ -912,7 +933,7 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
     if (files.includes(file)) continue;
     files.push(file);
     stats.set(file, stat);
-    total += stat.size;
+    total += Number(stat.size);
   }
   if (total > UPLOAD_MAX_BYTES) {
     return failed(`The files come to ${Math.ceil(total / 1048576)} MB; at most ${UPLOAD_MAX_BYTES / 1048576} MB go in one call.`);
@@ -925,16 +946,20 @@ async function requestFileUpload({ paths, ref, tabId, confirmed }, extra) {
   if (checked.isError) return checked;
   // Without that answer the user can't be told where the files would go.
   let frameOrigin = null;
+  let checkedTab = tabId; // the tab the check ran in: another, if this one was reopened
+  const [answerLine, ...after] = (checked.content?.[0]?.text || "{}").split("\n");
+  seen.dialogs = after.join("\n").trim();
   try {
-    const answer = JSON.parse(checked.content?.[0]?.text || "{}");
+    const answer = JSON.parse(answerLine);
     if (answer.ok !== true) throw new Error();
     frameOrigin = answer.origin || null;
+    if (Number.isInteger(answer.tabId)) checkedTab = answer.tabId;
   } catch {
     return failed("The file input couldn't be checked; nothing was uploaded. Try again.");
   }
 
-  const tab = await describeTab(tabId, signal);
-  let page = tab ? namePage(tab) : `tab ${tabId}`;
+  const tab = await describeTab(checkedTab, signal);
+  let page = tab ? namePage(tab) : `tab ${checkedTab}`;
   let tabOrigin = null;
   try {
     tabOrigin = tab && new URL(tab.url).origin;
@@ -1411,7 +1436,7 @@ server.tool(
   "Read what the extension actually did, as one timestamped list: tool calls with their arguments (what was typed is left out), how long they took, where each click, hover and scroll went (which element, which frame), how screenshots were taken, and pages that didn't answer. It holds what results leave out, so use it to check an action had the effect you meant, or to see where time went. It says how far back it reaches and how much was dropped.",
   {
     limit: z.number().optional().describe("How many of the latest matching events to show (default 100, at most 1000)."),
-    kind: z.enum(["tool", "input", "screenshot", "page"]).optional().describe('Only this kind: "tool" (calls and their outcome), "input" (where clicks, keys and scrolls went), "screenshot" (how one was taken), "page" (frames and pages that didn\'t answer).'),
+    kind: z.enum(["tool", "input", "screenshot", "page", "tab"]).optional().describe('Only this kind: "tool" (calls and their outcome), "input" (where clicks, keys and scrolls went), "screenshot" (how one was taken), "page" (frames and pages that didn\'t answer), "tab" (tabs another add-on reopened under a new ID).'),
     filter: z.string().optional().describe("Only events containing this text."),
     tabId: z.number().optional().describe("Only events for this tab."),
     since_ms: z.number().optional().describe("Only events from the last this many milliseconds, e.g. 5000 for what the last action did."),

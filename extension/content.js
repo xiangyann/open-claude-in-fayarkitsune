@@ -1228,14 +1228,21 @@
   // less the margin), and it stops before pressing anything once that's too
   // late, or once Claude no longer has this tab (its glow was removed).
   let releasedAt = 0;
-  class InputStopped extends Error {}
+  // `released`: Claude no longer has the tab (otherwise it ran out of time).
+  class InputStopped extends Error {
+    constructor(released = false) {
+      super(released ? "released" : "expired");
+      this.released = released;
+    }
+  }
   function timeFor(msg) {
     return typeof msg?.deadline === "number" ? msg.deadline - CONTENT_DEADLINE_MARGIN_MS - Date.now() : Infinity;
   }
   function goOn(msg, since, needs = 0) {
-    if (releasedAt >= since || timeFor(msg) < needs) throw new InputStopped();
+    if (releasedAt >= since) throw new InputStopped(true);
+    if (timeFor(msg) < needs) throw new InputStopped();
   }
-  const failure = (e) => (e instanceof InputStopped ? { error: "expired" } : { error: `${e?.name || "Error"}: ${e?.message || e}` });
+  const failure = (e) => (e instanceof InputStopped ? { error: e.message } : { error: `${e?.name || "Error"}: ${e?.message || e}` });
 
   // `within`: how long the way there may take at most; `since`: when the
   // action began (it stops if the tab was lost since).
@@ -1259,7 +1266,7 @@
     const start = performance.now();
     for (let s = 0; s < 1; ) {
       await sleep(16);
-      if (releasedAt >= since) throw new InputStopped();
+      if (releasedAt >= since) throw new InputStopped(true);
       s = duration ? Math.min(1, (performance.now() - start) / duration) : 1;
       const t = s < 0.5 ? 2 * s * s : 1 - (2 - 2 * s) ** 2 / 2;
       const u = 1 - t;
@@ -1585,29 +1592,33 @@
           mouseAt = { x, y };
         }
         const newTab = watchForNewTabLink();
-        for (let press = 1; press <= presses; press++) {
-          const init = mouseInit(x, y, modifiers, { button: btn, detail: press });
-          const pressed = pressMouse(target, { ...init, buttons: btns });
-          // A page that cancels mousedown (an editor's toolbar button) keeps
-          // the focus and the selection as they were, as with a real click.
-          if (pressed && press === 1) focusForClick(target);
-          if (pressed && btn === 0) {
-            try {
-              selectForClick(target, x, y, press);
-            } catch {
-              // Only a detail of the click: not on every kind of element.
+        let url;
+        try {
+          for (let press = 1; press <= presses; press++) {
+            const init = mouseInit(x, y, modifiers, { button: btn, detail: press });
+            const pressed = pressMouse(target, { ...init, buttons: btns });
+            // A page that cancels mousedown (an editor's toolbar button) keeps
+            // the focus and the selection as they were, as with a real click.
+            if (pressed && press === 1) focusForClick(target);
+            if (pressed && btn === 0) {
+              try {
+                selectForClick(target, x, y, press);
+              } catch {
+                // Only a detail of the click: not on every kind of element.
+              }
             }
+            if (speed) await humanPause(speed, 50, 110);
+            releaseMouse(target, init);
+            if (btn === 0) target.dispatchEvent(new MouseEvent("click", init));
+            if (speed && press < presses) await humanPause(speed, 60, 130);
           }
-          if (speed) await humanPause(speed, 50, 110);
-          releaseMouse(target, init);
-          if (btn === 0) target.dispatchEvent(new MouseEvent("click", init));
-          if (speed && press < presses) await humanPause(speed, 60, 130);
+          const init = mouseInit(x, y, modifiers, { button: btn });
+          if (presses >= 2) target.dispatchEvent(new MouseEvent("dblclick", { ...init, detail: 2 }));
+          if (btn === 2) target.dispatchEvent(new MouseEvent("contextmenu", init));
+          if (btn === 1) target.dispatchEvent(new MouseEvent("auxclick", { ...init, detail: 1 }));
+        } finally {
+          url = newTab.stop();
         }
-        const init = mouseInit(x, y, modifiers, { button: btn });
-        if (presses >= 2) target.dispatchEvent(new MouseEvent("dblclick", { ...init, detail: 2 }));
-        if (btn === 2) target.dispatchEvent(new MouseEvent("contextmenu", init));
-        if (btn === 1) target.dispatchEvent(new MouseEvent("auxclick", { ...init, detail: 1 }));
-        const url = newTab.stop();
         // Nothing under the point but the page itself: likely not what was
         // meant, though the page did get a click.
         const missed = target === document.documentElement || target === document.body;

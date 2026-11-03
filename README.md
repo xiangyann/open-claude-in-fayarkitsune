@@ -243,6 +243,8 @@ After a Firefox restart, the group comes back with a new ID, so the extension fi
 
 While Claude works in a tab, the page has a pulsing orange border, a "Claude is using this tab" label, and an orange pointer where Claude's mouse last clicked, hovered or dragged. All three are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
 
+**Container add-ons.** Facebook Container moves a site into or out of its container by opening it in a new tab and closing the old one, so the tab gets a new ID. The extension follows it: the new tab takes the old one's place (in Claude's group, or shared if the old one was) and its settings, and a tool call that names the old tab ID runs in the new tab and tells Claude the new ID. It only counts as the same tab if the new one opens the address the old one was loading, in the same window but in another container, within 3 seconds of the old one closing; a tab you open yourself, or bring back with **Reopen Closed Tab**, doesn't count. Other container add-ons are followed when they reopen a page the same way. The new tab is in that add-on's container, with the logins kept there: Facebook Container's, for a Meta site.
+
 ### Sharing your own tabs
 
 Claude can also work in tabs you're already using, for example a site you're logged in to, but only the ones you share:
@@ -351,7 +353,7 @@ Console messages, uncaught errors and unhandled promise rejections are captured 
 
 If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, up to three times, and not to an extension older than 2.1.0, which can't tell whether it already ran it). A call sent again only gets the time left of its original 60 seconds. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
 
-If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back, and so does the end of a Claude session that quits with a call still running. A call sent again with less than a few seconds left isn't run at all.
+If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back. A Claude session that quits with a call still running stops it too, or, if the extension wasn't connected just then, the extension stops it itself 10 seconds after the connection dropped. A call sent again with less than a few seconds left isn't run at all.
 
 The extension updates itself, but waits until no tool is running, so an update doesn't cut an action short. A tool that runs into the 60-second limit (a page busy with a script, a very long text to type) stops a little before, says how far it got, and doesn't act on the page afterwards.
 
