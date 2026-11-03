@@ -20,7 +20,7 @@
 
 ---
 
-This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension, forked from [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox). It gives Claude Code (and Claude Desktop) full browser automation via 23 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
+This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome), a clean-room reimplementation of Anthropic's [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension, forked from [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox). It gives Claude Code (and Claude Desktop) full browser automation via 28 MCP tools, without any domain restrictions, running in Firefox instead of Chromium.
 
 ## What's Different
 
@@ -29,7 +29,7 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser** | Chrome and Edge only | Firefox |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | 18 MCP tools | The same 18, plus 5: closing tabs, sharing your own tabs, handing them over and back, and answering page dialogs |
+| **Tools** | Its MCP tools | Most of the same (a few aren't possible in Firefox), plus: showing you a tab, sharing your own tabs, handing them over and back, answering page dialogs, a log of what the extension did, and settings such as human-like input |
 | **Automation method** | Chrome DevTools Protocol (CDP) | Firefox WebExtension APIs |
 
 ### Blocked Domains in the Official Extension
@@ -57,7 +57,7 @@ Claude Code / Claude Desktop <--stdio MCP--> mcp-server.js <--WebSocket 127.0.0.
 ```
 
 Two components:
-1. **Extension** — Manifest V3 using Firefox WebExtension APIs (screenshots via `captureVisibleTab`, input via content script synthetic events, JS eval via `scripting.executeScript`). Connects to the MCP server over a localhost WebSocket.
+1. **Extension** — Manifest V3 using Firefox WebExtension APIs (screenshots via `tabs.captureTab`, input via content script synthetic events, JS eval via `scripting.executeScript`). Connects to the MCP server over a localhost WebSocket.
 2. **MCP Server** — Node.js process started by Claude Code or Claude Desktop, exposes tools via MCP. Only accepts WebSocket connections from `moz-extension://` origins, so web pages can't drive it.
 
 No native messaging host, registry keys or install script: the extension finds the server by its fixed port.
@@ -92,8 +92,10 @@ From 2.0.0 on, Firefox keeps the extension up to date by itself: it checks this 
 #### Claude Desktop (`.mcpb`)
 
 1. Download the `.mcpb` from the [latest release](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/latest).
-2. In Claude Desktop, click your profile in the bottom-left corner → **Settings** → **Extensions**.
+2. In Claude Desktop, click your profile in the bottom-left corner → **Settings** → **Desktop app**, and scroll down to **Extensions**.
 3. Drag the `.mcpb` file onto the drop area there and confirm the install.
+
+Claude Desktop updates the bundle in place when the new one has a higher version. If it doesn't offer to, remove the installed one under **Extensions** first, then install the new one.
 
 Double-clicking the file usually doesn't work, because Claude Desktop often doesn't register the `.mcpb` file type. The bundle carries its own dependencies and runs on Claude Desktop's built-in Node.js, so nothing else needs installing.
 
@@ -146,7 +148,7 @@ npm install
 npx @anthropic-ai/mcpb pack . ../open-claude-in-fayarkitsune.mcpb
 ```
 
-This writes `open-claude-in-fayarkitsune.mcpb` to the repo root. Install it like the release file: Claude Desktop → your profile in the bottom-left corner → **Settings** → **Extensions**, then drag the file onto the drop area.
+This writes `open-claude-in-fayarkitsune.mcpb` to the repo root. Install it like the release file: Claude Desktop → your profile in the bottom-left corner → **Settings** → **Desktop app** → **Extensions** (near the bottom), then drag the file onto the drop area.
 
 #### Claude Code
 
@@ -171,7 +173,7 @@ That's it. The extension connects to the server on its own whenever Claude is ru
 
 ### Upgrading to 2.0.0
 
-- **From 1.x:** install the 2.0.0 `.xpi` over it, and the 2.0.0 `.mcpb` in Claude Desktop: remove the old one under **Extensions** first if it doesn't offer to update. From now on the extension updates itself; see [From Releases](#1-from-releases).
+- **From 1.x:** install the 2.0.0 `.xpi` over it, and the 2.0.0 `.mcpb` in Claude Desktop: remove the old one under **Settings** → **Desktop app** → **Extensions** first if it doesn't offer to update. From now on the extension updates itself; see [From Releases](#1-from-releases).
 - **Custom port:** the config file moved from `~/.config/open-claude-in-firefox/config.json` to `~/.config/open-claude-in-fayarkitsune/config.json`. Move yours if you changed the port.
 - **The original open-claude-in-firefox 1.0.0 extension isn't supported anymore.** Its native messaging host was the last way 1.0.0 could reach the server, and 2.0.0 refuses it. If you need it, stay on the [1.2.x releases](https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/tag/v1.2.0) (branch `release/1.x`). The section below covers switching away from it.
 
@@ -197,29 +199,33 @@ Reddit loads. No domain restriction.
 
 ## Available Tools
 
-The Claude in Chrome tools, plus a few for tabs you share and page dialogs:
+The Claude in Chrome tools, plus some for tabs you share, page dialogs, debugging and settings:
 
 | Tool | Description |
 |------|-------------|
 | `tabs_context_mcp` | List Claude's tab group and the tabs you shared |
 | `tabs_create_mcp` | Create a new tab in Claude's tab group |
-| `tabs_close_mcp` | Close a tab in Claude's tab group, or a tab you shared |
+| `tabs_close_mcp` | Close tabs in Claude's tab group, or tabs you shared: one, or several at once (`tabIds`) |
+| `set_tab_focus` | Show you a tab: select it in its window, and with `focus_window`, bring that window to the front |
 | `tabs_request_access` | Ask you to share some of your own tabs |
 | `tabs_request_handover` | Ask you to move shared tabs into Claude's window |
 | `tabs_release` | Give a shared tab back |
-| `navigate` | Navigate to URL, back, forward |
-| `computer` | Mouse, keyboard, screenshots (13 actions) |
-| `read_page` | Accessibility tree with element refs, frames included |
+| `navigate` | Navigate to URL, back, forward. With `wait: "networkidle"`, it also waits until the page has stopped making requests (up to 15 s more) |
+| `computer` | Mouse, keyboard, screenshots (13 actions). See [Screenshots](#screenshots) for `if_changed` and `save_to_disk` |
+| `read_page` | Accessibility tree with element refs, frames included. With `delta: true`, only what changed since the same read of that tab |
 | `get_page_text` | Extract article/main text, frames included |
 | `find` | Find elements by words from their text, label, role or type |
 | `form_input` | Set form values by ref |
+| `upload_image` | Put a screenshot into a file input, or drop it on the page at a point (see [Uploading files](#uploading-files)) |
+| `file_upload` | Upload files from your computer to a file input, once you agree |
 | `javascript_tool` | Execute JS in page context (top-level `await` and `return` work; credentials are hidden from results) |
 | `handle_dialog` | Choose the answer to the page's next `confirm()` or `prompt()` |
 | `read_console_messages` | Console output, uncaught errors and promise rejections (filtered) |
 | `read_network_requests` | Network activity |
 | `resize_window` | Resize browser window |
+| `debug` | What the extension did, step by step (see [Debug log](#debug-log)) |
+| `get_config`, `set_config` | Read and change the extension's settings (see [Settings](#settings)) |
 | `update_plan` | Notes Claude's plan (nothing is shown to you, and there's nothing to approve) |
-| `upload_image` | Not available: Firefox WebExtensions can't put a file into a page |
 | `gif_creator` | Not available |
 | `shortcuts_list` | Not available |
 | `shortcuts_execute` | Not available |
@@ -235,7 +241,7 @@ Claude works in a tab group named **Claude** (orange), which it opens in a windo
 
 After a Firefox restart, the group comes back with a new ID, so the extension finds it again by its name and color. That's also the rule for which tabs are Claude's: a tab you drag into an orange group named "Claude" becomes Claude's, and one you drag out of it isn't anymore. Rename or recolor the group and it's yours, tabs included, until it's an orange "Claude" again. The 1.1.x MCP window isn't reused (after a Firefox restart its saved ID could point at one of your windows): it stays an ordinary window, and Claude starts a new group.
 
-While Claude works in a tab, the page has a pulsing orange border and a "Claude is using this tab" label. Both are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
+While Claude works in a tab, the page has a pulsing orange border, a "Claude is using this tab" label, and an orange pointer where Claude's mouse last clicked, hovered or dragged. All three are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
 
 ### Sharing your own tabs
 
@@ -246,7 +252,7 @@ Claude can also work in tabs you're already using, for example a site you're log
 
 Shared tabs stay where they are, and Claude has full control of them, including closing them with `tabs_close_mcp`. The one exception is `resize_window`: it would resize your whole window, including tabs you didn't share. For the same reason, Claude doesn't resize its own window either if you've moved its group into one of your windows. Claude gives a tab back with `tabs_release`. Sharing ends when you close the tab, restart Firefox, or reload or update the extension. Network requests are only recorded in tabs Claude can use, from the moment it can: `read_network_requests` in a tab you just shared doesn't show what it loaded before. A link Claude opens in a new tab from a shared tab is shared too: it's a page Claude could already reach by navigating the shared tab there.
 
-**Handing a tab over.** Working in a shared tab means switching your window to it for each screenshot, and its window can't be resized. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**.
+**Handing a tab over.** A shared tab stays in your window, so Claude can't resize that window, and you may be using the tab while Claude works in it. When Claude needs a tab to itself, `tabs_request_handover` asks you in Claude Code's or Claude Desktop's own prompt (MCP elicitation, so the answer comes from you, not the model). If you agree, the tab moves into Claude's window and its "Claude" group; with no Claude window open, it gets a new one. In an app that can't show that prompt, Claude asks you in the conversation. You can also hand a tab over yourself: right-click it → **Move Tab to Claude's Window**.
 
 **The tab menu, both ways.** Each item does one thing:
 
@@ -278,13 +284,56 @@ Firefox WebExtensions cannot use the Chrome DevTools Protocol. Mouse clicks, key
 - Most web apps work fine — synthetic events are standard practice for testing frameworks. Clicks send the pointer events too, and the mouse "arrives" at an element (`mouseover`, `mouseenter`) the way a real one does. A drag of an element with `draggable="true"` is a browser drag (`dragstart` … `drop`).
 - What the browser would do for a click or a key is done by the extension: a click puts the caret where it lands, double and triple clicks select a word or a line (or the whole field), and `ctrl+a`, Enter (in a form, it submits it), Tab, Backspace, Delete, the arrow keys, Home, End, Page Up/Down and Space do what they do in Firefox. Keys that only Firefox itself acts on, like copy and paste or its own shortcuts, reach the page's handlers and nothing else; the result says so.
 - CSS `:hover` styles don't change: only the real mouse sets them.
+- A click that lands on nothing but the page itself (`<html>` or `<body>`, around the content) usually does nothing, so its result says so, and Claude can look again.
 - A small number of hardened apps check `event.isTrusted` and ignore synthetic events; those interactions will fail silently
 
 Pages in frames (`<iframe>`) are reached too: a click or a scroll at a point inside a frame goes to the frame's own page, keys go to the frame Claude last clicked in, and `read_page`, `find` and `get_page_text` include the frames shown on the page.
 
+### Human-like input
+
+By default, Claude's mouse goes straight to where it acts, and text is typed in one go. With the `humanize` setting on, the mouse travels there along a curve at a human pace, slowing down near the end and pausing before it presses, and keys come with a typing rhythm. Clicks, hovers, scrolls, drags and typing all work this way; you can watch the orange pointer move. `humanize_speed` makes it `fast`, `natural` (the default) or `relaxed`.
+
+Ask Claude for "human input" or "human behaviour", or to act like a person, and it turns `humanize` on (with `set_config`, see [Settings](#settings)) and does the task with the mouse and keyboard instead of setting values directly. It's slower, and meant for sites that tell scripted input apart by its timing. The events are still synthetic (`isTrusted: false`), so a site that checks that still ignores them.
+
+It also works in tabs you aren't looking at. Firefox runs the timers of a page in a background tab only about once a second, so there the extension times the moves itself instead of using the page's timers.
+
+### Uploading files
+
+- **`upload_image`** puts a screenshot Claude took into a file input, given by ref, or drops it on the page at a point, like a file dragged in from the desktop.
+- **`file_upload`** uploads files from your computer, by path, to a file input. Claude Code or Claude Desktop first asks you in its own prompt (MCP elicitation), listing the files and the page; in an app that can't show that prompt, Claude asks you in the conversation. At most 10 MB go in one call, and a target that isn't a file input is refused before you're asked.
+
+The page can send what's uploaded anywhere, like a file you upload yourself. File inputs are often hidden behind a styled button: `read_page` and `find` list them anyway, marked `hidden`, so Claude can use their ref. Claude doesn't need to click one, which would open Firefox's file picker.
+
 ### Screenshots
 
-`tabs.captureVisibleTab()` can only capture the active tab in a window. The extension automatically activates the target tab before each screenshot. A screenshot's pixels are the page's CSS pixels, on a zoomed page too. A viewport larger than what Claude's API takes in (about 1568 pixels across, or 1.15 megapixels) is captured smaller, and the coordinates Claude reads off that picture are scaled back when it clicks: the screenshot's result says when that's the case. If Claude's window is in the background, the tab switch is invisible since Firefox doesn't require the window to be focused. In a tab you shared, the switch happens in your window.
+Screenshots use `tabs.captureTab()`, which draws a tab even while its window shows another one, so taking one doesn't switch the tab you're looking at in your own windows, including the tab you shared. There's one exception: a tab that hasn't been shown since it loaded has no size to draw at yet, such as a link Claude opened in a new background tab. For that one, the extension makes it the active tab in its window, which can be your window for a tab you shared, and captures the window instead.
+
+In Claude's own window, the tab Claude works in is made the selected one anyway. Firefox slows down the pages of tabs that aren't shown (their timers and animations), and a screenshot would catch them half done. That doesn't happen if you've moved Claude's group into one of your windows.
+
+A screenshot's pixels are the page's CSS pixels, on a zoomed page too. A viewport larger than what Claude's API takes in (about 1568 pixels across, or 1.15 megapixels) is captured smaller, and the coordinates Claude reads off that picture are scaled back when it clicks: the screenshot's result says when that's the case.
+
+- **`if_changed`:** a screenshot identical to the last one of that tab comes back as "Unchanged", without the image, which saves room in Claude's context.
+- **`save_to_disk`:** screenshots and zooms are also saved, as `.jpg` files in `~/.config/open-claude-in-fayarkitsune/screenshots/`, on the computer that runs the MCP server. The folder isn't emptied automatically.
+
+### Settings
+
+`get_config` lists the extension's settings and what each one does, and `set_config` changes one, either for every tab or for one tab:
+
+- **For every tab:** kept until changed, also across restarts.
+- **For one tab:** until the tab closes, Firefox restarts or the extension updates.
+
+There are two so far: `humanize` and `humanize_speed` (see [Human-like input](#human-like-input)).
+
+### Debug log
+
+`debug` reads a list of what the extension did:
+
+- each tool call, with its arguments and how long it took
+- which element each click, hover and scroll reached, and in which frame
+- how each screenshot was taken
+- pages that didn't answer
+
+Claude can use it to check that an action did what it meant, or to see where time went. The list keeps the last 2,000 events, of which one call returns up to 1,000, and starts over when the extension restarts. Text Claude typed, form values, answers to dialog prompts and uploaded files are left out.
 
 ### Clicking by ref
 
@@ -374,7 +423,7 @@ The MCP server is running but the extension hasn't connected. The extension retr
 
 ### Tools fail immediately after reconnect
 
-Stale MCP server processes from previous sessions may be holding the port:
+Stale MCP server processes from previous sessions may be holding the port. From 2.0.1 on, a server also exits by itself within 30 seconds once the process that started it is gone, even if its input stays open (which can happen on Windows). Claude Desktop and `claude mcp add … -- node …` start it directly; a launcher in between, such as `npx` or `cmd /c`, can outlive Claude and keep it running. Older servers may not, so check for them:
 
 ```bash
 pkill -f "node.*mcp-server"
