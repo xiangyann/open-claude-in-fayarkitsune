@@ -11,6 +11,16 @@
               "strict_min_version": "153.0"
             }
           }
+        },
+        {
+          "version": "2.1.0",
+          "update_link": "https://github.com/xiangyann/open-claude-in-fayarkitsune/releases/download/v2.1.0/claude-mcp-in-fayar-kitsune-2.1.0.xpi",
+          "update_hash": "sha256:3134f1bd5eb8413ca7b07506177244e572aa21832f85217a310044763586af36",
+          "applications": {
+            "gecko": {
+              "strict_min_version": "153.0"
+            }
+          }
         }
       ]
     }
