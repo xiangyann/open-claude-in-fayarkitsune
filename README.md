@@ -50,6 +50,28 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 
 Claude MCP in Fayar kitsune has **none of these restrictions**.
 
+### Compared with the original Open Claude in Firefox
+
+This project started as a fork of [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox) 1.0.0. Since then:
+
+| | Open Claude in Firefox 1.0.0 | Claude MCP in Fayar kitsune 2.1 |
+|---|---|---|
+| **Setup** | A native messaging host: run `install.sh`, or on Windows write a wrapper script, a JSON manifest and a registry key, then restart Firefox | Nothing to register: the extension connects to the MCP server on a fixed local port. Claude Desktop installs the server from one `.mcpb` file |
+| **Releases** | Installed from the source folder, or an `.xpi` where one is provided | Signed releases that Firefox updates by itself |
+| **Claude's tabs** | A separate MCP window | A **Claude** tab group, in a window of its own; tabs Claude's pages open join it |
+| **Your own tabs** | Only tabs in the MCP window | Share the tabs you choose, take them back, or hand them over to Claude's window; the rest stay off limits |
+| **Tools** | 18 (`upload_image` was a placeholder) | 28: also closing and showing tabs, sharing and handover, page dialogs, uploading files you approve, a debug log and settings |
+| **Screenshots** | Switch to the tab first | Background tabs without switching, sized so click coordinates match on HiDPI screens and zoomed pages |
+| **Firefox** | 109 or later | 153 or later |
+
+Also new:
+- **Page dialogs:** an `alert()`, `confirm()` or `prompt()` is answered and reported to Claude, instead of leaving the page frozen.
+- **Human-like input** if you want it: a curved mouse path at a human pace, and a typing rhythm.
+- **Interrupted calls:** a call sent again after a reconnect isn't run twice, and calls stop at their deadline, when you cancel them, or when their Claude session quits.
+- **Privacy:** tokens, passwords and session values are hidden from what Claude gets back, and file uploads need your yes in Claude's own prompt.
+- **More options:** `upload_image` works, a screenshot can skip an unchanged image, `read_page` can return only what changed, and `navigate` can wait for the page to stop loading data.
+- **Container add-ons:** a tab Facebook Container reopens in its container stays Claude's tab.
+
 ## Architecture
 
 ```

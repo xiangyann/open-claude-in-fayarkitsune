@@ -587,6 +587,7 @@ function noteClosed(tabId, { windowId, isWindowClosing }) {
   const kind = ownTabs.has(tabId) ? "own" : sharedTabs.has(tabId) ? "shared" : null;
   const loads = new Map(recentLoads(tabId).map((load) => [load.url, load.store]));
   pageLoads.delete(tabId);
+  justOpened.delete(tabId); // no longer a tab that may be another one reopened
   closedTabs.add(tabId);
   setTimeout(() => closedTabs.delete(tabId), CLOSED_KEPT_MS);
   if (!kind || isWindowClosing) return;
@@ -608,7 +609,16 @@ function matchReopened() {
       for (const [id, entry] of reopenedTabs) {
         if (Date.now() - entry.at > REOPENED_KEPT_MS) reopenedTabs.delete(id);
       }
-      reopenedTabs.set(oldId, { tabId: newId, at: Date.now(), ready: takeOver(oldId, newId, closed) });
+      const ready = takeOver(oldId, newId, closed);
+      // Ids the old tab had before lead straight to the new one (with its
+      // takeover to wait for too), however often it's reopened.
+      for (const entry of reopenedTabs.values()) {
+        if (entry.tabId !== oldId) continue;
+        entry.tabId = newId;
+        entry.at = Date.now();
+        entry.ready = Promise.all([entry.ready, ready]);
+      }
+      reopenedTabs.set(oldId, { tabId: newId, at: Date.now(), ready });
       settleReopen(oldId, newId);
       break;
     }
@@ -1165,9 +1175,20 @@ async function startPageWork(tabId, kind, request) {
     const now = await tabControl(tabId);
     // Closed meanwhile, maybe by what the tool did (a click on a popup's
     // close button): the result stands, with a word about it.
+    // Or reopened by another add-on: then the new tab is the one to ask
+    // about, as here.
     if (!now.tab) {
       const reopened = await reopenedAs(tabId, request.deadline);
-      if (result?.content) addNote(result, reopened === null ? `Tab ${tabId} has closed.` : reopenedNote(tabId, reopened));
+      if (reopened === null) {
+        if (result?.content) addNote(result, `Tab ${tabId} has closed.`);
+        return result;
+      }
+      if (!(await tabControl(reopened)).kind) {
+        return result && errorResult(
+          `Tab ${tabId} was reopened as tab ${reopened} by another add-on, and the user took that tab back while this was running. It may have been done, but what it found there isn't shown. Use tabs_context_mcp to see the tabs you can use.`
+        );
+      }
+      if (result?.content) addNote(result, reopenedNote(tabId, reopened));
       return result;
     }
     if (!now.kind) {
@@ -1466,7 +1487,9 @@ const toolHandlers = {
   // once the user agreed (tabs_request_handover asks them in Claude's own
   // prompt); a shared tab is fully Claude's to use anyway.
   async tabs_handover(args) {
-    const ids = [...new Set((args.tabIds || []).map(Number))];
+    // (A tab reopened by another add-on while the user was asked goes by its
+    // new id.)
+    const ids = [...new Set(await Promise.all((args.tabIds || []).map((id) => currentTabId(Number(id)))))];
     const notShared = ids.filter((id) => !sharedTabs.has(id));
     if (!ids.length || notShared.length) {
       return errorResult(
@@ -2689,12 +2712,19 @@ function cancelRequest(id) {
 }
 
 async function runTool(tool, handler, args, request) {
-  if (!TAB_TOOLS.has(tool) || typeof args.tabId !== "number") return runInTab(tool, handler, args, request);
+  // (The settings can be for one tab too.)
+  const namesTab = TAB_TOOLS.has(tool) || tool === "get_config" || tool === "set_config";
+  if (!namesTab || typeof args.tabId !== "number") return runInTab(tool, handler, args, request);
   // A tab another add-on reopened goes by its new id, also one that's being
   // reopened just now (closed, and the new one not matched with it yet).
   let tabId = await currentTabId(args.tabId);
   const reopening = await reopenedAs(tabId, request.deadline);
   if (reopening !== null) tabId = await currentTabId(reopening);
+  // That can take a moment: a call cancelled or out of time meanwhile isn't
+  // started.
+  if (request.cancelled || Date.now() >= request.deadline) {
+    return errorResult(`Error: ${request.cancelled ? "the call was cancelled" : "the call ran out of time"}, so this wasn't done.`);
+  }
   let result;
   try {
     result = await runInTab(tool, handler, { ...args, tabId }, request);
@@ -2869,7 +2899,9 @@ function answerFromJournal(id, tool, args, seen) {
   } else if (seen.error) {
     sendError(id, seen.error);
   } else if (seen.result) {
-    sendResponse(id, seen.result);
+    // Redacted already, when it was kept (see keptOutcome). Not again: read
+    // back from storage, the tab list's checked JSON would be taken as text.
+    postToServer({ id, type: "tool_response", result: seen.result });
   } else {
     sendResponse(id, textResult(`This ${what} already ran before the connection to Claude dropped, so it wasn't run again. Its result wasn't kept; check the page for it.`));
   }
