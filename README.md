@@ -50,6 +50,28 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 
 Claude MCP in Fayar kitsune has **none of these restrictions**.
 
+### Compared with the original Open Claude in Firefox
+
+This project started as a fork of [beto621/open-claude-in-firefox](https://github.com/beto621/open-claude-in-firefox) 1.0.0. Since then:
+
+| | Open Claude in Firefox 1.0.0 | Claude MCP in Fayar kitsune 2.1 |
+|---|---|---|
+| **Setup** | A native messaging host: run `install.sh`, or on Windows write a wrapper script, a JSON manifest and a registry key, then restart Firefox | Nothing to register: the extension connects to the MCP server on a fixed local port. Claude Desktop installs the server from one `.mcpb` file |
+| **Releases** | Installed from the source folder, or an `.xpi` where one is provided | Signed releases that Firefox updates by itself |
+| **Claude's tabs** | A separate MCP window | A **Claude** tab group, in a window of its own; tabs Claude's pages open join it |
+| **Your own tabs** | Only tabs in the MCP window | Share the tabs you choose, take them back, or hand them over to Claude's window; the rest stay off limits |
+| **Tools** | 18, five of them placeholders (`upload_image`, `gif_creator`, the two shortcut tools, `switch_browser`) | 28: also closing and showing tabs, sharing and handover, page dialogs, uploading files you approve, a debug log and settings. `upload_image` works; the other four are still placeholders |
+| **Screenshots** | Switch to the tab first | Background tabs without switching, sized so click coordinates match on HiDPI screens and zoomed pages |
+| **Firefox** | 109 or later | 153 or later |
+
+Also new:
+- **Page dialogs:** an `alert()`, `confirm()` or `prompt()` is answered and reported to Claude, instead of leaving the page frozen.
+- **Human-like input** if you want it: a curved mouse path at a human pace, and a typing rhythm.
+- **Interrupted calls:** a call sent again after a reconnect isn't run twice, and calls stop at their deadline, when you cancel them, or when their Claude session quits.
+- **Privacy:** tokens, passwords and session values are hidden from what Claude gets back, as far as they can be recognized, and file uploads need your yes, in Claude's own prompt (or in the conversation, in an app that can't show one).
+- **More options:** `upload_image` works, a screenshot can skip an unchanged image, `read_page` can return only what changed, and `navigate` can wait for the page to stop loading data.
+- **Container add-ons:** a tab Facebook Container reopens in its container stays Claude's tab.
+
 ## Architecture
 
 ```
@@ -243,6 +265,8 @@ After a Firefox restart, the group comes back with a new ID, so the extension fi
 
 While Claude works in a tab, the page has a pulsing orange border, a "Claude is using this tab" label, and an orange pointer where Claude's mouse last clicked, hovered or dragged. All three are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
 
+**Container add-ons.** Facebook Container moves a site into or out of its container by opening it in a new tab and closing the old one, so the tab gets a new ID. The extension follows it: the new tab takes the old one's place (in Claude's group, or shared if the old one was) and its settings, and a tool call that names the old tab ID runs in the new tab and tells Claude the new ID. It only counts as the same tab if the new one opens the address the old one was loading, in the same window but in another container, within 3 seconds of the old one closing; a tab you open yourself in the same container, or bring back with **Reopen Closed Tab**, doesn't count. Other container add-ons are followed when they reopen a page the same way. The new tab is in that add-on's container, with the logins kept there: Facebook Container's, for a Meta site.
+
 ### Sharing your own tabs
 
 Claude can also work in tabs you're already using, for example a site you're logged in to, but only the ones you share:
@@ -351,7 +375,7 @@ Console messages, uncaught errors and unhandled promise rejections are captured 
 
 If the connection between the extension and the MCP server drops while a tool is running, the server sends the call again if the extension is back within 5 seconds (only to the same Firefox profile, up to three times, and not to an extension older than 2.1.0, which can't tell whether it already ran it). A call sent again only gets the time left of its original 60 seconds. Calls that only read (screenshots, `read_page`, `find`, …) simply run again. Actions (clicks, typing, `javascript_tool`, navigating, …) aren't repeated: if the action had finished, Claude gets its result; if it was cut short, Claude is told that it may or may not have happened, to check the page, and to ask you when it can't tell.
 
-If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back, and so does the end of a Claude session that quits with a call still running. A call sent again with less than a few seconds left isn't run at all.
+If you cancel a tool call in Claude, the extension stops typing or pressing keys before the next one, and a tool that hasn't acted on the page yet doesn't; what was already done stays done. A cancel that comes while the extension is reconnecting reaches it when it's back. A Claude session that quits with a call still running stops it too, or, if the extension wasn't connected just then, the extension stops it itself 10 seconds after the connection dropped. A call sent again with less than a few seconds left isn't run at all.
 
 The extension updates itself, but waits until no tool is running, so an update doesn't cut an action short. A tool that runs into the 60-second limit (a page busy with a script, a very long text to type) stops a little before, says how far it got, and doesn't act on the page afterwards.
 

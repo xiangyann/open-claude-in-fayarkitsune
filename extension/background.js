@@ -147,12 +147,14 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
 
+// Whether it was sent (not whether it arrived).
 function postToServer(msg) {
-  if (!serverSocket || serverSocket.readyState !== WebSocket.OPEN) return;
+  if (!serverSocket || serverSocket.readyState !== WebSocket.OPEN) return false;
   try {
     serverSocket.send(JSON.stringify(msg));
+    return true;
   } catch {
-    // Socket closed
+    return false; // Socket closed
   }
 }
 
@@ -161,14 +163,29 @@ function postToServer(msg) {
 // show, a dialog's default text, … javascript_tool's results get more (see
 // formatJavascriptOutcome).
 function sendResponse(id, result) {
-  postToServer({ id, type: "tool_response", result: redactResult(result) });
+  return postToServer({ id, type: "tool_response", result: redactResult(result) });
 }
+
+// JSON in a result that was checked value by value already (the tab list:
+// see formatTabContext), wherever it is in its text: tabs_create_mcp and
+// tabs_close_mcp put a line before it. Checked as text, a quote in one tab's
+// title and one in another's could be taken for a quoted value and hidden,
+// with what's between them: one tab would get the other's URL and sharing.
+// (Kept by text item: the journal keeps a copy of the result with the same
+// items.)
+const checkedJson = new WeakMap(); // text item -> its checked JSON
 
 function redactResult(result) {
   if (!Array.isArray(result?.content)) return result;
   return {
     ...result,
-    content: result.content.map((item) => (item?.type === "text" ? { ...item, text: redactTokens(item.text) } : item)),
+    content: result.content.map((item) => {
+      if (item?.type !== "text") return item;
+      const json = checkedJson.get(item);
+      const at = json ? item.text.indexOf(json) : -1;
+      if (at !== -1) return { ...item, text: redactTokens(item.text.slice(0, at)) + json + redactTokens(item.text.slice(at + json.length)) };
+      return { ...item, text: redactTokens(item.text) };
+    }),
   };
 }
 
@@ -444,10 +461,16 @@ function tabLine(t) {
 }
 
 function formatTabContext(group, own, shared) {
+  // Checked here, one by one (see redactResult): the server reads this JSON.
+  const entry = (t) => ({ tabId: t.id, title: redactTokens(t.title || "Untitled"), url: redactTokens(t.url || "") });
   const available = [
-    ...own.map((t) => ({ tabId: t.id, title: t.title || "Untitled", url: t.url || "" })),
-    ...shared.map((t) => ({ tabId: t.id, title: t.title || "Untitled", url: t.url || "", sharedByUser: true })),
+    ...own.map(entry),
+    ...shared.map((t) => ({ ...entry(t), sharedByUser: true })),
   ];
+  // The old ids of tabs another add-on reopened, for the server's own
+  // lookups (see "Tabs another add-on reopens").
+  const reopened = reopenedIds(available.map((t) => t.tabId));
+  const json = JSON.stringify({ availableTabs: available, groupId: group?.id ?? null, windowId: group?.windowId ?? null, ...(reopened && { reopened }) });
   let text = "Tab Context:\n";
   text += `- Claude's tabs (tab group "${GROUP_TITLE}"):\n`;
   text += own.length ? own.map(tabLine).join("") : "  (none)\n";
@@ -455,11 +478,9 @@ function formatTabContext(group, own, shared) {
     text += "- Tabs the user shared with you (their own tabs, in their windows):\n";
     text += shared.map(tabLine).join("");
   }
-  return textResult(
-    JSON.stringify({ availableTabs: available, groupId: group?.id ?? null, windowId: group?.windowId ?? null }) +
-      "\n\n" +
-      text
-  );
+  const result = textResult(json + "\n\n" + text);
+  checkedJson.set(result.content[0], json);
+  return result;
 }
 
 // Tabs opened from Claude's tabs (links with target=_blank, window.open)
@@ -478,14 +499,16 @@ chrome.tabs.onCreated.addListener(async (tab) => {
     if (tab.windowId !== group.windowId) await chrome.tabs.move(tab.id, { windowId: group.windowId, index: -1 });
     await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
   } catch {
+    if (!(await chrome.tabs.get(tab.id).catch(() => null))) return; // closed already
     sharedTabs.add(tab.id);
     saveSharedTabs();
   }
 });
 
 // Clean up when a tab is closed
-chrome.tabs.onRemoved.addListener(async (tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   await stateReady; // or the restore could bring its ids back afterwards
+  noteClosed(tabId, removeInfo); // first: it may have been reopened (see below)
   networkRequests.delete(tabId);
   if (startedTabs.delete(tabId)) saveStartedTabs();
   pageOrigins.delete(tabId);
@@ -501,6 +524,230 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (tabOrigins.delete(tabId)) saveTabOrigins();
 });
 
+// --- Tabs another add-on reopens ---
+// A container add-on (Facebook Container, say) moves a site into or out of a
+// container by stopping the tab's page from loading, opening it in a new tab
+// in another container where the old one was, and closing the old one. To
+// Claude it's still the same tab: the new one takes over the old one's place
+// (Claude's group, or the user's sharing) and settings, and a call that names
+// the old id runs in the new one, with a word about it. A new tab only counts
+// as the old one reopened if it opens, in the same window, in another
+// container and within seconds of the old one closing, the very address the
+// old one had just started to load. (Not a tab the user opens there, or one
+// they bring back with "Reopen Closed Tab": those stay in its container.)
+// The new tab's address can come a few seconds after it opened (its
+// container's process may have to start first): it's waited for that long.
+const REOPEN_WINDOW_MS = 3000;
+const REOPEN_WAIT_MS = 6000;
+const REOPENED_KEPT_MS = 30 * 60 * 1000;
+const CLOSED_KEPT_MS = 10 * 60 * 1000;
+const pageLoads = new Map(); // tabId -> [{ url, store, at }]: pages Claude's tabs just started to load, and in which container
+const justClosed = new Map(); // tabId -> { windowId, kind, loads (url -> container), at, settings, origin } of a tab Claude could use
+const closedTabs = new Set(); // ids of tabs that closed lately, Claude's or not
+const justOpened = new Map(); // tabId -> { windowId, store, opener, at, urls }
+// Tabs Claude's clicks opened (see openLinkInNewTab), until they're in the
+// group or shared: a container add-on can reopen one before that.
+const LINK_TAB_KEPT_MS = 10000;
+const linkTabs = new Map(); // tabId -> "own" or "shared", what it's going to be
+
+function noteLinkTab(tabId, kind) {
+  linkTabs.set(tabId, kind);
+  setTimeout(() => linkTabs.delete(tabId), LINK_TAB_KEPT_MS);
+}
+const reopenedTabs = new Map(); // old tabId -> { tabId, at, ready }
+const reopenWaiters = new Set(); // (oldId, newId or null) => void
+
+function recentLoads(tabId) {
+  return (pageLoads.get(tabId) || []).filter((load) => Date.now() - load.at < REOPEN_WINDOW_MS);
+}
+
+// From the webRequest listener: a tab started to load a page, in the
+// container `store`. The old tab's load can be reported only after it closed:
+// the add-on that stops the load can close the tab before listeners like this
+// one hear of it.
+function notePageLoad(tabId, url, store) {
+  const opened = justOpened.get(tabId);
+  if (opened && !opened.urls.has(url) && opened.urls.size < 5) {
+    opened.urls.add(url);
+    matchReopened();
+  }
+  const closed = justClosed.get(tabId);
+  if (closed && !closed.loads.has(url) && closed.loads.size < 5) {
+    closed.loads.set(url, store);
+    matchReopened();
+  }
+  if (isControlledNow(tabId)) pageLoads.set(tabId, [...recentLoads(tabId), { url, store, at: Date.now() }].slice(-5));
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  const urls = new Set(/^https?:/i.test(tab.url || "") ? [tab.url] : []);
+  justOpened.set(tab.id, { windowId: tab.windowId, store: tab.cookieStoreId, opener: tab.openerTabId, at: Date.now(), urls });
+  setTimeout(() => justOpened.delete(tab.id), REOPEN_WINDOW_MS + REOPEN_WAIT_MS);
+  if (urls.size) matchReopened();
+});
+// And the address it shows once it does, should its load have gone unseen.
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  const opened = justOpened.get(tabId);
+  if (opened && info.url && !opened.urls.has(info.url) && opened.urls.size < 5) {
+    opened.urls.add(info.url);
+    matchReopened();
+  }
+});
+
+// From the onRemoved listener, before the tab's records go: a tab Claude
+// could use closed. The page it was loading may be reported yet.
+function noteClosed(tabId, { windowId, isWindowClosing }) {
+  // A tab only just opened from one of Claude's (a link Claude's click or its
+  // page opened) can close before it's in the group or shared: it was going
+  // to be Claude's all the same, and its loads were noted as a new tab's.
+  const opened = justOpened.get(tabId);
+  const kind = ownTabs.has(tabId) ? "own"
+    : sharedTabs.has(tabId) ? "shared"
+    : linkTabs.get(tabId) ?? (opened && ownTabs.has(opened.opener) ? "own" : null);
+  const loads = new Map(recentLoads(tabId).map((load) => [load.url, load.store]));
+  for (const url of opened?.urls ?? []) if (!loads.has(url)) loads.set(url, opened.store);
+  pageLoads.delete(tabId);
+  justOpened.delete(tabId); // no longer a tab that may be another one reopened
+  closedTabs.add(tabId);
+  setTimeout(() => closedTabs.delete(tabId), CLOSED_KEPT_MS);
+  if (!kind || isWindowClosing) return;
+  justClosed.set(tabId, { windowId, kind, loads, at: Date.now(), settings: configForTabs.get(tabId), origin: tabOrigins.get(tabId) });
+  setTimeout(() => {
+    if (justClosed.delete(tabId)) settleReopen(tabId, null);
+  }, REOPEN_WAIT_MS);
+  matchReopened();
+}
+
+function matchReopened() {
+  for (const [oldId, closed] of justClosed) {
+    for (const [newId, opened] of justOpened) {
+      if (newId === oldId || opened.windowId !== closed.windowId) continue;
+      if (Math.abs(opened.at - closed.at) > REOPEN_WINDOW_MS) continue;
+      if (![...closed.loads].some(([url, store]) => opened.urls.has(url) && store && opened.store && store !== opened.store)) continue;
+      justClosed.delete(oldId);
+      justOpened.delete(newId);
+      for (const [id, entry] of reopenedTabs) {
+        if (Date.now() - entry.at > REOPENED_KEPT_MS) reopenedTabs.delete(id);
+      }
+      const ready = takeOver(oldId, newId, closed);
+      // Ids the old tab had before lead straight to the new one (with its
+      // takeover to wait for too), however often it's reopened.
+      for (const entry of reopenedTabs.values()) {
+        if (entry.tabId !== oldId) continue;
+        entry.tabId = newId;
+        entry.at = Date.now();
+        entry.ready = Promise.all([entry.ready, ready]);
+      }
+      reopenedTabs.set(oldId, { tabId: newId, at: Date.now(), ready });
+      settleReopen(oldId, newId);
+      break;
+    }
+  }
+}
+
+function settleReopen(oldId, newId) {
+  for (const waiter of [...reopenWaiters]) waiter(oldId, newId);
+}
+
+// The new tab takes the old one's place. (Firefox may have put it in the old
+// one's group already: it opens where the old one was.)
+async function takeOver(oldId, newId, closed) {
+  debugEvent("tab", newId, `tab ${oldId} was reopened as tab ${newId} by another add-on`);
+  if (closed.settings) {
+    configForTabs.set(newId, closed.settings);
+    saveTabConfig();
+  }
+  if (closed.origin) {
+    tabOrigins.set(newId, closed.origin);
+    saveTabOrigins();
+  }
+  try {
+    if (closed.kind === "shared") {
+      if (!(await tabControl(newId)).kind) {
+        sharedTabs.add(newId);
+        await saveSharedTabs();
+      }
+      return;
+    }
+    await withGroupLock(async () => {
+      const tab = await chrome.tabs.get(newId);
+      const group = await findClaudeGroup();
+      if (group && tab.groupId === group.id) return;
+      if (group) {
+        if (tab.windowId !== group.windowId) await chrome.tabs.move(newId, { windowId: group.windowId, index: -1 });
+        await chrome.tabs.group({ groupId: group.id, tabIds: [newId] });
+      } else {
+        // The old tab was the group's last one: the new one starts it again.
+        const groupId = await chrome.tabs.group({ tabIds: [newId], createProperties: { windowId: tab.windowId } });
+        await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: GROUP_COLOR });
+        await rememberGroup(groupId);
+      }
+    });
+  } catch {
+    // Closed already, or it can't join the group: it stays as it is.
+  } finally {
+    await tabControl(newId).catch(() => {}); // ownTabs, up to date
+  }
+}
+
+// Old id -> the tab it stands for now, for those of `ids` (the tabs Claude
+// can use) that were reopened; null if none were.
+function reopenedIds(ids) {
+  const found = {};
+  for (const oldId of reopenedTabs.keys()) {
+    let id = oldId;
+    for (let hops = 0; hops < 10 && reopenedTabs.has(id); hops++) id = reopenedTabs.get(id).tabId;
+    if (ids.includes(id)) found[oldId] = id;
+  }
+  return Object.keys(found).length ? found : null;
+}
+
+// What a tab id stands for now: the tab its page was reopened in, if it was.
+async function currentTabId(tabId) {
+  for (let hops = 0; hops < 10 && reopenedTabs.has(tabId); hops++) {
+    const entry = reopenedTabs.get(tabId);
+    await entry.ready;
+    tabId = entry.tabId;
+  }
+  return tabId;
+}
+
+// Whether a tab that's gone may yet turn out reopened: it had started to
+// load a page, or a tab opened in its window meanwhile. Its onRemoved may not
+// have come yet; one that came and kept nothing was no tab of Claude's, or
+// closed with its window.
+function mayBeReopened(tabId) {
+  const closed = justClosed.get(tabId);
+  if (!closed) return !closedTabs.has(tabId) && (recentLoads(tabId).length > 0 || justOpened.size > 0);
+  return closed.loads.size > 0 || [...justOpened.values()].some((opened) => opened.windowId === closed.windowId);
+}
+
+// The tab a closed tab was reopened as, or null, after waiting for it (until
+// `deadline` at the latest) if it may yet be.
+async function reopenedAs(tabId, deadline = Infinity) {
+  if (!reopenedTabs.has(tabId) && !(await chrome.tabs.get(tabId).catch(() => null)) && mayBeReopened(tabId)) {
+    await new Promise((resolve) => {
+      const waiter = (oldId) => {
+        if (oldId !== tabId) return;
+        reopenWaiters.delete(waiter);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => waiter(tabId), Math.max(0, Math.min(REOPEN_WAIT_MS, deadline - Date.now())));
+      reopenWaiters.add(waiter);
+      if (reopenedTabs.has(tabId)) waiter(tabId);
+    });
+  }
+  const entry = reopenedTabs.get(tabId);
+  if (!entry) return null;
+  await entry.ready;
+  return entry.tabId;
+}
+
+function reopenedNote(oldId, newId) {
+  return `Tab ${oldId} is now tab ${newId}: another add-on reopened its page in a new tab, as container add-ons do to move a site into or out of a container. Use tabId ${newId} from now on.`;
+}
+
 // --- Network monitoring via webRequest ---
 // Only tabs Claude can use are recorded, from the moment it can: a tab the
 // user shares later starts with an empty history, not with what it loaded
@@ -513,7 +760,9 @@ const pageOrigins = new Map(); // tabId -> { origin, requestId } of the last pag
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (details.tabId < 0 || !isControlledNow(details.tabId)) return;
+    if (details.tabId < 0) return;
+    if (details.type === "main_frame") notePageLoad(details.tabId, details.url, details.cookieStoreId);
+    if (!isControlledNow(details.tabId)) return;
     let reqs = networkRequests.get(details.tabId) || [];
     if (details.type === "main_frame") {
       const origin = URL.canParse(details.url) ? new URL(details.url).origin : null;
@@ -622,6 +871,12 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_TIMEOUT_MS
     // The page got it too late to act on it (see content.js): not done.
     if (response?.error === "expired") {
       const err = new Error("The page was too busy to take this in time; it wasn't done.");
+      err.notDone = true;
+      throw err;
+    }
+    // Humanized input stopped on its way there (see content.js).
+    if (response?.error === "released") {
+      const err = new Error("The user took this tab back, so it wasn't done.");
       err.notDone = true;
       throw err;
     }
@@ -920,7 +1175,7 @@ async function showInClaudesWindow(tab) {
 
 // Tools that work inside a tab's page get the glow, page hooks, and a report
 // of any dialogs the page opened.
-async function startPageWork(tabId, kind) {
+async function startPageWork(tabId, kind, request) {
   lastWorkAt.set(tabId, Date.now());
   workingTabs.set(tabId, (workingTabs.get(tabId) || 0) + 1);
   const before = await callPageHooks(tabId, { answerUntil: dialogDeadline(tabId, kind) });
@@ -940,8 +1195,20 @@ async function startPageWork(tabId, kind) {
     const now = await tabControl(tabId);
     // Closed meanwhile, maybe by what the tool did (a click on a popup's
     // close button): the result stands, with a word about it.
+    // Or reopened by another add-on: then the new tab is the one to ask
+    // about, as here.
     if (!now.tab) {
-      if (result?.content) addNote(result, `Tab ${tabId} has closed.`);
+      const reopened = await reopenedAs(tabId, request.deadline);
+      if (reopened === null) {
+        if (result?.content) addNote(result, `Tab ${tabId} has closed.`);
+        return result;
+      }
+      if (!(await tabControl(reopened)).kind) {
+        return result && errorResult(
+          `Tab ${tabId} was reopened as tab ${reopened} by another add-on, and the user took that tab back while this was running. It may have been done, but what it found there isn't shown. Use tabs_context_mcp to see the tabs you can use.`
+        );
+      }
+      if (result?.content) addNote(result, reopenedNote(tabId, reopened));
       return result;
     }
     if (!now.kind) {
@@ -1041,7 +1308,9 @@ async function takeScreenshot(tabId, request, options = {}) {
 
 let lastScreenshotNumber = 0;
 
-async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { over: false }) {
+// `keep`: whether it gets an imageId (for upload_image and if_changed), and
+// one of the 10 places; the images scroll and zoom show don't.
+async function takeScreenshotNow(tabId, request, { rect, scale, keep = true } = {}, turn = { over: false }) {
   // It may have waited its turn: is the tab still Claude's to show, and does
   // the call still want it? And is it still this screenshot's turn?
   const stillClaudes = () => {
@@ -1124,6 +1393,7 @@ async function takeScreenshotNow(tabId, request, { rect, scale } = {}, turn = { 
     }
   }
 
+  if (!keep) return { base64, imageId: null, view };
   // Unique, also for screenshots of two windows taken in the same millisecond.
   lastScreenshotNumber = Math.max(Date.now(), lastScreenshotNumber + 1);
   const imageId = `screenshot_${lastScreenshotNumber}`;
@@ -1155,9 +1425,15 @@ async function openLinkInNewTab(fromTabId, kind, url) {
     openerTabId: fromTabId,
     active: false,
   });
+  noteLinkTab(tab.id, kind); // (see "Tabs another add-on reopens")
   let grouped = false;
   if (kind === "own" && claudeGroupId !== null) {
     grouped = await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] }).then(() => true, () => false);
+    if (grouped) ownTabs.add(tab.id);
+  }
+  // Closed already (a container add-on reopening it, say): nothing to share.
+  if (!(await chrome.tabs.get(tab.id).catch(() => null))) {
+    return { tab, where: "which closed again at once; if another add-on reopened it, a call that names it runs in the new tab" };
   }
   if (!grouped && isControlledNow(fromTabId)) {
     sharedTabs.add(tab.id);
@@ -1237,7 +1513,9 @@ const toolHandlers = {
   // once the user agreed (tabs_request_handover asks them in Claude's own
   // prompt); a shared tab is fully Claude's to use anyway.
   async tabs_handover(args) {
-    const ids = [...new Set((args.tabIds || []).map(Number))];
+    // (A tab reopened by another add-on while the user was asked goes by its
+    // new id.)
+    const ids = [...new Set(await Promise.all((args.tabIds || []).map((id) => currentTabId(Number(id)))))];
     const notShared = ids.filter((id) => !sharedTabs.has(id));
     if (!ids.length || notShared.length) {
       return errorResult(
@@ -1282,8 +1560,8 @@ const toolHandlers = {
       const resp = await pageMessage(args.tabId, request, { type: "setFiles", ref: args.ref, check: true, count: args.count }, refFrame(args.ref));
       if (resp?.error) return errorResult(`Error: ${resp.error}`);
       if (!resp?.result) return errorResult("Error: the page gave no answer.");
-      // (Read by the server: which site gets the files.)
-      return textResult(JSON.stringify({ ok: true, origin: resp.result.origin }));
+      // (Read by the server: which site, in which tab, gets the files.)
+      return textResult(JSON.stringify({ ok: true, origin: resp.result.origin, tabId: args.tabId }));
     }
     return putFiles(args, Array.isArray(args.files) ? args.files : [], request);
   },
@@ -1327,18 +1605,36 @@ const toolHandlers = {
     // the page that was loading before: only count it once the tab has
     // started loading again. A jump within the same page (#anchor) doesn't
     // load anything; it's done when the tab shows the requested URL (for
-    // back/forward, any new URL).
+    // back/forward, any new URL). Another add-on can reopen the page in a
+    // new tab (see "Tabs another add-on reopens"): that's the one to wait for
+    // then, past the blank page it starts with.
     const urlBefore = control?.tab?.url;
+    let current = tabId;
     const loaded = new Promise((resolve) => {
       let started = false;
       const listener = (updatedTabId, info, tab) => {
-        if (updatedTabId !== tabId) return;
+        if (updatedTabId !== current) return;
         if (info.status === "loading") started = true;
-        else if (started && info.status === "complete") finish();
+        else if (started && info.status === "complete" && (current === tabId || tab.url !== "about:blank")) finish();
         else if (!started && info.url && tab.status === "complete" && (targetUrl === null || info.url === targetUrl)) finish();
+      };
+      const reopened = (oldId, newId) => {
+        if (oldId !== current) return;
+        if (newId === null) return finish();
+        current = newId;
+        started = true;
+        chrome.tabs.get(newId).then((tab) => {
+          if (tab.status === "complete" && tab.url !== "about:blank") finish();
+        }, finish);
+      };
+      // Closed, and not reopened: nothing more will load.
+      const removed = (removedTabId) => {
+        if (removedTabId === current) setTimeout(() => removedTabId === current && finish(), REOPEN_WAIT_MS + 500);
       };
       const finish = () => {
         chrome.tabs.onUpdated.removeListener(listener);
+        chrome.tabs.onRemoved.removeListener(removed);
+        reopenWaiters.delete(reopened);
         clearTimeout(timer);
         clearTimeout(nothingYet);
         resolve();
@@ -1349,6 +1645,8 @@ const toolHandlers = {
         if (!started) finish();
       }, 3000);
       chrome.tabs.onUpdated.addListener(listener);
+      chrome.tabs.onRemoved.addListener(removed);
+      reopenWaiters.add(reopened);
     });
 
     if (url === "back") {
@@ -1361,24 +1659,26 @@ const toolHandlers = {
 
     await loaded;
 
-    let tab = await chrome.tabs.get(tabId);
+    let tab = await chrome.tabs.get(current).catch(() => null);
+    if (!tab) return errorResult("Error: the tab closed before the page finished loading.");
+    if (current !== tabId) await currentTabId(tabId); // it has taken the old one's place
     if (targetUrl === null && tab.url === urlBefore && tab.status === "complete") {
       return errorResult(`Nothing happened: this tab has no page to go ${url} to, or that page didn't load. It still shows ${tab.url}.`);
     }
     let busyNote = "";
     if (args.wait === "networkidle") {
-      const waited = await networkIdle(tabId, request);
+      const waited = await networkIdle(current, request);
       if (waited !== true) {
         busyNote = ` (it was still making requests after ${Math.round(waited / 1000)} s more; what it shows may not be complete)`;
       }
     }
-    tab = await chrome.tabs.get(tabId);
+    tab = await chrome.tabs.get(current);
     const group = await findClaudeGroup();
     const tabs = group && tab.groupId === group.id ? await tabsInGroup(group) : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text =
       `Navigated to ${tab.url}${loading}${busyNote}.\n## Pages\n` +
-      tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
+      tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === current ? " [selected]" : ""}`).join("\n");
 
     return textResult(text);
   },
@@ -1437,8 +1737,11 @@ const toolHandlers = {
           screenshotStore.delete(imageId);
           return textResult(`Unchanged: the tab looks exactly as in ${previous.imageId}, so the image was left out.`);
         }
-        // Only one Claude gets: not one taken after the call ran out of time.
-        if (Date.now() < request.deadline) lastScreenshots.set(tabId, { session: request.session, imageId });
+        // Only one Claude got (see handleToolRequest).
+        // (Not if the tab closed or went back to the user meanwhile.)
+        request.answered = () => {
+          if (isControlledNow(tabId)) lastScreenshots.set(tabId, { session: request.session, imageId });
+        };
         const size = shot.fit < 1
           ? `${shot.imageWidth}x${shot.imageHeight}, jpeg, of a ${shot.width}x${shot.height} viewport; use this image's pixels as coordinates`
           : `${shot.width}x${shot.height}, jpeg`;
@@ -1621,6 +1924,8 @@ const toolHandlers = {
               if (submitted) return stopped("Enter submitted the form, and the page went away");
               return stopped(`the page stopped responding while that key was being released (${err.message})`);
             }
+            // The page is going: the rest would land on it or the next one.
+            if (submitted && pressed < total) return stopped("Enter submitted the form");
             await sleep(humanize ? typingPause(keyStr, humanize) : 30);
           }
         }
@@ -1655,7 +1960,7 @@ const toolHandlers = {
         // The scroll happened; a screenshot that fails afterwards doesn't undo it.
         let base64;
         try {
-          ({ base64 } = await takeScreenshot(tabId, request));
+          ({ base64 } = await takeScreenshot(tabId, request, { keep: false }));
         } catch (err) {
           return textResult(`${scrolled}. No screenshot afterwards: ${err.message}.`);
         }
@@ -1738,6 +2043,7 @@ const toolHandlers = {
         const { base64 } = await takeScreenshot(tabId, request, {
           rect: { x: left, y: top, width, height },
           scale,
+          keep: false,
         });
         return {
           content: [
@@ -1790,7 +2096,9 @@ const toolHandlers = {
     const previous = lastTrees.get(tabId);
     const whole = !/\n\.\.\. \(truncated/.test(tree);
     // Compared only with a read Claude got (see screenshot's if_changed).
-    if (Date.now() < request.deadline) lastTrees.set(tabId, whole ? { session: request.session, sameRead, tree } : null);
+    request.answered = () => {
+      if (isControlledNow(tabId)) lastTrees.set(tabId, whole ? { session: request.session, sameRead, tree } : null);
+    };
     if (args.delta && whole && !request.resent && previous?.session === request.session && previous.sameRead === sameRead) {
       const changes = treeChanges(previous.tree, tree);
       if (changes !== null) return textResult(`${changes}${viewport}`);
@@ -2355,12 +2663,12 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
   // A request the server sent again after the connection dropped (see
   // "Not running a request twice"). Only those are looked up: servers
   // before 2.1.0 start their ids over when they restart.
+  if (resent && runningRequests.has(id)) {
+    runningRequests.get(id).lostAt = 0; // its server is back (see connectToServer)
+    return; // still running here: that run answers
+  }
   const journaled = !isRepeatable(tool, args);
   if (journaled && resent) {
-    if (runningRequests.has(id)) {
-      runningRequests.get(id).lostAt = 0; // its server is back (see connectToServer)
-      return; // still running here: that run answers
-    }
     const seen = journal.get(id);
     if (seen) {
       answerFromJournal(id, tool, args, seen);
@@ -2409,7 +2717,9 @@ async function handleToolRequest(id, tool, args, serverVersion, resent, timeLeft
       debugEvent("tool", args.tabId, `${tool} ${verdict} in ${Date.now() - started} ms${shown}`);
     }
     if (outcome.error) sendError(id, outcome.error);
-    else sendResponse(id, outcome.result);
+    // What a tool keeps of what Claude got (request.answered), only if
+    // Claude got it: not cancelled, in time, and sent.
+    else if (sendResponse(id, outcome.result) && !request.cancelled && Date.now() < request.deadline) request.answered?.();
   } finally {
     toolCallsRunning--;
     reloadIfIdle();
@@ -2428,6 +2738,42 @@ function cancelRequest(id) {
 }
 
 async function runTool(tool, handler, args, request) {
+  // (The settings can be for one tab too.)
+  const namesTab = TAB_TOOLS.has(tool) || tool === "get_config" || tool === "set_config";
+  if (!namesTab || typeof args.tabId !== "number") return runInTab(tool, handler, args, request);
+  // A tab another add-on reopened goes by its new id, also one that's being
+  // reopened just now (closed, and the new one not matched with it yet).
+  let tabId = await currentTabId(args.tabId);
+  const reopening = await reopenedAs(tabId, request.deadline);
+  if (reopening !== null) tabId = await currentTabId(reopening);
+  // That can take a moment: a call cancelled or out of time meanwhile isn't
+  // started.
+  if (request.cancelled || Date.now() >= request.deadline) {
+    return errorResult(`Error: ${request.cancelled ? "the call was cancelled" : "the call ran out of time"}, so this wasn't done.`);
+  }
+  let result;
+  try {
+    result = await runInTab(tool, handler, { ...args, tabId }, request);
+  } catch (err) {
+    // The tab went from under the tool: it may have been reopened.
+    const reopened = await reopenedAs(tabId, request.deadline);
+    if (reopened === null) throw err;
+    result = errorResult(`Error: ${err.message}. ${reopenedNote(tabId, reopened)} Check there whether this was done before repeating it.`);
+  }
+  // (Not in the upload check's answer: the server reads the tab from it, and
+  // the upload after it gets the note.)
+  if (tabId !== args.tabId && result?.content && !(tool === "upload_files" && args.check)) {
+    // Reopened again during the call, the note about that has the id to use;
+    // a tab that's gone, or isn't Claude's, isn't one to use.
+    const now = await currentTabId(tabId);
+    addNote(result, now === tabId && isControlledNow(tabId)
+      ? `This ran in tab ${tabId}. ${reopenedNote(args.tabId, tabId)}`
+      : `This was for tab ${tabId}: tab ${args.tabId} had been reopened as tab ${tabId} before.`);
+  }
+  return result;
+}
+
+async function runInTab(tool, handler, args, request) {
   let finish = null;
   // Why a tool can't work in the tab as it is now, if there's a reason.
   const refused = (control) => {
@@ -2453,7 +2799,7 @@ async function runTool(tool, handler, args, request) {
       const no = refused(control);
       if (no) return no;
       if (PAGE_TOOLS.has(tool)) {
-        finish = await startPageWork(args.tabId, control.kind);
+        finish = await startPageWork(args.tabId, control.kind, request);
         // That waits seconds for a busy page. A lot can change meanwhile, and
         // nothing has happened yet: this is the moment to stop.
         control = await tabControl(args.tabId);
@@ -2579,7 +2925,9 @@ function answerFromJournal(id, tool, args, seen) {
   } else if (seen.error) {
     sendError(id, seen.error);
   } else if (seen.result) {
-    sendResponse(id, seen.result);
+    // Redacted already, when it was kept (see keptOutcome). Not again: read
+    // back from storage, the tab list's checked JSON would be taken as text.
+    postToServer({ id, type: "tool_response", result: seen.result });
   } else {
     sendResponse(id, textResult(`This ${what} already ran before the connection to Claude dropped, so it wasn't run again. Its result wasn't kept; check the page for it.`));
   }
