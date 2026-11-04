@@ -499,6 +499,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
     if (tab.windowId !== group.windowId) await chrome.tabs.move(tab.id, { windowId: group.windowId, index: -1 });
     await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
   } catch {
+    if (!(await chrome.tabs.get(tab.id).catch(() => null))) return; // closed already
     sharedTabs.add(tab.id);
     saveSharedTabs();
   }
@@ -534,13 +535,25 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
 // container and within seconds of the old one closing, the very address the
 // old one had just started to load. (Not a tab the user opens there, or one
 // they bring back with "Reopen Closed Tab": those stay in its container.)
+// The new tab's address can come a few seconds after it opened (its
+// container's process may have to start first): it's waited for that long.
 const REOPEN_WINDOW_MS = 3000;
+const REOPEN_WAIT_MS = 6000;
 const REOPENED_KEPT_MS = 30 * 60 * 1000;
 const CLOSED_KEPT_MS = 10 * 60 * 1000;
 const pageLoads = new Map(); // tabId -> [{ url, store, at }]: pages Claude's tabs just started to load, and in which container
 const justClosed = new Map(); // tabId -> { windowId, kind, loads (url -> container), at, settings, origin } of a tab Claude could use
 const closedTabs = new Set(); // ids of tabs that closed lately, Claude's or not
-const justOpened = new Map(); // tabId -> { windowId, store, at, urls }
+const justOpened = new Map(); // tabId -> { windowId, store, opener, at, urls }
+// Tabs Claude's clicks opened (see openLinkInNewTab), until they're in the
+// group or shared: a container add-on can reopen one before that.
+const LINK_TAB_KEPT_MS = 10000;
+const linkTabs = new Map(); // tabId -> "own" or "shared", what it's going to be
+
+function noteLinkTab(tabId, kind) {
+  linkTabs.set(tabId, kind);
+  setTimeout(() => linkTabs.delete(tabId), LINK_TAB_KEPT_MS);
+}
 const reopenedTabs = new Map(); // old tabId -> { tabId, at, ready }
 const reopenWaiters = new Set(); // (oldId, newId or null) => void
 
@@ -568,8 +581,8 @@ function notePageLoad(tabId, url, store) {
 
 chrome.tabs.onCreated.addListener((tab) => {
   const urls = new Set(/^https?:/i.test(tab.url || "") ? [tab.url] : []);
-  justOpened.set(tab.id, { windowId: tab.windowId, store: tab.cookieStoreId, at: Date.now(), urls });
-  setTimeout(() => justOpened.delete(tab.id), REOPEN_WINDOW_MS);
+  justOpened.set(tab.id, { windowId: tab.windowId, store: tab.cookieStoreId, opener: tab.openerTabId, at: Date.now(), urls });
+  setTimeout(() => justOpened.delete(tab.id), REOPEN_WINDOW_MS + REOPEN_WAIT_MS);
   if (urls.size) matchReopened();
 });
 // And the address it shows once it does, should its load have gone unseen.
@@ -584,8 +597,15 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 // From the onRemoved listener, before the tab's records go: a tab Claude
 // could use closed. The page it was loading may be reported yet.
 function noteClosed(tabId, { windowId, isWindowClosing }) {
-  const kind = ownTabs.has(tabId) ? "own" : sharedTabs.has(tabId) ? "shared" : null;
+  // A tab only just opened from one of Claude's (a link Claude's click or its
+  // page opened) can close before it's in the group or shared: it was going
+  // to be Claude's all the same, and its loads were noted as a new tab's.
+  const opened = justOpened.get(tabId);
+  const kind = ownTabs.has(tabId) ? "own"
+    : sharedTabs.has(tabId) ? "shared"
+    : linkTabs.get(tabId) ?? (opened && ownTabs.has(opened.opener) ? "own" : null);
   const loads = new Map(recentLoads(tabId).map((load) => [load.url, load.store]));
+  for (const url of opened?.urls ?? []) if (!loads.has(url)) loads.set(url, opened.store);
   pageLoads.delete(tabId);
   justOpened.delete(tabId); // no longer a tab that may be another one reopened
   closedTabs.add(tabId);
@@ -594,7 +614,7 @@ function noteClosed(tabId, { windowId, isWindowClosing }) {
   justClosed.set(tabId, { windowId, kind, loads, at: Date.now(), settings: configForTabs.get(tabId), origin: tabOrigins.get(tabId) });
   setTimeout(() => {
     if (justClosed.delete(tabId)) settleReopen(tabId, null);
-  }, REOPEN_WINDOW_MS);
+  }, REOPEN_WAIT_MS);
   matchReopened();
 }
 
@@ -713,7 +733,7 @@ async function reopenedAs(tabId, deadline = Infinity) {
         clearTimeout(timer);
         resolve();
       };
-      const timer = setTimeout(() => waiter(tabId), Math.max(0, Math.min(REOPEN_WINDOW_MS, deadline - Date.now())));
+      const timer = setTimeout(() => waiter(tabId), Math.max(0, Math.min(REOPEN_WAIT_MS, deadline - Date.now())));
       reopenWaiters.add(waiter);
       if (reopenedTabs.has(tabId)) waiter(tabId);
     });
@@ -1405,9 +1425,15 @@ async function openLinkInNewTab(fromTabId, kind, url) {
     openerTabId: fromTabId,
     active: false,
   });
+  noteLinkTab(tab.id, kind); // (see "Tabs another add-on reopens")
   let grouped = false;
   if (kind === "own" && claudeGroupId !== null) {
     grouped = await chrome.tabs.group({ groupId: claudeGroupId, tabIds: [tab.id] }).then(() => true, () => false);
+    if (grouped) ownTabs.add(tab.id);
+  }
+  // Closed already (a container add-on reopening it, say): nothing to share.
+  if (!(await chrome.tabs.get(tab.id).catch(() => null))) {
+    return { tab, where: "which closed again at once; if another add-on reopened it, a call that names it runs in the new tab" };
   }
   if (!grouped && isControlledNow(fromTabId)) {
     sharedTabs.add(tab.id);
@@ -1603,7 +1629,7 @@ const toolHandlers = {
       };
       // Closed, and not reopened: nothing more will load.
       const removed = (removedTabId) => {
-        if (removedTabId === current) setTimeout(() => removedTabId === current && finish(), REOPEN_WINDOW_MS + 500);
+        if (removedTabId === current) setTimeout(() => removedTabId === current && finish(), REOPEN_WAIT_MS + 500);
       };
       const finish = () => {
         chrome.tabs.onUpdated.removeListener(listener);

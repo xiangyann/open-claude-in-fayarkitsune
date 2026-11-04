@@ -88,6 +88,12 @@ function sendToExtension(tool, args, signal) {
       reject(new Error("Cancelled."));
       return;
     }
+    // Quitting: its calls were cancelled, and a tool's next step (the next
+    // tab to close, the upload after a yes) isn't sent after them.
+    if (shuttingDown) {
+      reject(new Error("This Claude session is closing, so it wasn't sent to the browser."));
+      return;
+    }
     const id = `${REQUEST_ID_PREFIX}-${++requestIdCounter}`;
     const timer = setTimeout(() => {
       pendingRequests.delete(id);

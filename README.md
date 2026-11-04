@@ -60,7 +60,7 @@ This project started as a fork of [beto621/open-claude-in-firefox](https://githu
 | **Releases** | Installed from the source folder, or an `.xpi` where one is provided | Signed releases that Firefox updates by itself |
 | **Claude's tabs** | A separate MCP window | A **Claude** tab group, in a window of its own; tabs Claude's pages open join it |
 | **Your own tabs** | Only tabs in the MCP window | Share the tabs you choose, take them back, or hand them over to Claude's window; the rest stay off limits |
-| **Tools** | 18 (`upload_image` was a placeholder) | 28: also closing and showing tabs, sharing and handover, page dialogs, uploading files you approve, a debug log and settings |
+| **Tools** | 18, five of them placeholders (`upload_image`, `gif_creator`, the two shortcut tools, `switch_browser`) | 28: also closing and showing tabs, sharing and handover, page dialogs, uploading files you approve, a debug log and settings. `upload_image` works; the other four are still placeholders |
 | **Screenshots** | Switch to the tab first | Background tabs without switching, sized so click coordinates match on HiDPI screens and zoomed pages |
 | **Firefox** | 109 or later | 153 or later |
 
@@ -68,7 +68,7 @@ Also new:
 - **Page dialogs:** an `alert()`, `confirm()` or `prompt()` is answered and reported to Claude, instead of leaving the page frozen.
 - **Human-like input** if you want it: a curved mouse path at a human pace, and a typing rhythm.
 - **Interrupted calls:** a call sent again after a reconnect isn't run twice, and calls stop at their deadline, when you cancel them, or when their Claude session quits.
-- **Privacy:** tokens, passwords and session values are hidden from what Claude gets back, and file uploads need your yes in Claude's own prompt.
+- **Privacy:** tokens, passwords and session values are hidden from what Claude gets back, as far as they can be recognized, and file uploads need your yes, in Claude's own prompt (or in the conversation, in an app that can't show one).
 - **More options:** `upload_image` works, a screenshot can skip an unchanged image, `read_page` can return only what changed, and `navigate` can wait for the page to stop loading data.
 - **Container add-ons:** a tab Facebook Container reopens in its container stays Claude's tab.
 
@@ -265,7 +265,7 @@ After a Firefox restart, the group comes back with a new ID, so the extension fi
 
 While Claude works in a tab, the page has a pulsing orange border, a "Claude is using this tab" label, and an orange pointer where Claude's mouse last clicked, hovered or dragged. All three are hidden while screenshots are taken, and fade a few seconds after Claude's last action.
 
-**Container add-ons.** Facebook Container moves a site into or out of its container by opening it in a new tab and closing the old one, so the tab gets a new ID. The extension follows it: the new tab takes the old one's place (in Claude's group, or shared if the old one was) and its settings, and a tool call that names the old tab ID runs in the new tab and tells Claude the new ID. It only counts as the same tab if the new one opens the address the old one was loading, in the same window but in another container, within 3 seconds of the old one closing; a tab you open yourself, or bring back with **Reopen Closed Tab**, doesn't count. Other container add-ons are followed when they reopen a page the same way. The new tab is in that add-on's container, with the logins kept there: Facebook Container's, for a Meta site.
+**Container add-ons.** Facebook Container moves a site into or out of its container by opening it in a new tab and closing the old one, so the tab gets a new ID. The extension follows it: the new tab takes the old one's place (in Claude's group, or shared if the old one was) and its settings, and a tool call that names the old tab ID runs in the new tab and tells Claude the new ID. It only counts as the same tab if the new one opens the address the old one was loading, in the same window but in another container, within 3 seconds of the old one closing; a tab you open yourself in the same container, or bring back with **Reopen Closed Tab**, doesn't count. Other container add-ons are followed when they reopen a page the same way. The new tab is in that add-on's container, with the logins kept there: Facebook Container's, for a Meta site.
 
 ### Sharing your own tabs
 
